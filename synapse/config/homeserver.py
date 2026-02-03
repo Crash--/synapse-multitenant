@@ -54,6 +54,7 @@ from .room import RoomConfig
 from .room_directory import RoomDirectoryConfig
 from .saml2 import SAML2Config
 from .server import ServerConfig
+from .tenants import TenantsConfig
 from .server_notices import ServerNoticesConfig
 from .spam_checker import SpamCheckerConfig
 from .sso import SSOConfig
@@ -117,6 +118,8 @@ class HomeServerConfig(RootConfig):
         BackgroundUpdateConfig,
         AutoAcceptInvitesConfig,
         UserTypesConfig,
+        # Multi-tenant configuration
+        TenantsConfig,
         # This must be last, as it checks for conflicts with other config options.
         MasConfig,
     ]

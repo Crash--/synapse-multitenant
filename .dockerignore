@@ -3,6 +3,7 @@
 
 # things to include
 !docker
+!docker-multitenant
 !synapse
 !rust
 !README.rst
@@ -11,6 +12,14 @@
 !Cargo.lock
 !Cargo.toml
 !build_rust.py
+
+# Multi-tenant test files
+!test_*.py
+!demo_multitenant.py
+!standalone_demo.py
+!simple_test.py
+!manual_test.py
+!requirements-test.txt
 
 rust/target
 synapse/*.so
