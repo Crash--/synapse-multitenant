@@ -92,6 +92,7 @@ from synapse.rest.admin.rooms import (
 )
 from synapse.rest.admin.scheduled_tasks import ScheduledTasksRestServlet
 from synapse.rest.admin.server_notice_servlet import SendServerNoticeServlet
+from synapse.rest.admin.tenants import register_tenant_servlets
 from synapse.rest.admin.statistics import (
     LargestRoomsStatistics,
     UserMediaStatisticsRestServlet,
@@ -350,6 +351,9 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     ScheduledTasksRestServlet(hs).register(http_server)
     AdminRoomHierarchy(hs).register(http_server)
     EventRestServlet(hs).register(http_server)
+
+    # Multi-tenant admin endpoints
+    register_tenant_servlets(hs, http_server)
 
 
 def register_servlets_for_client_rest_resource(
