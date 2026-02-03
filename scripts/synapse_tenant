@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+#
+# This file is licensed under the Affero General Public License (AGPL) version 3.
+#
+# Copyright 2026 Linagora
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# See the GNU Affero General Public License for more details:
+# <https://www.gnu.org/licenses/agpl-3.0.html>.
+#
+#
+
+"""
+Synapse Multi-Tenant CLI Tool
+
+This command-line tool provides utilities for managing tenants in a multi-tenant
+Synapse deployment. It supports:
+
+- Listing configured tenants
+- Creating new tenants (schema, keys, directories)
+- Validating tenant configuration
+- Generating signing keys
+- Managing tenant schemas
+
+Usage:
+    synapse_tenant list -c homeserver.yaml
+    synapse_tenant create -c homeserver.yaml --server-name acme.com
+    synapse_tenant validate -c homeserver.yaml
+    synapse_tenant generate-key --output /keys/acme.signing.key
+    synapse_tenant init-schema -c homeserver.yaml --server-name acme.com
+
+For more information on each command:
+    synapse_tenant <command> --help
+"""
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+# Add the synapse directory to the path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from signedjson.key import generate_signing_key, write_signing_keys
+except ImportError:
+    generate_signing_key = None
+    write_signing_keys = None
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def load_config(config_path: str) -> dict:
+    """Load the Synapse configuration file."""
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def get_tenants_from_config(config: dict) -> list:
+    """Extract tenant configurations from Synapse config."""
+    multi_tenant = config.get("multi_tenant", {})
+    if not multi_tenant.get("enabled", False):
+        return []
+    return multi_tenant.get("tenants", [])
+
+
+def cmd_list(args) -> int:
+    """List all configured tenants."""
+    try:
+        config = load_config(args.config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return 1
+
+    tenants = get_tenants_from_config(config)
+
+    if not tenants:
+        print("No tenants configured (multi-tenant mode may be disabled)")
+        return 0
+
+    print(f"\nConfigured tenants ({len(tenants)}):")
+    print("-" * 70)
+    print(f"{'Server Name':<30} {'Schema':<20} {'Reg.':<6} {'Fed.':<6}")
+    print("-" * 70)
+
+    for tenant in tenants:
+        server_name = tenant.get("server_name", "N/A")
+        schema = tenant.get("database_schema", "N/A")
+        reg = "Yes" if tenant.get("registration_enabled", False) else "No"
+        fed = "Yes" if tenant.get("federation_enabled", True) else "No"
+        print(f"{server_name:<30} {schema:<20} {reg:<6} {fed:<6}")
+
+    print("-" * 70)
+    return 0
+
+
+def cmd_create(args) -> int:
+    """Create a new tenant with all required resources."""
+    try:
+        config = load_config(args.config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return 1
+
+    server_name = args.server_name
+    safe_name = server_name.replace(".", "_").replace("-", "_")
+
+    # Check if tenant already exists
+    tenants = get_tenants_from_config(config)
+    for tenant in tenants:
+        if tenant.get("server_name") == server_name:
+            logger.error(f"Tenant '{server_name}' already exists in configuration")
+            return 1
+
+    # Generate defaults
+    database_schema = args.schema_name or f"tenant_{safe_name}"
+    signing_key_path = args.signing_key_path or f"/etc/synapse/keys/{safe_name}.signing.key"
+    media_store_path = args.media_store_path or f"/var/synapse/media/{safe_name}"
+
+    print(f"\nCreating tenant: {server_name}")
+    print("-" * 50)
+
+    # Step 1: Generate signing key
+    if not args.skip_key_generation:
+        print(f"\n1. Generating signing key: {signing_key_path}")
+        if generate_signing_key is None:
+            print("   ERROR: signedjson not installed. Install with: pip install signedjson")
+            print(f"   Manual command: python -c \"from signedjson.key import generate_signing_key, write_signing_keys; "
+                  f"write_signing_keys(open('{signing_key_path}', 'w'), [generate_signing_key('a')])\"")
+        else:
+            try:
+                key_dir = os.path.dirname(signing_key_path)
+                if key_dir and not os.path.exists(key_dir):
+                    os.makedirs(key_dir, mode=0o700)
+                    print(f"   Created directory: {key_dir}")
+
+                key = generate_signing_key("a")
+                with open(signing_key_path, "w") as f:
+                    write_signing_keys(f, [key])
+                os.chmod(signing_key_path, 0o600)
+                print(f"   Created signing key: {signing_key_path}")
+            except Exception as e:
+                logger.error(f"   Failed to generate signing key: {e}")
+                if not args.force:
+                    return 1
+    else:
+        print("\n1. Skipping signing key generation (--skip-key-generation)")
+
+    # Step 2: Create database schema
+    if not args.skip_schema_creation:
+        print(f"\n2. Creating database schema: {database_schema}")
+        if psycopg2 is None:
+            print("   ERROR: psycopg2 not installed. Install with: pip install psycopg2-binary")
+            print(f"   Manual command: python -m scripts.create_tenant_schema -c {args.config_path} "
+                  f"--tenant-name {server_name} --schema-name {database_schema}")
+        else:
+            try:
+                from scripts.create_tenant_schema import (
+                    get_db_connection_params,
+                    initialize_empty_schema,
+                )
+
+                db_params = get_db_connection_params(config)
+                initialize_empty_schema(db_params, database_schema)
+                print(f"   Created schema: {database_schema}")
+            except Exception as e:
+                logger.error(f"   Failed to create schema: {e}")
+                if not args.force:
+                    return 1
+    else:
+        print("\n2. Skipping schema creation (--skip-schema-creation)")
+
+    # Step 3: Create media directory
+    if not args.skip_media_dir:
+        print(f"\n3. Creating media directory: {media_store_path}")
+        try:
+            Path(media_store_path).mkdir(parents=True, exist_ok=True)
+            print(f"   Created directory: {media_store_path}")
+        except Exception as e:
+            logger.error(f"   Failed to create media directory: {e}")
+            if not args.force:
+                return 1
+    else:
+        print("\n3. Skipping media directory creation (--skip-media-dir)")
+
+    # Step 4: Generate YAML snippet
+    print("\n4. Configuration snippet for homeserver.yaml:")
+    print("-" * 50)
+    yaml_config = f"""
+# Add this tenant under multi_tenant.tenants:
+  - server_name: "{server_name}"
+    database_schema: "{database_schema}"
+    signing_key_path: "{signing_key_path}"
+    media_store_path: "{media_store_path}"
+    registration_enabled: {str(args.registration_enabled).lower()}
+    federation_enabled: {str(args.federation_enabled).lower()}
+"""
+    print(yaml_config)
+    print("-" * 50)
+
+    # Write config snippet to file if requested
+    if args.output_config:
+        with open(args.output_config, "w") as f:
+            f.write(yaml_config)
+        print(f"\nConfiguration saved to: {args.output_config}")
+
+    print("\nNext steps:")
+    print("  1. Add the above configuration to homeserver.yaml")
+    print("  2. Restart Synapse")
+    print(f"  3. Test: curl -H 'Host: {server_name}' http://localhost:8008/_matrix/client/versions")
+
+    return 0
+
+
+def cmd_validate(args) -> int:
+    """Validate tenant configuration."""
+    try:
+        config = load_config(args.config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return 1
+
+    tenants = get_tenants_from_config(config)
+    if not tenants:
+        print("No tenants configured")
+        return 0
+
+    print(f"\nValidating {len(tenants)} tenant(s)...")
+    print("-" * 70)
+
+    errors = 0
+    warnings = 0
+
+    for tenant in tenants:
+        server_name = tenant.get("server_name", "MISSING")
+        print(f"\nTenant: {server_name}")
+
+        # Check required fields
+        required = ["server_name", "database_schema", "signing_key_path"]
+        for field in required:
+            if field not in tenant:
+                print(f"  ERROR: Missing required field: {field}")
+                errors += 1
+
+        # Check signing key exists
+        key_path = tenant.get("signing_key_path")
+        if key_path:
+            if os.path.exists(key_path):
+                print(f"  OK: Signing key exists: {key_path}")
+            else:
+                print(f"  ERROR: Signing key not found: {key_path}")
+                errors += 1
+
+        # Check media directory
+        media_path = tenant.get("media_store_path")
+        if media_path:
+            if os.path.isdir(media_path):
+                print(f"  OK: Media directory exists: {media_path}")
+            else:
+                print(f"  WARNING: Media directory not found: {media_path}")
+                warnings += 1
+
+        # Check database schema (if psycopg2 available)
+        schema = tenant.get("database_schema")
+        if schema and psycopg2:
+            try:
+                from scripts.create_tenant_schema import (
+                    get_db_connection_params,
+                    schema_exists,
+                )
+
+                db_params = get_db_connection_params(config)
+                conn = psycopg2.connect(**db_params)
+                if schema_exists(conn, schema):
+                    print(f"  OK: Database schema exists: {schema}")
+                else:
+                    print(f"  WARNING: Database schema not found: {schema}")
+                    warnings += 1
+                conn.close()
+            except Exception as e:
+                print(f"  WARNING: Could not check database schema: {e}")
+                warnings += 1
+
+    print("\n" + "-" * 70)
+    print(f"Validation complete: {errors} error(s), {warnings} warning(s)")
+
+    return 1 if errors > 0 else 0
+
+
+def cmd_generate_key(args) -> int:
+    """Generate a signing key for a tenant."""
+    if generate_signing_key is None:
+        logger.error("signedjson not installed. Install with: pip install signedjson")
+        return 1
+
+    output_path = args.output
+
+    try:
+        # Create directory if needed
+        key_dir = os.path.dirname(output_path)
+        if key_dir and not os.path.exists(key_dir):
+            os.makedirs(key_dir, mode=0o700)
+            logger.info(f"Created directory: {key_dir}")
+
+        # Generate key
+        key_id = args.key_id or "a"
+        key = generate_signing_key(key_id)
+
+        with open(output_path, "w") as f:
+            write_signing_keys(f, [key])
+
+        os.chmod(output_path, 0o600)
+
+        print(f"Generated signing key: {output_path}")
+        print(f"Key ID: ed25519:{key_id}")
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to generate key: {e}")
+        return 1
+
+
+def cmd_init_schema(args) -> int:
+    """Initialize database schema for a tenant."""
+    if psycopg2 is None:
+        logger.error("psycopg2 not installed. Install with: pip install psycopg2-binary")
+        return 1
+
+    try:
+        config = load_config(args.config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return 1
+
+    # Find tenant config
+    tenants = get_tenants_from_config(config)
+    tenant = None
+    for t in tenants:
+        if t.get("server_name") == args.server_name:
+            tenant = t
+            break
+
+    if tenant is None and not args.schema_name:
+        logger.error(f"Tenant '{args.server_name}' not found and no --schema-name provided")
+        return 1
+
+    schema_name = args.schema_name or tenant.get("database_schema")
+    if not schema_name:
+        safe_name = args.server_name.replace(".", "_").replace("-", "_")
+        schema_name = f"tenant_{safe_name}"
+
+    try:
+        from scripts.create_tenant_schema import (
+            create_tenant_schema_from_template,
+            get_db_connection_params,
+            initialize_empty_schema,
+        )
+
+        db_params = get_db_connection_params(config)
+
+        if args.from_template:
+            create_tenant_schema_from_template(
+                db_params, schema_name, args.template_schema
+            )
+        else:
+            initialize_empty_schema(db_params, schema_name)
+
+        print(f"Created schema: {schema_name}")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Failed to create schema: {e}")
+        return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Synapse Multi-Tenant CLI Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  List tenants:
+    synapse_tenant list -c homeserver.yaml
+
+  Create a new tenant:
+    synapse_tenant create -c homeserver.yaml --server-name acme.com
+
+  Validate configuration:
+    synapse_tenant validate -c homeserver.yaml
+
+  Generate signing key:
+    synapse_tenant generate-key --output /keys/acme.signing.key
+
+  Initialize database schema:
+    synapse_tenant init-schema -c homeserver.yaml --server-name acme.com
+""",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # List command
+    list_parser = subparsers.add_parser("list", help="List all configured tenants")
+    list_parser.add_argument(
+        "-c", "--config-path", required=True, help="Path to homeserver.yaml"
+    )
+
+    # Create command
+    create_parser = subparsers.add_parser(
+        "create", help="Create a new tenant with all required resources"
+    )
+    create_parser.add_argument(
+        "-c", "--config-path", required=True, help="Path to homeserver.yaml"
+    )
+    create_parser.add_argument(
+        "--server-name", required=True, help="Server name for the new tenant"
+    )
+    create_parser.add_argument(
+        "--schema-name", help="Database schema name (default: tenant_<safe_name>)"
+    )
+    create_parser.add_argument(
+        "--signing-key-path", help="Path for signing key"
+    )
+    create_parser.add_argument(
+        "--media-store-path", help="Path for media storage"
+    )
+    create_parser.add_argument(
+        "--registration-enabled",
+        action="store_true",
+        default=False,
+        help="Enable registration for this tenant",
+    )
+    create_parser.add_argument(
+        "--federation-enabled",
+        action="store_true",
+        default=True,
+        help="Enable federation for this tenant (default: true)",
+    )
+    create_parser.add_argument(
+        "--skip-key-generation",
+        action="store_true",
+        help="Skip signing key generation",
+    )
+    create_parser.add_argument(
+        "--skip-schema-creation",
+        action="store_true",
+        help="Skip database schema creation",
+    )
+    create_parser.add_argument(
+        "--skip-media-dir",
+        action="store_true",
+        help="Skip media directory creation",
+    )
+    create_parser.add_argument(
+        "--output-config", help="Write config snippet to file"
+    )
+    create_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Continue even if some steps fail",
+    )
+
+    # Validate command
+    validate_parser = subparsers.add_parser(
+        "validate", help="Validate tenant configuration"
+    )
+    validate_parser.add_argument(
+        "-c", "--config-path", required=True, help="Path to homeserver.yaml"
+    )
+
+    # Generate key command
+    genkey_parser = subparsers.add_parser(
+        "generate-key", help="Generate a signing key"
+    )
+    genkey_parser.add_argument(
+        "--output", "-o", required=True, help="Output path for the signing key"
+    )
+    genkey_parser.add_argument(
+        "--key-id", default="a", help="Key ID/version (default: a)"
+    )
+
+    # Init schema command
+    schema_parser = subparsers.add_parser(
+        "init-schema", help="Initialize database schema for a tenant"
+    )
+    schema_parser.add_argument(
+        "-c", "--config-path", required=True, help="Path to homeserver.yaml"
+    )
+    schema_parser.add_argument(
+        "--server-name", required=True, help="Server name of the tenant"
+    )
+    schema_parser.add_argument(
+        "--schema-name", help="Override the schema name"
+    )
+    schema_parser.add_argument(
+        "--from-template",
+        action="store_true",
+        help="Copy table structure from template schema",
+    )
+    schema_parser.add_argument(
+        "--template-schema",
+        default="public",
+        help="Schema to use as template (default: public)",
+    )
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        return 1
+
+    commands = {
+        "list": cmd_list,
+        "create": cmd_create,
+        "validate": cmd_validate,
+        "generate-key": cmd_generate_key,
+        "init-schema": cmd_init_schema,
+    }
+
+    return commands[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
