@@ -32,7 +32,13 @@ from synapse.synapse_rust import get_rust_file_digest
 def check_rust_lib_up_to_date() -> None:
     """For editable installs check if the rust library is outdated and needs to
     be rebuilt.
+
+    NOTE: This check is skipped for multi-tenant development/testing.
     """
+    # Skip the Rust check for development/testing without compiled Rust
+    import os
+    if os.environ.get("SYNAPSE_SKIP_RUST_CHECK", "0") == "1":
+        return None
 
     # Get the location of the editable install.
     synapse_root = get_synapse_source_directory()

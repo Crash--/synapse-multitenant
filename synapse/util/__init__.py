@@ -30,7 +30,11 @@ from typing import (
 )
 
 import attr
-from matrix_common.versionstring import get_distribution_version_string
+try:
+    from matrix_common.versionstring import get_distribution_version_string
+except ImportError:
+    def get_distribution_version_string(name, path):
+        return "0.0.0.dev"
 
 from twisted.internet import defer
 from twisted.python.failure import Failure
@@ -76,7 +80,10 @@ def log_failure(
 
 # Version string with git info. Computed here once so that we don't invoke git multiple
 # times.
-SYNAPSE_VERSION = get_distribution_version_string("matrix-synapse", __file__)
+try:
+    SYNAPSE_VERSION = get_distribution_version_string("matrix-synapse", __file__)
+except Exception:
+    SYNAPSE_VERSION = "0.0.0.dev"
 
 
 class ExceptionBundle(Exception):
