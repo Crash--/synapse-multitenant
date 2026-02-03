@@ -32,6 +32,7 @@ from synapse.api.room_versions import (
 )
 from synapse.crypto.event_signing import add_hashes_and_signatures
 from synapse.event_auth import auth_types_for_event
+from synapse.tenant_context import get_current_tenant
 from synapse.events import EventBase, make_event_from_dict
 from synapse.state import StateHandler
 from synapse.storage.databases.main import DataStore
@@ -281,6 +282,7 @@ class EventBuilder:
 
 class EventBuilderFactory:
     def __init__(self, hs: "HomeServer"):
+        self._hs = hs
         self.clock = hs.get_clock()
         self.hostname = hs.hostname
         self.signing_key = hs.signing_key
@@ -288,6 +290,26 @@ class EventBuilderFactory:
         self.store = hs.get_datastores().main
         self.state = hs.get_state_handler()
         self._event_auth_handler = hs.get_event_auth_handler()
+
+    def _get_hostname_and_signing_key(self) -> tuple[str, "SigningKey"]:
+        """Get the hostname and signing key for the current tenant context.
+
+        Returns:
+            A tuple of (hostname, signing_key) for the current tenant,
+            or the default server credentials if no tenant context is set.
+        """
+        tenant = get_current_tenant()
+        if tenant is not None:
+            # Multi-tenant mode: use tenant's credentials
+            mt_keyring = self._hs.get_multi_tenant_keyring()
+            if mt_keyring is not None:
+                try:
+                    signing_key = mt_keyring.get_signing_key(tenant.server_name)
+                    return tenant.server_name, signing_key
+                except KeyError:
+                    # Fall back to default if tenant key not found
+                    pass
+        return self.hostname, self.signing_key
 
     def for_room_version(
         self, room_version: RoomVersion, key_values: dict
@@ -302,13 +324,16 @@ class EventBuilderFactory:
         Returns:
             EventBuilder
         """
+        # Get tenant-aware hostname and signing key
+        hostname, signing_key = self._get_hostname_and_signing_key()
+
         return EventBuilder(
             store=self.store,
             state=self.state,
             event_auth_handler=self._event_auth_handler,
             clock=self.clock,
-            hostname=self.hostname,
-            signing_key=self.signing_key,
+            hostname=hostname,
+            signing_key=signing_key,
             room_version=room_version,
             type=key_values["type"],
             state_key=key_values.get("state_key"),

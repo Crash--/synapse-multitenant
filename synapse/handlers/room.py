@@ -89,6 +89,7 @@ from synapse.types import (
 )
 from synapse.types.handlers import ShutdownRoomParams, ShutdownRoomResponse
 from synapse.types.state import StateFilter
+from synapse.tenant_context import get_current_tenant
 from synapse.util import stringutils
 from synapse.util.async_helpers import concurrently_execute
 from synapse.util.caches.response_cache import ResponseCache
@@ -192,6 +193,17 @@ class RoomCreationHandler:
         self._third_party_event_rules = (
             hs.get_module_api_callbacks().third_party_event_rules
         )
+
+    def _get_current_server_name(self) -> str:
+        """Get the server name for the current request context.
+
+        In multi-tenant mode, returns the current tenant's server_name.
+        Otherwise, returns the default server_name.
+        """
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.server_name
+        return self.server_name
 
     async def upgrade_room(
         self,
@@ -1165,7 +1177,7 @@ class RoomCreationHandler:
                     "Please note this expects a local part — 'wombat', not '#wombat:example.com'.",
                 )
 
-            room_alias = RoomAlias(config["room_alias_name"], self.hs.hostname)
+            room_alias = RoomAlias(config["room_alias_name"], self._get_current_server_name())
             mapping = await self.store.get_association_from_room_alias(room_alias)
 
             if mapping:
@@ -1295,7 +1307,7 @@ class RoomCreationHandler:
                 requester=requester,
                 room_id=room_id,
                 room_alias=room_alias,
-                servers=[self.hs.hostname],
+                servers=[self._get_current_server_name()],
                 check_membership=False,
             )
 
@@ -1842,7 +1854,7 @@ class RoomCreationHandler:
             A random room ID of the form "!opaque_id:domain".
         """
         random_string = stringutils.random_string(18)
-        return RoomIdWithDomain(random_string, self.hs.hostname).to_string()
+        return RoomIdWithDomain(random_string, self._get_current_server_name()).to_string()
 
     async def _generate_and_create_room_id(
         self,

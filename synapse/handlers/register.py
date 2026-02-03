@@ -57,6 +57,7 @@ from synapse.replication.http.register import (
 from synapse.spam_checker_api import RegistrationBehaviour
 from synapse.types import GUEST_USER_ID_PATTERN, RoomAlias, UserID, create_requester
 from synapse.types.state import StateFilter
+from synapse.tenant_context import get_current_tenant
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -156,6 +157,17 @@ class RegistrationHandler:
             auth_provider_id="", server_name=self.server_name
         )
 
+    def _get_current_server_name(self) -> str:
+        """Get the server name for the current request context.
+
+        In multi-tenant mode, returns the tenant's server_name.
+        Otherwise, returns the default server hostname.
+        """
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.server_name
+        return self.hs.hostname
+
     async def check_username(
         self,
         localpart: str,
@@ -181,7 +193,8 @@ class RegistrationHandler:
                 400, "User ID may not begin with _", Codes.INVALID_USERNAME
             )
 
-        user = UserID(localpart, self.hs.hostname)
+        # Multi-tenant: use tenant's server_name if available
+        user = UserID(localpart, self._get_current_server_name())
         user_id = user.to_string()
 
         if assigned_user_id:
@@ -310,7 +323,8 @@ class RegistrationHandler:
 
             was_guest = guest_access_token is not None
 
-            user = UserID(localpart, self.hs.hostname)
+            # Multi-tenant: use tenant's server_name if available
+            user = UserID(localpart, self._get_current_server_name())
             user_id = user.to_string()
 
             if was_guest:
@@ -353,7 +367,8 @@ class RegistrationHandler:
                     raise SynapseError(500, "Unable to find a suitable guest user ID")
 
                 generated_localpart = await self.store.generate_user_id()
-                user = UserID(generated_localpart, self.hs.hostname)
+                # Multi-tenant: use tenant's server_name if available
+                user = UserID(generated_localpart, self._get_current_server_name())
                 user_id = user.to_string()
                 self.check_user_id_not_appservice_exclusive(user_id)
                 if generate_display_name:
@@ -653,7 +668,8 @@ class RegistrationHandler:
     async def appservice_register(
         self, user_localpart: str, as_token: str
     ) -> tuple[str, ApplicationService]:
-        user = UserID(user_localpart, self.hs.hostname)
+        # Multi-tenant: use tenant's server_name if available
+        user = UserID(user_localpart, self._get_current_server_name())
         user_id = user.to_string()
         service = self.store.get_app_service_by_token(as_token)
         if not service:
