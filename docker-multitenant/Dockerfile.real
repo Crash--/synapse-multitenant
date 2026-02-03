@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+# Multi-Tenant Synapse Docker Image
+#
+# This builds real Synapse from the local source with multi-tenant patches.
+# Build from the repository root:
+#   DOCKER_BUILDKIT=1 docker build -f docker-multitenant/Dockerfile.real .
+#
+# NOTE: Uses official matrixdotorg/synapse as base and overlays multi-tenant patches.
+# Version must match the local codebase version.
+
+ARG SYNAPSE_VERSION=v1.146.0
+
+###
+### Stage 1: Get official Synapse with all dependencies pre-installed
+###
+FROM matrixdotorg/synapse:${SYNAPSE_VERSION} AS base
+
+###
+### Stage 2: Apply multi-tenant patches
+###
+FROM base
+
+# Synapse v1.146.0 uses Python 3.13
+# Copy the multi-tenant modules from local source
+COPY synapse/tenant_context.py /usr/local/lib/python3.13/site-packages/synapse/tenant_context.py
+COPY synapse/tenant_registry.py /usr/local/lib/python3.13/site-packages/synapse/tenant_registry.py
+COPY synapse/config/tenants.py /usr/local/lib/python3.13/site-packages/synapse/config/tenants.py
+
+# Copy modified core files (with multi-tenant integration)
+COPY synapse/http/site.py /usr/local/lib/python3.13/site-packages/synapse/http/site.py
+COPY synapse/storage/database.py /usr/local/lib/python3.13/site-packages/synapse/storage/database.py
+COPY synapse/storage/databases/main/__init__.py /usr/local/lib/python3.13/site-packages/synapse/storage/databases/main/__init__.py
+COPY synapse/handlers/register.py /usr/local/lib/python3.13/site-packages/synapse/handlers/register.py
+COPY synapse/handlers/room.py /usr/local/lib/python3.13/site-packages/synapse/handlers/room.py
+COPY synapse/server.py /usr/local/lib/python3.13/site-packages/synapse/server.py
+COPY synapse/events/builder.py /usr/local/lib/python3.13/site-packages/synapse/events/builder.py
+
+# Copy the multi-tenant media and crypto modules
+COPY synapse/media/multitenant_filepath.py /usr/local/lib/python3.13/site-packages/synapse/media/multitenant_filepath.py
+COPY synapse/crypto/multitenant_keyring.py /usr/local/lib/python3.13/site-packages/synapse/crypto/multitenant_keyring.py
+
+# Copy modified config homeserver module (includes TenantsConfig import)
+COPY synapse/config/homeserver.py /usr/local/lib/python3.13/site-packages/synapse/config/homeserver.py
+
+# Create directories for multi-tenant data
+RUN mkdir -p /data /keys /media && \
+    chmod 777 /data /keys /media
+
+# Copy multi-tenant scripts
+COPY docker-multitenant/scripts/keygen.py /scripts/keygen.py
+COPY docker-multitenant/scripts/init_schemas.py /scripts/init_schemas.py
+
+EXPOSE 8008/tcp 8448/tcp
+
+# Use the standard Synapse entrypoint
+ENTRYPOINT ["/start.py"]
+
+HEALTHCHECK --start-period=30s --interval=15s --timeout=5s \
+  CMD curl -fSs http://localhost:8008/health || exit 1

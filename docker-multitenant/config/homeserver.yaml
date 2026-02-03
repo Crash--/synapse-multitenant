@@ -1,0 +1,110 @@
+# Multi-Tenant Synapse Configuration
+#
+# This configuration runs a single Synapse process serving 3 Matrix domains:
+# - acme.localhost
+# - corp.localhost
+# - startup.localhost
+
+## Server Settings ##
+# Primary server_name is required for backwards compatibility
+server_name: "localhost"
+pid_file: /data/homeserver.pid
+web_client: false
+soft_file_limit: 0
+public_baseurl: "http://localhost:8008/"
+
+## Multi-Tenant Mode ##
+multi_tenant:
+  enabled: true
+  default_schema: "public"
+
+## Tenant Definitions ##
+tenants:
+  - server_name: "acme.localhost"
+    database_schema: "tenant_acme"
+    signing_key_path: "/keys/acme_localhost.signing.key"
+    media_store_path: "/media/acme"
+    registration_enabled: true
+    enable_federation: true
+
+  - server_name: "corp.localhost"
+    database_schema: "tenant_corp"
+    signing_key_path: "/keys/corp_localhost.signing.key"
+    media_store_path: "/media/corp"
+    registration_enabled: true
+    enable_federation: true
+
+  - server_name: "startup.localhost"
+    database_schema: "tenant_startup"
+    signing_key_path: "/keys/startup_localhost.signing.key"
+    media_store_path: "/media/startup"
+    registration_enabled: true
+    enable_federation: false
+
+## Listeners ##
+listeners:
+  - port: 8008
+    type: http
+    tls: false
+    x_forwarded: true
+    bind_addresses: ['0.0.0.0']
+    resources:
+      - names: [client, federation]
+        compress: false
+
+## Database ##
+database:
+  name: psycopg2
+  allow_unsafe_locale: true
+  args:
+    user: synapse
+    password: synapse_password
+    database: synapse_multitenant
+    host: postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+
+## Logging ##
+log_config: "/data/log.config"
+
+## Media ##
+media_store_path: "/media"
+max_upload_size: "50M"
+
+## Registration ##
+enable_registration: true
+enable_registration_without_verification: true
+registration_shared_secret: "demo_shared_secret_change_in_production"
+
+## Signing Key ##
+# Primary signing key (required)
+signing_key_path: "/keys/localhost.signing.key"
+
+## Trusted Key Servers ##
+suppress_key_server_warning: true
+trusted_key_servers: []
+
+## Security ##
+macaroon_secret_key: "demo_macaroon_secret_change_in_production"
+form_secret: "demo_form_secret_change_in_production"
+
+## Rate Limiting ##
+rc_message:
+  per_second: 1
+  burst_count: 10
+
+rc_registration:
+  per_second: 0.5
+  burst_count: 5
+
+## Metrics ##
+enable_metrics: false
+report_stats: false
+
+## Guest Access ##
+allow_guest_access: false
+
+## Experimental Features ##
+experimental_features:
+  msc3266_enabled: false

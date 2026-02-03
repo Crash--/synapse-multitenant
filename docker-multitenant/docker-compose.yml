@@ -1,0 +1,145 @@
+# Multi-Tenant Synapse (REAL Synapse Build)
+#
+# This setup creates:
+# - PostgreSQL with schemas for 3 tenants
+# - REAL Synapse built from source with multi-tenant patches
+# - Nginx reverse proxy routing by Host header
+#
+# Usage:
+#   docker compose up -d --build
+#
+# Test:
+#   curl -H "Host: acme.localhost" http://localhost/_matrix/client/versions
+#   curl -H "Host: corp.localhost" http://localhost/_matrix/client/versions
+#   curl -H "Host: startup.localhost" http://localhost/_matrix/client/versions
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: synapse-mt-postgres
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse_password
+      POSTGRES_DB: synapse_multitenant
+    volumes:
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init-db.sql:ro
+    tmpfs:
+      - /var/lib/postgresql/data
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse_multitenant"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - synapse-net
+
+  # Key Generator (runs once to create signing keys)
+  # Uses the Synapse image which has signedjson pre-installed
+  keygen:
+    build:
+      context: ..
+      dockerfile: docker-multitenant/Dockerfile.real
+    image: synapse-multitenant:latest
+    container_name: synapse-mt-keygen
+    user: root
+    volumes:
+      - ./data/keys:/keys
+      - ./scripts:/scripts:ro
+    environment:
+      KEYS_DIR: "/keys"
+    entrypoint: ["python3", "/scripts/generate_keys.py"]
+    networks:
+      - synapse-net
+
+  # Schema initializer (creates PostgreSQL schemas for tenants)
+  # Uses Synapse image which has psycopg2 pre-installed
+  init-schemas:
+    build:
+      context: ..
+      dockerfile: docker-multitenant/Dockerfile.real
+    image: synapse-multitenant:latest
+    container_name: synapse-mt-init-schemas
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse_password
+      POSTGRES_DB: synapse_multitenant
+      TENANTS: "acme.localhost,corp.localhost,startup.localhost"
+    entrypoint: ["python3", "/scripts/init_schemas.py"]
+    networks:
+      - synapse-net
+
+  # Synapse Multi-Tenant Server (REAL Synapse)
+  synapse:
+    build:
+      context: ..
+      dockerfile: docker-multitenant/Dockerfile.real
+    image: synapse-multitenant:latest
+    container_name: synapse-mt-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keygen:
+        condition: service_completed_successfully
+      init-schemas:
+        condition: service_completed_successfully
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+    volumes:
+      - ./config:/data:ro
+      - ./data/keys:/keys:ro
+      - ./data/media:/media
+    ports:
+      - "8008:8008"
+    networks:
+      - synapse-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: synapse-mt-nginx
+    depends_on:
+      synapse:
+        condition: service_healthy
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    networks:
+      - synapse-net
+
+  # Test Runner (optional - run with: docker compose run test)
+  test:
+    image: python:3.11-slim
+    container_name: synapse-mt-test
+    depends_on:
+      synapse:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: >
+      sh -c "pip install -q requests &&
+             python3 /scripts/test_tenants.py"
+    networks:
+      - synapse-net
+    profiles:
+      - test
+
+networks:
+  synapse-net:
+    driver: bridge
