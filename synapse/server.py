@@ -63,9 +63,11 @@ from synapse.app.phone_stats_home import start_phone_stats_home
 from synapse.appservice.api import ApplicationServiceApi
 from synapse.appservice.scheduler import ApplicationServiceScheduler
 from synapse.config.homeserver import HomeServerConfig
+from synapse.tenant_context import get_current_tenant
 from synapse.crypto import context_factory
 from synapse.crypto.context_factory import RegularPolicyForHTTPS
 from synapse.crypto.keyring import Keyring
+from synapse.crypto.multitenant_keyring import MultiTenantKeyring, create_multi_tenant_keyring
 from synapse.events.builder import EventBuilderFactory
 from synapse.events.presence_router import PresenceRouter
 from synapse.events.utils import EventClientSerializer
@@ -676,24 +678,53 @@ class HomeServer(metaclass=abc.ABCMeta):
         return self._reactor
 
     def is_mine(self, domain_specific_string: DomainSpecificString) -> bool:
-        return domain_specific_string.domain == self.hostname
+        # Multi-tenant: check if domain matches any local tenant
+        domain = domain_specific_string.domain
+        if domain == self.hostname:
+            return True
+        # Check if it's one of our tenants
+        return self._is_local_server_name(domain)
 
     def is_mine_id(self, user_id: str) -> bool:
         """Determines whether a user ID or room alias originates from this homeserver.
 
         Returns:
             `True` if the hostname part of the user ID or room alias matches this
-            homeserver.
+            homeserver or any configured tenant.
             `False` otherwise, or if the user ID or room alias is malformed.
         """
         localpart_hostname = user_id.split(":", 1)
         if len(localpart_hostname) < 2:
             return False
-        return localpart_hostname[1] == self.hostname
+        server_name = localpart_hostname[1]
+        if server_name == self.hostname:
+            return True
+        # Multi-tenant: check if it's one of our tenants
+        return self._is_local_server_name(server_name)
 
     def is_mine_server_name(self, server_name: str) -> bool:
         """Determines whether a server name refers to this homeserver."""
-        return server_name == self.hostname
+        if server_name == self.hostname:
+            return True
+        # Multi-tenant: check if it's one of our tenants
+        return self._is_local_server_name(server_name)
+
+    def _is_local_server_name(self, server_name: str) -> bool:
+        """Check if server_name belongs to a local tenant.
+
+        This method checks both the current tenant context and all configured tenants.
+        """
+        # Check current tenant context first
+        tenant = get_current_tenant()
+        if tenant is not None and tenant.server_name == server_name:
+            return True
+
+        # Check if it's any of our configured tenants
+        tenants_config = getattr(self.config, "tenants", None)
+        if tenants_config is not None and hasattr(tenants_config, "multi_tenant"):
+            if tenants_config.multi_tenant.enabled:
+                return server_name in tenants_config.multi_tenant.tenants
+        return False
 
     @cache_in_self
     def get_clock(self) -> Clock:
@@ -969,6 +1000,11 @@ class HomeServer(metaclass=abc.ABCMeta):
     @cache_in_self
     def get_keyring(self) -> Keyring:
         return Keyring(self)
+
+    @cache_in_self
+    def get_multi_tenant_keyring(self) -> MultiTenantKeyring | None:
+        """Get the multi-tenant keyring, or None if multi-tenant mode is disabled."""
+        return create_multi_tenant_keyring(self)
 
     @cache_in_self
     def get_event_builder_factory(self) -> EventBuilderFactory:

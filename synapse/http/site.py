@@ -19,6 +19,7 @@
 #
 #
 import contextlib
+import contextvars
 import json
 import logging
 import time
@@ -48,12 +49,19 @@ from synapse.logging.context import (
     PreserveLoggingContext,
 )
 from synapse.metrics import SERVER_NAME_LABEL
+from synapse.tenant_context import (
+    get_current_tenant,
+    reset_current_tenant,
+    set_current_tenant,
+)
 from synapse.types import ISynapseReactor, Requester
 
 if TYPE_CHECKING:
     import opentracing
 
+    from synapse.config.tenants import TenantConfig
     from synapse.server import HomeServer
+    from synapse.tenant_registry import TenantRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -138,6 +146,38 @@ class SynapseRequest(Request):
         # what time we finished sending the response to the client (or the connection
         # dropped)
         self.finish_time: float | None = None
+
+        # Multi-tenant support: tenant configuration for this request
+        self._tenant_config: "TenantConfig | None" = None
+        # Token to reset tenant context when request completes
+        self._tenant_context_token: contextvars.Token["TenantConfig | None"] | None = None
+
+    @property
+    def tenant_config(self) -> "TenantConfig | None":
+        """Get the tenant configuration for this request."""
+        return self._tenant_config
+
+    def set_tenant_context(self, tenant: "TenantConfig") -> None:
+        """Set the tenant context for this request.
+
+        This sets both the request-local tenant config and the thread-local
+        context variable for the duration of request processing.
+
+        Args:
+            tenant: The TenantConfig for this request.
+        """
+        self._tenant_config = tenant
+        self._tenant_context_token = set_current_tenant(tenant)
+
+    def clear_tenant_context(self) -> None:
+        """Clear the tenant context for this request.
+
+        This should be called when request processing is complete to restore
+        the previous tenant context (if any).
+        """
+        if self._tenant_context_token is not None:
+            reset_current_tenant(self._tenant_context_token)
+            self._tenant_context_token = None
 
     def __repr__(self) -> str:
         # We overwrite this so that we don't log ``access_token``
@@ -423,6 +463,15 @@ class SynapseRequest(Request):
         # this is called once a Resource has been found to serve the request; in our
         # case the Resource in question will normally be a JsonResource.
 
+        # Set up tenant context if multi-tenant mode is enabled
+        self._setup_tenant_context()
+
+        # Determine the effective server name for this request
+        # In multi-tenant mode, this comes from the tenant config
+        effective_server_name = self.our_server_name
+        if self._tenant_config is not None:
+            effective_server_name = self._tenant_config.server_name
+
         # Create a LogContext for this request
         #
         # We only care about associating logs and tallying up metrics at the per-request
@@ -431,7 +480,7 @@ class SynapseRequest(Request):
         request_id = self.get_request_id()
         self.logcontext = LoggingContext(
             name=request_id,
-            server_name=self.our_server_name,
+            server_name=effective_server_name,
             request=ContextRequest(
                 request_id=request_id,
                 ip_address=self.get_client_ip_if_available(),
@@ -466,8 +515,45 @@ class SynapseRequest(Request):
             requests_counter.labels(
                 method=self.get_method(),
                 servlet=self.request_metrics.name,
-                **{SERVER_NAME_LABEL: self.our_server_name},
+                **{SERVER_NAME_LABEL: effective_server_name},
             ).inc()
+
+    def _setup_tenant_context(self) -> None:
+        """Set up the tenant context for this request.
+
+        This is called at the start of request processing to determine which
+        tenant should handle this request based on the Host header.
+        """
+        if not self.synapse_site.multi_tenant_enabled:
+            logger.debug("Multi-tenant mode not enabled")
+            return
+
+        # First try X-Matrix-Server-Name header (allows explicit tenant specification)
+        server_name_header = self.getHeader(b"X-Matrix-Server-Name")
+        if server_name_header:
+            server_name = server_name_header.decode("utf-8", errors="replace")
+            tenant = self.synapse_site.tenant_registry.get_tenant(server_name)
+            if tenant:
+                logger.info("Setting tenant context from X-Matrix-Server-Name: %s", tenant.server_name)
+                self.set_tenant_context(tenant)
+                return
+
+        # Fall back to Host header
+        host_header = self.getHeader(b"Host")
+        if host_header:
+            host = host_header.decode("utf-8", errors="replace")
+            logger.info("Looking up tenant for Host header: %s", host)
+            tenant = self.synapse_site.get_tenant_for_host(host)
+            if tenant:
+                logger.info("Setting tenant context from Host: %s -> %s", host, tenant.server_name)
+                self.set_tenant_context(tenant)
+                return
+            else:
+                logger.info("No tenant found for host: %s", host)
+
+        # No tenant found - this might be OK for some endpoints (like health checks)
+        # but handlers should check if a tenant context is required
+        logger.debug("No tenant context set for this request")
 
     @contextlib.contextmanager
     def processing(self) -> Generator[None, None, None]:
@@ -514,14 +600,18 @@ class SynapseRequest(Request):
         Overrides twisted.web.server.Request.finish to record the finish time and do
         logging.
         """
-        self.finish_time = time.time()
-        Request.finish(self)
-        if self._opentracing_span:
-            self._opentracing_span.log_kv({"event": "response sent"})
-        if not self._is_processing:
-            assert self.logcontext is not None
-            with PreserveLoggingContext(self.logcontext):
-                self._finished_processing()
+        try:
+            self.finish_time = time.time()
+            Request.finish(self)
+            if self._opentracing_span:
+                self._opentracing_span.log_kv({"event": "response sent"})
+            if not self._is_processing:
+                assert self.logcontext is not None
+                with PreserveLoggingContext(self.logcontext):
+                    self._finished_processing()
+        finally:
+            # Clean up tenant context when request finishes
+            self.clear_tenant_context()
 
     def connectionLost(self, reason: Failure | Exception) -> None:
         """Called when the client connection is closed before the response is written.
@@ -529,50 +619,54 @@ class SynapseRequest(Request):
         Overrides twisted.web.server.Request.connectionLost to record the finish time and
         do logging.
         """
-        # There is a bug in Twisted where reason is not wrapped in a Failure object
-        # Detect this and wrap it manually as a workaround
-        # More information: https://github.com/matrix-org/synapse/issues/7441
-        if not isinstance(reason, Failure):
-            reason = Failure(reason)
+        try:
+            # There is a bug in Twisted where reason is not wrapped in a Failure object
+            # Detect this and wrap it manually as a workaround
+            # More information: https://github.com/matrix-org/synapse/issues/7441
+            if not isinstance(reason, Failure):
+                reason = Failure(reason)
 
-        self.finish_time = time.time()
-        Request.connectionLost(self, reason)
+            self.finish_time = time.time()
+            Request.connectionLost(self, reason)
 
-        if self.logcontext is None:
-            logger.info(
-                "Connection from %s lost before request headers were read", self.client
-            )
-            return
-
-        # we only get here if the connection to the client drops before we send
-        # the response.
-        #
-        # It's useful to log it here so that we can get an idea of when
-        # the client disconnects.
-        with PreserveLoggingContext(self.logcontext):
-            logger.info("Connection from client lost before response was sent")
-
-            if self._opentracing_span:
-                self._opentracing_span.log_kv(
-                    {"event": "client connection lost", "reason": str(reason.value)}
+            if self.logcontext is None:
+                logger.info(
+                    "Connection from %s lost before request headers were read", self.client
                 )
+                return
 
-            if self._is_processing:
-                if self.is_render_cancellable:
-                    if self.render_deferred is not None:
-                        # Throw a cancellation into the request processing, in the hope
-                        # that it will finish up sooner than it normally would.
-                        # The `self.processing()` context manager will call
-                        # `_finished_processing()` when done.
-                        with PreserveLoggingContext():
-                            self.render_deferred.cancel()
-                    else:
-                        logger.error(
-                            "Connection from client lost, but have no Deferred to "
-                            "cancel even though the request is marked as cancellable."
-                        )
-            else:
-                self._finished_processing()
+            # we only get here if the connection to the client drops before we send
+            # the response.
+            #
+            # It's useful to log it here so that we can get an idea of when
+            # the client disconnects.
+            with PreserveLoggingContext(self.logcontext):
+                logger.info("Connection from client lost before response was sent")
+
+                if self._opentracing_span:
+                    self._opentracing_span.log_kv(
+                        {"event": "client connection lost", "reason": str(reason.value)}
+                    )
+
+                if self._is_processing:
+                    if self.is_render_cancellable:
+                        if self.render_deferred is not None:
+                            # Throw a cancellation into the request processing, in the hope
+                            # that it will finish up sooner than it normally would.
+                            # The `self.processing()` context manager will call
+                            # `_finished_processing()` when done.
+                            with PreserveLoggingContext():
+                                self.render_deferred.cancel()
+                        else:
+                            logger.error(
+                                "Connection from client lost, but have no Deferred to "
+                                "cancel even though the request is marked as cancellable."
+                            )
+                else:
+                    self._finished_processing()
+        finally:
+            # Clean up tenant context when connection is lost
+            self.clear_tenant_context()
 
     def _started_processing(self, servlet_name: str) -> None:
         """Record the fact that we are processing this request.
@@ -904,6 +998,55 @@ class SynapseSite(ProxySite):
         self.access_logger = logging.getLogger(logger_name)
         self.server_version_string = server_version_string.encode("ascii")
         self.connections: list[Protocol] = []
+
+        # Multi-tenant support: store the tenant registry for tenant lookups
+        self._tenant_registry: "TenantRegistry | None" = None
+        self._multi_tenant_enabled: bool = False
+
+        # Check if multi-tenant mode is enabled in config
+        tenants_config = getattr(hs.config, "tenants", None)
+        if tenants_config is not None and tenants_config.multi_tenant.enabled:
+            from synapse.tenant_registry import TenantRegistry
+
+            self._multi_tenant_enabled = True
+            self._tenant_registry = TenantRegistry(tenants_config.multi_tenant)
+            logger.info(
+                "Multi-tenant mode enabled for site %s with %d tenants",
+                site_tag,
+                len(self._tenant_registry.get_all_tenants()),
+            )
+
+    @property
+    def multi_tenant_enabled(self) -> bool:
+        """Whether multi-tenant mode is enabled for this site."""
+        return self._multi_tenant_enabled
+
+    @property
+    def tenant_registry(self) -> "TenantRegistry | None":
+        """Get the tenant registry, or None if not in multi-tenant mode."""
+        return self._tenant_registry
+
+    def get_tenant_for_host(self, host: str) -> "TenantConfig | None":
+        """Get the tenant configuration for a given host.
+
+        Args:
+            host: The Host header value (may include port).
+
+        Returns:
+            The TenantConfig if found, None otherwise.
+        """
+        if not self._multi_tenant_enabled or self._tenant_registry is None:
+            return None
+
+        # Strip port if present
+        if ":" in host and not host.startswith("["):
+            # Not an IPv6 address, strip port
+            host = host.rsplit(":", 1)[0]
+        elif host.startswith("[") and "]:" in host:
+            # IPv6 address with port
+            host = host.rsplit(":", 1)[0]
+
+        return self._tenant_registry.get_tenant(host)
 
     def buildProtocol(self, addr: IAddress) -> SynapseProtocol:
         protocol = SynapseProtocol(
