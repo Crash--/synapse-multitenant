@@ -60,12 +60,14 @@ from synapse.metrics import SERVER_NAME_LABEL, register_threadpool
 from synapse.storage.background_updates import BackgroundUpdater
 from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine, Sqlite3Engine
 from synapse.storage.types import Connection, Cursor, SQLQueryParameters
+from synapse.tenant_context import get_current_tenant
 from synapse.types import StrCollection
 from synapse.util.async_helpers import delay_cancellation
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter
 
 if TYPE_CHECKING:
+    from synapse.config.tenants import TenantConfig
     from synapse.server import HomeServer
 
 # python 3 does not have a maximum int value
@@ -652,6 +654,67 @@ class DatabasePool:
         """Is the database pool currently running"""
         return self._db_pool.running
 
+    def _set_tenant_schema(
+        self, conn: Connection, tenant: "TenantConfig"
+    ) -> str | None:
+        """Set the PostgreSQL search_path to the tenant's schema.
+
+        This method sets the search_path for the connection to isolate
+        queries to the tenant's schema. It returns the original search_path
+        so it can be restored later.
+
+        Args:
+            conn: The database connection.
+            tenant: The tenant configuration.
+
+        Returns:
+            The original search_path value, or None if not applicable.
+        """
+        if not isinstance(self.engine, PostgresEngine):
+            return None
+
+        cursor = conn.cursor()
+        try:
+            # Get the current search_path
+            cursor.execute("SHOW search_path")
+            result = cursor.fetchone()
+            original_search_path = result[0] if result else "public"
+
+            # Set the search_path to the tenant's schema
+            # We include 'public' as a fallback for shared tables
+            schema = tenant.database_schema
+            # Use parameterized query format - but schema names can't be parameters
+            # so we validate the schema name first
+            if not schema.replace("_", "").isalnum():
+                raise ValueError(f"Invalid schema name: {schema}")
+
+            cursor.execute(f"SET search_path TO {schema}, public")
+            logger.debug(
+                "Set search_path to '%s, public' for tenant %s",
+                schema,
+                tenant.server_name,
+            )
+            return original_search_path
+        finally:
+            cursor.close()
+
+    def _restore_search_path(self, conn: Connection, search_path: str) -> None:
+        """Restore the PostgreSQL search_path to its original value.
+
+        Args:
+            conn: The database connection.
+            search_path: The original search_path value to restore.
+        """
+        if not isinstance(self.engine, PostgresEngine):
+            return
+
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"SET search_path TO {search_path}")
+            logger.debug("Restored search_path to '%s'", search_path)
+        finally:
+            cursor.close()
+
     async def _check_safe_to_upsert(self) -> None:
         """
         Is it safe to use native UPSERT?
@@ -1050,6 +1113,18 @@ class DatabasePool:
 
         start_time = monotonic_time()
 
+        # Capture the current tenant BEFORE entering the thread pool
+        # contextvars don't propagate to thread pool threads automatically
+        captured_tenant = get_current_tenant()
+        if captured_tenant is not None:
+            logger.info(
+                "Captured tenant context for DB operation: %s (schema: %s)",
+                captured_tenant.server_name,
+                captured_tenant.database_schema,
+            )
+        else:
+            logger.debug("No tenant context for DB operation")
+
         def inner_func(conn: _PoolConnection, *args: P.args, **kwargs: P.kwargs) -> R:
             # We shouldn't be in a transaction. If we are then something
             # somewhere hasn't committed after doing work. (This is likely only
@@ -1093,12 +1168,27 @@ class DatabasePool:
                         if self._txn_limit > 0:
                             self._txn_counters[tid] = 1
 
+                    # Multi-tenant support: use the captured tenant from the async context
+                    # (contextvars don't propagate to thread pool threads)
+                    original_search_path: str | None = None
+
                     try:
                         if db_autocommit:
                             self.engine.attempt_to_set_autocommit(conn, True)
                         if isolation_level is not None:
                             self.engine.attempt_to_set_isolation_level(
                                 conn, isolation_level
+                            )
+
+                        # Set tenant schema if multi-tenant mode is active
+                        if captured_tenant is not None and isinstance(self.engine, PostgresEngine):
+                            original_search_path = self._set_tenant_schema(
+                                conn, captured_tenant
+                            )
+                            logger.info(
+                                "Set database schema for tenant %s: %s",
+                                captured_tenant.server_name,
+                                captured_tenant.database_schema,
                             )
 
                         db_conn = LoggingDatabaseConnection(
@@ -1109,6 +1199,12 @@ class DatabasePool:
                         )
                         return func(db_conn, *args, **kwargs)
                     finally:
+                        # Restore original search_path if we changed it
+                        if original_search_path is not None and isinstance(
+                            self.engine, PostgresEngine
+                        ):
+                            self._restore_search_path(conn, original_search_path)
+
                         if db_autocommit:
                             self.engine.attempt_to_set_autocommit(conn, False)
                         if isolation_level:

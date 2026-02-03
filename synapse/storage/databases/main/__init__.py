@@ -410,6 +410,19 @@ def check_database_before_upgrade(
     if user_domain == config.server.server_name:
         return
 
+    # Multi-tenant support: check if the user belongs to a configured tenant
+    tenants_config = getattr(config, "tenants", None)
+    if tenants_config is not None and hasattr(tenants_config, "multi_tenant"):
+        if tenants_config.multi_tenant.enabled:
+            # Get all configured tenant server_names
+            tenant_server_names = set(tenants_config.multi_tenant.tenants.keys())
+            if user_domain in tenant_server_names:
+                logger.info(
+                    "User domain %s belongs to configured tenant, allowing",
+                    user_domain,
+                )
+                return
+
     raise Exception(
         "Found users in database not native to %s!\n"
         "You cannot change a synapse server_name after it's been configured"
