@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Multi-Tenant Synapse — Request Lifecycle</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="chrome">
+    <h1>Multi-Tenant Synapse <span class="subtitle">— Request Lifecycle</span></h1>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-scene="A" role="tab">A · Flow</button>
+      <button class="tab" data-scene="B" role="tab">B · Stack</button>
+      <button class="tab" data-scene="C" role="tab">C · Log</button>
+    </nav>
+    <label class="parallel-toggle">
+      <input type="checkbox" id="parallel-mode" />
+      <span>Parallel tenants</span>
+    </label>
+  </header>
+
+  <main id="scene-mount" class="scene-mount" aria-live="polite"></main>
+
+  <footer class="transport">
+    <button id="play-pause" aria-label="Play / pause">▶</button>
+    <button id="restart" aria-label="Restart">↻</button>
+    <div class="scrubber" id="scrubber"></div>
+    <div class="stage-label">
+      <span id="stage-name">Idle</span>
+      <span class="stage-counter"><span id="stage-index">0</span>/10</span>
+    </div>
+  </footer>
+
+  <script type="module" src="data.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
