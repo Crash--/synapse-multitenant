@@ -104,51 +104,194 @@ def create_schema(conn, schema_name: str) -> None:
         logger.info(f"Created schema: {schema_name}")
 
 
-def copy_table_structure(conn, source_schema: str, target_schema: str) -> None:
-    """Copy table structure from source schema to target schema.
+def build_clone_schema_sql(
+    target_schema: str,
+    tables: list,
+    sequences: list,
+    sequence_defaults: list,
+    source_schema: str = "public",
+) -> list:
+    """Build the SQL statements that clone a schema with per-tenant sequences.
 
-    This copies the table definitions, indexes, and constraints from the
-    public schema (or another source) to the tenant schema.
+    Pure-function SQL generator -- does not touch the DB. Returns an
+    ordered list of SQL statements that, when executed, produce a
+    tenant schema containing:
+
+      1. Per-tenant copies of every sequence in ``sequences``.
+      2. Cloned copies of every table in ``tables``, via LIKE INCLUDING ALL.
+      3. ALTER statements repointing each (table, column) default to
+         the per-tenant sequence copy.
+
+    Args:
+        target_schema: Tenant schema name (validated).
+        tables: Names of tables to clone.
+        sequences: Names of sequences to clone.
+        sequence_defaults: ``(table, column, sequence_name)`` tuples.
+        source_schema: Schema to clone from. Defaults to ``"public"``.
+
+    Returns:
+        Ordered list of SQL statements.
+
+    Raises:
+        ValueError: on any name that fails the alphanumeric+underscore
+            safety check.
     """
+
+    def _safe(name: str) -> str:
+        if not name.replace("_", "").isalnum():
+            raise ValueError(f"Invalid schema name: {name}")
+        return name
+
+    target = _safe(target_schema)
+    source = _safe(source_schema)
+
+    statements: list = []
+
+    # 1. Sequences -- per-tenant copies starting at 1 (postgres default).
+    #    Tenant tables start empty, so no seeding needed.
+    for seq in sequences:
+        s = _safe(seq)
+        statements.append(f"CREATE SEQUENCE IF NOT EXISTS {target}.{s}")
+
+    # 2. Tables -- LIKE INCLUDING ALL clones structure, indexes,
+    #    constraints, and defaults (the defaults still point at
+    #    source_schema sequences at this point).
+    for tbl in tables:
+        t = _safe(tbl)
+        statements.append(
+            f"CREATE TABLE {target}.{t} "
+            f"(LIKE {source}.{t} INCLUDING ALL)"
+        )
+
+    # 3. Repoint column defaults to per-tenant sequence copies.
+    for tbl, col, seq in sequence_defaults:
+        t = _safe(tbl)
+        c = _safe(col)
+        s = _safe(seq)
+        statements.append(
+            f"ALTER TABLE {target}.{t} "
+            f"ALTER COLUMN {c} "
+            f"SET DEFAULT nextval('{target}.{s}')"
+        )
+
+    return statements
+
+
+def discover_schema_surface(
+    conn,
+    source_schema: str = "public",
+):
+    """Discover tables, sequences, and sequence/column bindings.
+
+    Queries PostgreSQL catalogs to enumerate:
+      - Every BASE TABLE in ``source_schema``.
+      - Every sequence in ``source_schema``.
+      - Every column whose default is ``nextval('<source_schema>.<seq>')``.
+
+    Returns:
+        ``(tables, sequences, sequence_defaults)`` -- the three inputs to
+        :func:`build_clone_schema_sql`.
+    """
+    import re
+
     with conn.cursor() as cur:
-        # Get all tables from source schema
         cur.execute(
             """
             SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = %s
-              AND table_type = 'BASE TABLE'
-            ORDER BY table_name
+              FROM information_schema.tables
+             WHERE table_schema = %s
+               AND table_type = 'BASE TABLE'
+             ORDER BY table_name
             """,
             (source_schema,),
         )
         tables = [row[0] for row in cur.fetchall()]
 
-        logger.info(
-            f"Copying {len(tables)} tables from {source_schema} to {target_schema}"
+        cur.execute(
+            """
+            SELECT sequence_name
+              FROM information_schema.sequences
+             WHERE sequence_schema = %s
+             ORDER BY sequence_name
+            """,
+            (source_schema,),
         )
+        sequences = [row[0] for row in cur.fetchall()]
 
-        for table in tables:
-            # Get the CREATE TABLE statement
-            # We use pg_dump style recreation
-            cur.execute(
-                f"""
-                SELECT 'CREATE TABLE {target_schema}.' || quote_ident(c.relname) || ' (LIKE {source_schema}.' || quote_ident(c.relname) || ' INCLUDING ALL)'
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'r'
-                """,
-                (source_schema, table),
+        cur.execute(
+            """
+            SELECT c.table_name, c.column_name, c.column_default
+              FROM information_schema.columns c
+             WHERE c.table_schema = %s
+               AND c.column_default LIKE 'nextval(%%'
+             ORDER BY c.table_name, c.column_name
+            """,
+            (source_schema,),
+        )
+        sequence_defaults = []
+        for table_name, column_name, column_default in cur.fetchall():
+            # column_default looks like:
+            #   nextval('public.events_stream_seq'::regclass)
+            match = re.search(
+                r"nextval\('(?:[^.]+\.)?([^']+)'", column_default
             )
-            result = cur.fetchone()
-            if result:
-                try:
-                    cur.execute(result[0])
-                    logger.debug(f"  Created table: {target_schema}.{table}")
-                except psycopg2.errors.DuplicateTable:
-                    logger.debug(f"  Table already exists: {target_schema}.{table}")
-                except Exception as e:
-                    logger.warning(f"  Error creating table {table}: {e}")
+            if match:
+                seq_name = match.group(1)
+                sequence_defaults.append(
+                    (table_name, column_name, seq_name)
+                )
+
+        return tables, sequences, sequence_defaults
+
+
+def clone_schema_with_sequences(
+    conn,
+    source_schema: str,
+    target_schema: str,
+) -> None:
+    """Clone a schema into a tenant schema with per-tenant sequences.
+
+    Enumerates tables, sequences, and column/sequence bindings from
+    the source schema, then emits a batch of SQL that creates
+    per-tenant copies of everything and repoints column defaults.
+
+    REPLACES the old ``copy_table_structure``, which used
+    ``CREATE TABLE ... LIKE ... INCLUDING ALL`` but did not copy
+    sequences -- leaving defaults pointing at ``public.<seq>`` and
+    making per-tenant stream ordering a fiction.
+    """
+    tables, sequences, sequence_defaults = discover_schema_surface(
+        conn, source_schema
+    )
+    logger.info(
+        "Cloning %d tables, %d sequences, %d sequence/column bindings "
+        "from %s to %s",
+        len(tables),
+        len(sequences),
+        len(sequence_defaults),
+        source_schema,
+        target_schema,
+    )
+
+    statements = build_clone_schema_sql(
+        target_schema=target_schema,
+        tables=tables,
+        sequences=sequences,
+        sequence_defaults=sequence_defaults,
+        source_schema=source_schema,
+    )
+
+    with conn.cursor() as cur:
+        for stmt in statements:
+            try:
+                cur.execute(stmt)
+            except Exception as e:
+                logger.error(
+                    "Failed to execute bootstrap SQL: %s -- error: %s",
+                    stmt,
+                    e,
+                )
+                raise
 
 
 def create_tenant_schema_from_template(
@@ -174,10 +317,12 @@ def create_tenant_schema_from_template(
         logger.info(f"Creating tenant schema: {schema_name}")
         create_schema(conn, schema_name)
 
-        # Copy table structure from template
+        # Clone tables and sequences from the template
         conn.autocommit = False
         try:
-            copy_table_structure(conn, template_schema, schema_name)
+            clone_schema_with_sequences(
+                conn, template_schema, schema_name
+            )
             conn.commit()
             logger.info(f"Successfully created tenant schema: {schema_name}")
         except Exception:
@@ -257,9 +402,13 @@ def main() -> int:
         help="Override the schema name (only with --tenant-name)",
     )
     parser.add_argument(
-        "--from-template",
+        "--empty",
         action="store_true",
-        help="Copy table structure from public schema (for migration)",
+        help=(
+            "Create an empty tenant schema without cloning tables or "
+            "sequences. DANGEROUS under multi-tenant mode: tables will "
+            "fall through to public. For debugging only."
+        ),
     )
     parser.add_argument(
         "--template-schema",
@@ -317,14 +466,14 @@ def main() -> int:
         logger.info(f"Creating schemas for {len(tenants)} tenants")
         for tenant in tenants:
             try:
-                if args.from_template:
+                if args.empty:
+                    initialize_empty_schema(db_params, tenant.database_schema)
+                else:
                     create_tenant_schema_from_template(
                         db_params,
                         tenant.database_schema,
                         args.template_schema,
                     )
-                else:
-                    initialize_empty_schema(db_params, tenant.database_schema)
             except Exception as e:
                 logger.error(f"Failed to create schema for {tenant.server_name}: {e}")
                 return 1
@@ -350,14 +499,14 @@ def main() -> int:
             )
 
         try:
-            if args.from_template:
+            if args.empty:
+                initialize_empty_schema(db_params, schema_name)
+            else:
                 create_tenant_schema_from_template(
                     db_params,
                     schema_name,
                     args.template_schema,
                 )
-            else:
-                initialize_empty_schema(db_params, schema_name)
         except Exception as e:
             logger.error(f"Failed to create schema {schema_name}: {e}")
             return 1
