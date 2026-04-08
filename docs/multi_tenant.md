@@ -13,6 +13,13 @@ Traditional Synapse deployments require one process (typically ~150MB RAM) per h
 - **Shared infrastructure**: Single PostgreSQL database, single reverse proxy configuration
 - **Complete isolation**: Each tenant has separate database schema, signing keys, and media storage
 
+## Isolation model
+
+Tenant isolation rests on two mechanisms (identifier isolation +
+schema-per-tenant). For the full design including the catalogue of
+tables and sequences where schema isolation is load-bearing, see
+[multi_tenant_isolation_model.md](multi_tenant_isolation_model.md).
+
 ### Architecture
 
 ```
