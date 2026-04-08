@@ -73,10 +73,10 @@ class IdTokenServlet(RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
+        self.hs = hs
         self.auth = hs.get_auth()
         self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
-        self.server_name = hs.config.server.server_name
 
     async def on_POST(
         self, request: SynapseRequest, user_id: str
@@ -99,7 +99,7 @@ class IdTokenServlet(RestServlet):
             {
                 "access_token": token,
                 "token_type": "Bearer",
-                "matrix_server_name": self.server_name,
+                "matrix_server_name": self.hs.effective_server_name(),
                 "expires_in": self.EXPIRES_MS // 1000,
             },
         )

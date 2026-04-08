@@ -129,7 +129,9 @@ class ConsentResource(DirectServeHtmlResource):
             if username.startswith("@"):
                 qualified_user_id = username
             else:
-                qualified_user_id = UserID(username, self.hs.hostname).to_string()
+                qualified_user_id = UserID(
+                    username, self.hs.effective_server_name()
+                ).to_string()
 
             u = await self.store.get_user_by_id(qualified_user_id)
             if u is None:
@@ -162,7 +164,9 @@ class ConsentResource(DirectServeHtmlResource):
         if username.startswith("@"):
             qualified_user_id = username
         else:
-            qualified_user_id = UserID(username, self.hs.hostname).to_string()
+            qualified_user_id = UserID(
+                    username, self.hs.effective_server_name()
+                ).to_string()
 
         try:
             await self.store.user_set_consent_version(qualified_user_id, version)

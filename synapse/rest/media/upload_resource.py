@@ -44,10 +44,10 @@ class BaseUploadServlet(RestServlet):
     def __init__(self, hs: "HomeServer", media_repo: "MediaRepository"):
         super().__init__()
 
+        self.hs = hs
         self.media_repo = media_repo
         self.filepaths = media_repo.filepaths
         self.store = hs.get_datastores().main
-        self.server_name = hs.hostname
         self.auth = hs.get_auth()
         self.max_upload_size = hs.config.media.max_upload_size
         self._media_repository_callbacks = (
@@ -147,7 +147,7 @@ class AsyncUploadServlet(BaseUploadServlet):
     ) -> None:
         requester = await self.auth.get_user_by_req(request)
 
-        if server_name != self.server_name:
+        if server_name != self.hs.effective_server_name():
             raise SynapseError(
                 404,
                 "Non-local server name specified",

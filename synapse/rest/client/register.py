@@ -824,7 +824,7 @@ class RegisterRestServlet(RestServlet):
         """
         result: JsonDict = {
             "user_id": user_id,
-            "home_server": self.hs.hostname,
+            "home_server": self.hs.effective_server_name(),
         }
         # We don't want to log the user in if we're going to deny them access because
         # they need to be approved first.
@@ -882,7 +882,7 @@ class RegisterRestServlet(RestServlet):
             "user_id": user_id,
             "device_id": device_id,
             "access_token": access_token,
-            "home_server": self.hs.hostname,
+            "home_server": self.hs.effective_server_name(),
         }
 
         if valid_until_ms is not None:
