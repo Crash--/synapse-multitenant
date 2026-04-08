@@ -70,6 +70,15 @@ class TenantConfig:
     # the global config has (which may also be unset, meaning no
     # identity server is announced).
     identity_server: str | None = None
+    # Per-tenant server-notices sender MXID (e.g.
+    # "@notices:acme.localhost"). Under multi-tenant the upstream global
+    # `server_notices.server_notices_mxid` is wrong because it bakes the
+    # primary hostname into every notice's `sender` field -- a stored-row
+    # corruption where notices sent on corp.localhost carried
+    # `@notices:acme.localhost` as their author. If unset, the tenant
+    # falls back to the conventional `@notices:{server_name}` form so
+    # MXIDs always live on the sending tenant's domain.
+    server_notices_mxid: str | None = None
 
     @property
     def effective_public_baseurl(self) -> str:
@@ -82,6 +91,20 @@ class TenantConfig:
         if self.public_baseurl is not None:
             return self.public_baseurl
         return f"https://{self.server_name}/"
+
+    @property
+    def effective_server_notices_mxid(self) -> str:
+        """Return the MXID server notices should be sent from for this tenant.
+
+        Falls back to `@notices:{server_name}` when `server_notices_mxid`
+        is unset so the MXID always lives on the tenant's own domain.
+        Callers that need to know whether server notices are *enabled*
+        for a tenant should check the global `server_notices.enabled`
+        config -- this accessor only resolves the MXID.
+        """
+        if self.server_notices_mxid is not None:
+            return self.server_notices_mxid
+        return f"@notices:{self.server_name}"
 
     @property
     def effective_identity_server(self) -> str | None:
@@ -139,6 +162,7 @@ class TenantConfig:
             max_mau_value=config.get("max_mau_value", 0),
             public_baseurl=config.get("public_baseurl"),
             identity_server=config.get("identity_server"),
+            server_notices_mxid=config.get("server_notices_mxid"),
         )
 
 

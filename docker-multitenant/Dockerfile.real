@@ -31,6 +31,7 @@ COPY synapse/http/site.py /usr/local/lib/python3.13/site-packages/synapse/http/s
 COPY synapse/storage/database.py /usr/local/lib/python3.13/site-packages/synapse/storage/database.py
 COPY synapse/storage/databases/main/__init__.py /usr/local/lib/python3.13/site-packages/synapse/storage/databases/main/__init__.py
 COPY synapse/storage/databases/state/store.py /usr/local/lib/python3.13/site-packages/synapse/storage/databases/state/store.py
+COPY synapse/server_notices/server_notices_manager.py /usr/local/lib/python3.13/site-packages/synapse/server_notices/server_notices_manager.py
 COPY synapse/handlers/register.py /usr/local/lib/python3.13/site-packages/synapse/handlers/register.py
 COPY synapse/handlers/room.py /usr/local/lib/python3.13/site-packages/synapse/handlers/room.py
 COPY synapse/server.py /usr/local/lib/python3.13/site-packages/synapse/server.py

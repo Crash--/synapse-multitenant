@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from synapse.api.constants import EventTypes, Membership, RoomCreationPreset
 from synapse.events import EventBase
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict, Requester, StreamKeyType, UserID, create_requester
 from synapse.util.caches.descriptors import cached
 
@@ -48,11 +49,51 @@ class ServerNoticesManager:
         self._is_mine_id = hs.is_mine_id
 
         self._notifier = hs.get_notifier()
-        self.server_notices_mxid = self._config.servernotices.server_notices_mxid
+        # NB: under multi-tenant this attribute is the *global* fallback
+        # only -- every request-path read MUST go through
+        # `_get_server_notices_mxid()` so it resolves against the current
+        # tenant's ContextVar. The capture is kept so `is_enabled()` can
+        # still answer "are server notices configured at all" without a
+        # per-tenant plumbing change.
+        self._global_server_notices_mxid = (
+            self._config.servernotices.server_notices_mxid
+        )
+
+    def _get_server_notices_mxid(self) -> str | None:
+        """Resolve the notices sender MXID for the current request.
+
+        Under multi-tenant: if a tenant is bound on the ContextVar, we
+        return *its* `effective_server_notices_mxid` (which falls back to
+        `@notices:{tenant.server_name}`). Without a tenant bound we
+        return the global `server_notices.server_notices_mxid` -- that
+        preserves single-tenant and test-fixture behaviour.
+
+        Returns None when server notices are not configured at all (the
+        global MXID is unset *and* there is no tenant on the ContextVar).
+        """
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.effective_server_notices_mxid
+        return self._global_server_notices_mxid
+
+    def _get_effective_server_name(self) -> str:
+        """Return the current tenant's server_name, falling back to the
+        primary hostname. Used as `authenticated_entity` on the internal
+        notices requester so the requester's origin matches the sender
+        MXID's domain."""
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.server_name
+        return self.server_name
 
     def is_enabled(self) -> bool:
-        """Checks if server notices are enabled on this server."""
-        return self.server_notices_mxid is not None
+        """Checks if server notices are enabled on this server.
+
+        Under multi-tenant: if the current ContextVar has a tenant bound,
+        notices are enabled when that tenant has (or defaults to) an
+        MXID. Otherwise the global config decides.
+        """
+        return self._get_server_notices_mxid() is not None
 
     async def send_notice(
         self,
@@ -76,9 +117,11 @@ class ServerNoticesManager:
         room_id = await self.get_or_create_notice_room_for_user(user_id)
         await self.maybe_invite_user_to_room(user_id, room_id)
 
-        assert self.server_notices_mxid is not None
+        server_notices_mxid = self._get_server_notices_mxid()
+        assert server_notices_mxid is not None
         requester = create_requester(
-            self.server_notices_mxid, authenticated_entity=self.server_name
+            server_notices_mxid,
+            authenticated_entity=self._get_effective_server_name(),
         )
 
         logger.info("Sending server notice to %s", user_id)
@@ -86,7 +129,7 @@ class ServerNoticesManager:
         event_dict = {
             "type": type,
             "room_id": room_id,
-            "sender": self.server_notices_mxid,
+            "sender": server_notices_mxid,
             "content": event_content,
         }
 
@@ -111,7 +154,8 @@ class ServerNoticesManager:
             The room's ID, or None if no room could be found.
         """
         # If there is no server notices MXID, then there is no server notices room
-        if self.server_notices_mxid is None:
+        server_notices_mxid = self._get_server_notices_mxid()
+        if server_notices_mxid is None:
             return None
 
         rooms = await self._store.get_rooms_for_local_user_where_membership_is(
@@ -124,7 +168,7 @@ class ServerNoticesManager:
             # manages to invite the system user to a room, that doesn't make it
             # the server notices room.
             is_server_notices_room = await self._store.check_local_user_in_room(
-                user_id=self.server_notices_mxid, room_id=room.room_id
+                user_id=server_notices_mxid, room_id=room.room_id
             )
             if is_server_notices_room:
                 # we found a room which our user shares with the system notice
@@ -146,13 +190,15 @@ class ServerNoticesManager:
         Returns:
             room id of notice room.
         """
-        if self.server_notices_mxid is None:
+        server_notices_mxid = self._get_server_notices_mxid()
+        if server_notices_mxid is None:
             raise Exception("Server notices not enabled")
 
         assert self._is_mine_id(user_id), "Cannot send server notices to remote users"
 
         requester = create_requester(
-            self.server_notices_mxid, authenticated_entity=self.server_name
+            server_notices_mxid,
+            authenticated_entity=self._get_effective_server_name(),
         )
 
         room_id = await self.maybe_get_notice_room_for_user(user_id)
@@ -255,9 +301,11 @@ class ServerNoticesManager:
             user_id: The ID of the user to invite.
             room_id: The ID of the room to invite the user to.
         """
-        assert self.server_notices_mxid is not None
+        server_notices_mxid = self._get_server_notices_mxid()
+        assert server_notices_mxid is not None
+        effective_server_name = self._get_effective_server_name()
         requester = create_requester(
-            self.server_notices_mxid, authenticated_entity=self.server_name
+            server_notices_mxid, authenticated_entity=effective_server_name
         )
 
         # Check whether the user has already joined or been invited to this room. If
@@ -280,7 +328,7 @@ class ServerNoticesManager:
 
         if self._config.servernotices.server_notices_auto_join:
             user_requester = create_requester(
-                user_id, authenticated_entity=self.server_name
+                user_id, authenticated_entity=effective_server_name
             )
             await self._room_member_handler.update_membership(
                 requester=user_requester,
@@ -308,13 +356,14 @@ class ServerNoticesManager:
         """
         logger.debug("Checking whether notice user profile has changed for %s", room_id)
 
-        assert self.server_notices_mxid is not None
+        server_notices_mxid = self._get_server_notices_mxid()
+        assert server_notices_mxid is not None
 
         notice_user_data_in_room = (
             await self._storage_controllers.state.get_current_state_event(
                 room_id,
                 EventTypes.Member,
-                self.server_notices_mxid,
+                server_notices_mxid,
             )
         )
 
@@ -328,7 +377,7 @@ class ServerNoticesManager:
             logger.info("Updating notice user profile in room %s", room_id)
             await self._room_member_handler.update_membership(
                 requester=requester,
-                target=UserID.from_string(self.server_notices_mxid),
+                target=UserID.from_string(server_notices_mxid),
                 room_id=room_id,
                 action="join",
                 ratelimit=False,
