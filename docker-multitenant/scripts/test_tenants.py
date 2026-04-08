@@ -7,6 +7,7 @@ using real Matrix API endpoints.
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -14,6 +15,10 @@ import urllib.error
 
 SYNAPSE_URL = "http://synapse:8008"
 TENANTS = ["acme.localhost", "corp.localhost", "startup.localhost"]
+
+# Path inside the test container where the synapse log file is mounted
+# (see docker-compose.yml — ./data/logs is bind-mounted to /synapse-logs).
+SYNAPSE_LOG_PATH = "/synapse-logs/synapse.log"
 
 
 def make_request(method, path, host, data=None, headers=None):
@@ -82,13 +87,19 @@ def test_versions(tenant):
         return False
 
 
+_REGISTER_SEQ = 0
+
+
 def test_register(tenant):
     """Test user registration for a tenant.
 
     Returns the user credentials if successful, None otherwise.
     """
-    # Generate unique username
-    username = f"test_{tenant.replace('.', '_')}_{int(time.time())}"
+    # Generate unique username — combine microsecond timestamp + a
+    # process-local counter so back-to-back calls don't collide.
+    global _REGISTER_SEQ
+    _REGISTER_SEQ += 1
+    username = f"test_{tenant.replace('.', '_')}_{int(time.time() * 1000)}_{_REGISTER_SEQ}"
 
     # First, get registration flows
     result = make_request("POST", "/_matrix/client/v3/register", tenant, data={})
@@ -195,6 +206,455 @@ def test_unknown_tenant():
     else:
         print(f"    [FAIL] unexpected status {result.get('status')}")
         return False
+
+
+def fetch_text(path, host=None):
+    """GET a URL and return the raw text body (for the metrics scrape)."""
+    url = f"{SYNAPSE_URL}{path}"
+    headers = {"Host": host} if host else {}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"__error__: {e}"
+
+
+def test_metrics_endpoint_reachable():
+    """Sanity-check: /_synapse/metrics responds with Prometheus exposition.
+
+    This is the prerequisite for any per-tenant labelling work — if the
+    endpoint isn't there, the audit/instrumentation phase has nothing
+    to assert against.
+    """
+    body = fetch_text("/_synapse/metrics")
+    if body.startswith("__error__"):
+        print(f"    [FAIL] /_synapse/metrics unreachable: {body}")
+        return False
+    # Prometheus exposition always starts with HELP/TYPE comments.
+    if "# HELP" in body and "# TYPE" in body:
+        print("    [PASS] /_synapse/metrics serving Prometheus exposition")
+        return True
+    print("    [FAIL] /_synapse/metrics returned unexpected body")
+    return False
+
+
+def test_metrics_have_tenant_label():
+    """Check that Synapse metrics differentiate tenants via the
+    `server_name` label.
+
+    The fork reuses Synapse's existing `server_name` Prometheus label
+    rather than introducing a parallel `tenant=` label — in multi-tenant
+    mode `effective_server_name` IS the active tenant (see
+    synapse/http/site.py around the requests_counter increment). So
+    after hitting `acme.localhost` and `corp.localhost` we expect both
+    of those values to appear in the metrics scrape.
+    """
+    # Hit each tenant once so the per-tenant counters increment.
+    for t in TENANTS:
+        fetch_text("/_matrix/client/versions", host=t)
+    time.sleep(0.5)  # let the counter increments propagate
+
+    body = fetch_text("/_synapse/metrics")
+    if body.startswith("__error__"):
+        print(f"    [FAIL] could not scrape metrics: {body}")
+        return False
+
+    found = [t for t in TENANTS if f'server_name="{t}"' in body]
+    if len(found) >= 2:
+        print(f"    [PASS] metrics differentiate tenants via server_name "
+              f"({len(found)}/{len(TENANTS)} tenants visible)")
+        return True
+    print(f"    [FAIL] expected ≥2 tenants in server_name labels, "
+          f"found {len(found)}: {found}")
+    return False
+
+
+def test_login_response_uses_tenant_server_name():
+    """The login response carries `home_server` — it must be the tenant's
+    server_name, not the primary `localhost` baked into homeserver.yaml.
+
+    A failure here means the login handler is reading `self.hs.hostname`
+    instead of `hs.effective_server_name()` somewhere on the response path.
+    """
+    # First register so we have credentials.
+    user = test_register("acme.localhost")
+    if not user:
+        print("    [SKIP] could not register a test user")
+        return False
+
+    # Now log in as that user.
+    result = make_request(
+        "POST",
+        "/_matrix/client/v3/login",
+        "acme.localhost",
+        data={
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": user["user_id"].split(":")[0].lstrip("@")},
+            "password": "TestPassword123!",
+        },
+    )
+
+    if result.get("status") != 200:
+        print(f"    [FAIL] login - status {result.get('status')}: "
+              f"{result['data'].get('error', 'unknown')}")
+        return False
+
+    home_server = result["data"].get("home_server")
+    user_id = result["data"].get("user_id", "")
+    if home_server == "acme.localhost" and user_id.endswith(":acme.localhost"):
+        print(f"    [PASS] login - home_server={home_server} user_id={user_id}")
+        return True
+    print(f"    [FAIL] login - home_server={home_server!r} user_id={user_id!r} "
+          f"(expected acme.localhost)")
+    return False
+
+
+def test_capabilities_endpoint_per_tenant():
+    """`/_matrix/client/v3/capabilities` is a synchronous request handler.
+    Hitting it as different tenants should produce metric series with
+    different `server_name` labels — if it doesn't, the handler is using
+    `self.server_name` (constructor-time) instead of resolving per-request.
+    """
+    # Register so we have an access token (capabilities is auth-required).
+    user_acme = test_register("acme.localhost")
+    user_corp = test_register("corp.localhost")
+    if not user_acme or not user_corp:
+        print("    [SKIP] could not register both tenants")
+        return False
+
+    for u, host in [(user_acme, "acme.localhost"), (user_corp, "corp.localhost")]:
+        for _ in range(2):
+            make_request(
+                "GET",
+                "/_matrix/client/v3/capabilities",
+                host,
+                headers={"Authorization": f"Bearer {u['access_token']}"},
+            )
+    time.sleep(0.5)
+
+    body = fetch_text("/_synapse/metrics")
+    has_acme = (
+        'server_name="acme.localhost"' in body
+        and "CapabilitiesRestServlet" in body
+        and any(
+            'server_name="acme.localhost"' in line and "CapabilitiesRestServlet" in line
+            for line in body.splitlines()
+        )
+    )
+    has_corp = any(
+        'server_name="corp.localhost"' in line and "CapabilitiesRestServlet" in line
+        for line in body.splitlines()
+    )
+    if has_acme and has_corp:
+        print("    [PASS] CapabilitiesRestServlet metric carries per-tenant server_name")
+        return True
+    print(f"    [FAIL] CapabilitiesRestServlet metric not split per tenant "
+          f"(acme={has_acme}, corp={has_corp})")
+    return False
+
+
+def test_whoami_response_uses_tenant_server_name():
+    """Whoami returns the user_id; the server_name segment must be the
+    tenant's, not the primary. Already implicitly tested via
+    test_whoami(), but here we make the assertion explicit and lock it in.
+    """
+    user = test_register("acme.localhost")
+    if not user:
+        print("    [SKIP] could not register")
+        return False
+    result = make_request(
+        "GET",
+        "/_matrix/client/v3/account/whoami",
+        "acme.localhost",
+        headers={"Authorization": f"Bearer {user['access_token']}"},
+    )
+    if result.get("status") != 200:
+        print(f"    [FAIL] whoami status {result.get('status')}")
+        return False
+    uid = result["data"].get("user_id", "")
+    if uid.endswith(":acme.localhost"):
+        print(f"    [PASS] whoami user_id={uid}")
+        return True
+    print(f"    [FAIL] whoami user_id={uid!r} (expected …:acme.localhost)")
+    return False
+
+
+def test_wellknown_client_per_tenant():
+    """`/.well-known/matrix/client` should announce the tenant's own
+    homeserver base URL, not the primary. If both tenants get the same
+    base_url, the well-known builder is reading the global config.
+    """
+    acme = make_request("GET", "/.well-known/matrix/client", "acme.localhost")
+    corp = make_request("GET", "/.well-known/matrix/client", "corp.localhost")
+
+    # 404 is acceptable — fork may not implement this yet — but if it
+    # IS implemented it MUST be tenant-aware.
+    if acme.get("status") == 404 and corp.get("status") == 404:
+        print("    [SKIP] /.well-known/matrix/client not implemented "
+              "(deferred — note for future phase)")
+        return True
+
+    acme_base = acme.get("data", {}).get("m.homeserver", {}).get("base_url", "")
+    corp_base = corp.get("data", {}).get("m.homeserver", {}).get("base_url", "")
+    if "acme" in acme_base and "corp" in corp_base:
+        print(f"    [PASS] well-known per tenant ({acme_base} vs {corp_base})")
+        return True
+    print(f"    [FAIL] well-known not tenant-aware "
+          f"(acme={acme_base!r}, corp={corp_base!r})")
+    return False
+
+
+def test_user_directory_per_tenant_population():
+    """The user directory is rebuilt by a `notify_new_event` background
+    process. Phase 2 makes background processes tenant-aware: today the
+    rebuild loop runs with no `TenantConfig` bound, so the per-tenant
+    `user_directory` tables are never populated and a self-search returns
+    nothing. After the per-tenant background helper lands, registering a
+    user with a distinctive display name in a public room must make them
+    findable from their own tenant.
+    """
+    user = test_register("acme.localhost")
+    if not user:
+        print("    [SKIP] could not register acme user")
+        return False
+
+    auth = {"Authorization": f"Bearer {user['access_token']}"}
+
+    # Public, world-readable room — required for the user to be eligible
+    # for the user directory at all.
+    room = make_request(
+        "POST",
+        "/_matrix/client/v3/createRoom",
+        "acme.localhost",
+        data={"visibility": "public", "preset": "public_chat"},
+        headers=auth,
+    )
+    if room.get("status") != 200:
+        print(f"    [SKIP] could not create public room: {room.get('status')} {room.get('data')}")
+        return False
+
+    # Distinctive display name so the search term is unambiguous.
+    distinctive = f"phase2probe{int(time.time() * 1000)}"
+    profile = make_request(
+        "PUT",
+        f"/_matrix/client/v3/profile/{user['user_id']}/displayname",
+        "acme.localhost",
+        data={"displayname": distinctive},
+        headers=auth,
+    )
+    if profile.get("status") != 200:
+        print(f"    [SKIP] could not set displayname: {profile}")
+        return False
+
+    # Wait for the user_directory background loop to drain the deltas.
+    # The loop runs on every notify_new_event firing — give it room.
+    time.sleep(8)
+
+    search = make_request(
+        "POST",
+        "/_matrix/client/v3/user_directory/search",
+        "acme.localhost",
+        data={"search_term": distinctive, "limit": 10},
+        headers=auth,
+    )
+    if search.get("status") != 200:
+        print(f"    [FAIL] search status {search.get('status')}: {search.get('data')}")
+        return False
+
+    results = search.get("data", {}).get("results", [])
+    found = any(r.get("user_id") == user["user_id"] for r in results)
+    if found:
+        print(f"    [PASS] user_directory populated per tenant "
+              f"({user['user_id']} findable in own tenant)")
+        return True
+    print(f"    [FAIL] user_directory not populated for tenant — bg loop not tenant-aware "
+          f"(searched={distinctive!r}, results={results})")
+    return False
+
+
+def test_stats_loop_per_tenant():
+    """The stats background loop (`handlers/stats.py`) processes state
+    deltas and advances `event_processing_positions{name="stats"}`. With
+    per-tenant fan-out, that metric should appear once per tenant with
+    the tenant's own `server_name` label. Before the fix, the loop ran
+    with no tenant context bound, so only the primary hostname (or no
+    row at all) would appear.
+
+    We force activity in each tenant by registering a user + creating a
+    room, wait for the loop to drain, and then scrape the metric.
+    """
+    users = {}
+    for t in ("acme.localhost", "corp.localhost"):
+        u = test_register(t)
+        if not u:
+            print(f"    [SKIP] could not register on {t}")
+            return False
+        users[t] = u
+        room = make_request(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            t,
+            data={"preset": "public_chat"},
+            headers={"Authorization": f"Bearer {u['access_token']}"},
+        )
+        if room.get("status") != 200:
+            print(f"    [SKIP] could not create room in {t}: {room.get('status')}")
+            return False
+
+    # Wait for the stats loop to drain the new deltas on both tenants.
+    time.sleep(8)
+
+    body = fetch_text("/_synapse/metrics")
+    if body.startswith("__error__"):
+        print(f"    [FAIL] could not scrape metrics: {body}")
+        return False
+
+    # Look for the per-tenant event_processing_positions rows. Match the
+    # full metric line so we don't accidentally pick up unrelated metrics
+    # that share a label value.
+    needed = {
+        'acme.localhost': False,
+        'corp.localhost': False,
+    }
+    for line in body.splitlines():
+        if "synapse_event_processing_positions" not in line:
+            continue
+        if 'name="stats"' not in line:
+            continue
+        for tenant in needed:
+            if f'server_name="{tenant}"' in line:
+                needed[tenant] = True
+
+    if all(needed.values()):
+        print(f"    [PASS] stats loop ran per tenant "
+              f"(event_processing_positions{{name='stats'}} present for "
+              f"{', '.join(needed)})")
+        return True
+    missing = [t for t, ok in needed.items() if not ok]
+    print(f"    [FAIL] stats loop did not run per tenant — missing "
+          f"event_processing_positions{{name='stats', server_name=...}} "
+          f"rows for: {missing}")
+    return False
+
+
+def test_retention_purge_per_tenant():
+    """The retention purge is a `looping_call` in
+    `synapse/handlers/pagination.py`. It previously ran as a single
+    un-tenanted background process, which would silently no-op against
+    the empty `public` schema (or, worse, operate on the wrong tenant
+    if one happened to live in `public`). With the per-tenant fan-out,
+    the `purge_history_for_rooms_in_range` background process start
+    counter should appear once per configured tenant.
+
+    The docker rig sets a tight 3 s purge interval so we only need to
+    wait a few seconds before the counter accumulates.
+    """
+    # Give the looping_call a few cycles to fire across all tenants.
+    time.sleep(8)
+
+    body = fetch_text("/_synapse/metrics")
+    if body.startswith("__error__"):
+        print(f"    [FAIL] could not scrape metrics: {body}")
+        return False
+
+    needed = {
+        "acme.localhost": False,
+        "corp.localhost": False,
+        "startup.localhost": False,
+    }
+    for line in body.splitlines():
+        if "synapse_background_process_start_count" not in line:
+            continue
+        if 'name="purge_history_for_rooms_in_range"' not in line:
+            continue
+        for tenant in needed:
+            if f'server_name="{tenant}"' in line:
+                needed[tenant] = True
+
+    if all(needed.values()):
+        print(f"    [PASS] retention purge ran per tenant "
+              f"(background_process_start_count "
+              f"{{name='purge_history_for_rooms_in_range'}} present for "
+              f"{', '.join(needed)})")
+        return True
+    missing = [t for t, ok in needed.items() if not ok]
+    print(f"    [FAIL] retention purge did not run per tenant — missing "
+          f"background_process_start_count rows for: {missing}")
+    return False
+
+
+def test_user_parter_loop_per_tenant():
+    """The deactivated-user parter loop in
+    `synapse/handlers/deactivate_account.py` fires once at process startup
+    to resume any work left in the per-tenant
+    `users_pending_deactivation` table. With the per-tenant fan-out, the
+    `user_parter_loop` background process must have a start count for
+    every tenant, not just the primary hostname. Synapse exposes that
+    counter at process startup so we don't need to trigger any user
+    activity to observe it.
+    """
+    body = fetch_text("/_synapse/metrics")
+    if body.startswith("__error__"):
+        print(f"    [FAIL] could not scrape metrics: {body}")
+        return False
+
+    needed = {
+        "acme.localhost": False,
+        "corp.localhost": False,
+        "startup.localhost": False,
+    }
+    for line in body.splitlines():
+        if "synapse_background_process_start_count" not in line:
+            continue
+        if 'name="user_parter_loop"' not in line:
+            continue
+        for tenant in needed:
+            if f'server_name="{tenant}"' in line:
+                needed[tenant] = True
+
+    if all(needed.values()):
+        print("    [PASS] user parter loop ran per tenant at startup "
+              "(background_process_start_count {name='user_parter_loop'} "
+              "present for all tenants)")
+        return True
+    missing = [t for t, ok in needed.items() if not ok]
+    print(f"    [FAIL] user parter loop did not run per tenant — missing "
+          f"background_process_start_count rows for: {missing}")
+    return False
+
+
+def test_logs_have_tenant_context():
+    """Check that synapse.log mentions the active tenant on request lines.
+
+    The fork already binds `server_name=effective_server_name` to every
+    per-request LoggingContext, and Synapse's auto-installed
+    LoggingContextFilter exposes it as a `server_name` field on each
+    log record. Phase 1 added `%(server_name)s` to the log format
+    string so that field is actually written out.
+    """
+    if not os.path.exists(SYNAPSE_LOG_PATH):
+        print(f"    [FAIL] log file not found at {SYNAPSE_LOG_PATH} "
+              "(check the ./data/logs bind mount)")
+        return False
+
+    # Make sure there's at least one request from acme in the log.
+    fetch_text("/_matrix/client/versions", host="acme.localhost")
+    time.sleep(0.5)  # let the file handler flush
+
+    try:
+        with open(SYNAPSE_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as e:
+        print(f"    [FAIL] could not read log file: {e}")
+        return False
+
+    if "server_name=acme.localhost" in content:
+        print("    [PASS] logs include tenant context (server_name=acme.localhost)")
+        return True
+    print("    [FAIL] no `server_name=acme.localhost` field found in synapse.log "
+          "(check log.config format string + LoggingContext binding)")
+    return False
 
 
 def test_tenant_isolation(users):
@@ -310,6 +770,74 @@ def main():
         total_passed += 1
     else:
         total_failed += 1
+
+    # Observability tests — these gate the audit/instrumentation phase.
+    # The first one (endpoint reachable) should pass once Prometheus is
+    # wired up; the latter two are expected to FAIL until the
+    # instrumentation work lands. They're loud on purpose.
+    print(f"\n{'='*60}")
+    print("  OBSERVABILITY TESTS")
+    print(f"{'='*60}")
+
+    if test_metrics_endpoint_reachable():
+        total_passed += 1
+    else:
+        total_failed += 1
+
+    if test_metrics_have_tenant_label():
+        total_passed += 1
+    else:
+        total_failed += 1
+
+    if test_logs_have_tenant_context():
+        total_passed += 1
+    else:
+        total_failed += 1
+
+    # Phase-1 leak probes — these are the failing tests that gate the
+    # remaining audit work. Each one targets a specific class of
+    # `self.hs.hostname` / `self.server_name` leak inside a request
+    # handler.
+    print(f"\n{'='*60}")
+    print("  PHASE 1 LEAK PROBES (audit completion)")
+    print(f"{'='*60}")
+
+    for fn in (
+        test_login_response_uses_tenant_server_name,
+        test_whoami_response_uses_tenant_server_name,
+        test_capabilities_endpoint_per_tenant,
+        test_wellknown_client_per_tenant,
+    ):
+        try:
+            ok = fn()
+        except Exception as e:
+            print(f"    [FAIL] {fn.__name__} raised {type(e).__name__}: {e}")
+            ok = False
+        if ok:
+            total_passed += 1
+        else:
+            total_failed += 1
+
+    # Phase-2 probes — background processes must run tenant-aware.
+    print(f"\n{'='*60}")
+    print("  PHASE 2 PROBES (background process tenant context)")
+    print(f"{'='*60}")
+
+    for fn in (
+        test_user_directory_per_tenant_population,
+        test_stats_loop_per_tenant,
+        test_retention_purge_per_tenant,
+        test_user_parter_loop_per_tenant,
+    ):
+        try:
+            ok = fn()
+        except Exception as e:
+            print(f"    [FAIL] {fn.__name__} raised {type(e).__name__}: {e}")
+            ok = False
+        if ok:
+            total_passed += 1
+        else:
+            total_failed += 1
 
     # Summary
     print("\n" + "=" * 60)

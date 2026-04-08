@@ -24,6 +24,7 @@ tenants:
     database_schema: "tenant_acme"
     signing_key_path: "/keys/acme_localhost.signing.key"
     media_store_path: "/media/acme"
+    public_baseurl: "http://acme.localhost/"
     registration_enabled: true
     enable_federation: true
 
@@ -31,6 +32,7 @@ tenants:
     database_schema: "tenant_corp"
     signing_key_path: "/keys/corp_localhost.signing.key"
     media_store_path: "/media/corp"
+    public_baseurl: "http://corp.localhost/"
     registration_enabled: true
     enable_federation: true
 
@@ -38,6 +40,7 @@ tenants:
     database_schema: "tenant_startup"
     signing_key_path: "/keys/startup_localhost.signing.key"
     media_store_path: "/media/startup"
+    public_baseurl: "http://startup.localhost/"
     registration_enabled: true
     enable_federation: false
 
@@ -49,7 +52,7 @@ listeners:
     x_forwarded: true
     bind_addresses: ['0.0.0.0']
     resources:
-      - names: [client, federation]
+      - names: [client, federation, metrics]
         compress: false
 
 ## Database ##
@@ -95,12 +98,41 @@ rc_message:
   burst_count: 10
 
 rc_registration:
-  per_second: 0.5
-  burst_count: 5
+  # Bumped for the test rig — the leak-probe test suite registers
+  # ~10 users in a few seconds.
+  per_second: 5
+  burst_count: 20
+
+rc_login:
+  address:
+    per_second: 5
+    burst_count: 20
+  account:
+    per_second: 5
+    burst_count: 20
+  failed_attempts:
+    per_second: 5
+    burst_count: 20
 
 ## Metrics ##
-enable_metrics: false
+# Enabled so the test rig can scrape /_synapse/metrics on the
+# main listener and assert per-tenant labels are present.
+enable_metrics: true
 report_stats: false
+
+## Retention ##
+# Enabled with a tight interval so the docker rig exercises the
+# per-tenant retention purge loop. The default policy keeps events
+# forever (max_lifetime is absurdly long) — we only care that the
+# loop fires once per tenant, not that it actually deletes anything
+# during the test.
+retention:
+  enabled: true
+  default_policy:
+    min_lifetime: 1d
+    max_lifetime: 3650d
+  purge_jobs:
+    - interval: 3s
 
 ## Guest Access ##
 allow_guest_access: false

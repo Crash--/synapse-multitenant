@@ -20,6 +20,45 @@ docker-compose logs -f synapse
 docker-compose run test
 ```
 
+## Fast iteration loop
+
+The patched Python files under `../synapse/` are bind-mounted into
+the running container, so the inner loop is:
+
+```bash
+# Edit a file under ../synapse/, then:
+docker-compose restart synapse
+docker-compose run test
+```
+
+No image rebuild required. If you add a *new* patched file, add it
+to BOTH `Dockerfile.real` (so a clean build still works) and the
+volume list in `docker-compose.yml` (so the hot loop picks it up).
+
+## Observability
+
+`enable_metrics` is on, and a `prometheus` service scrapes Synapse
+on every boot:
+
+- Prometheus UI:    <http://localhost:9090>
+- Raw scrape:       `curl http://localhost:8008/_synapse/metrics`
+- Synapse log file: `./data/logs/synapse.log` (also visible via
+  `docker-compose logs synapse`)
+
+The test suite includes three observability checks under
+`OBSERVABILITY TESTS`:
+
+1. `/_synapse/metrics` reachable — should pass on a fresh boot.
+2. Metrics carry a `tenant=` label — **expected to fail** until the
+   audit/instrumentation phase wires the active `TenantConfig` into
+   the Prometheus label set.
+3. `synapse.log` includes tenant context on request lines — **expected
+   to fail** until the same phase threads the `ContextVar` into the
+   logging context.
+
+The two failing tests are intentional — they gate the next phase of
+the multi-tenancy roadmap (`docs/multi_tenant_roadmap.md`).
+
 ## Test Manually
 
 ```bash

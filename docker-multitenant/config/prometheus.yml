@@ -1,0 +1,16 @@
+# Prometheus scrape config for the multi-tenant Synapse demo.
+#
+# Synapse exposes metrics on the same listener as the Client-Server
+# API (8008) at /_synapse/metrics, because we added `metrics` to the
+# listener resources in homeserver.yaml.
+#
+# Reach the UI at http://localhost:9090.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: synapse
+    metrics_path: /_synapse/metrics
+    static_configs:
+      - targets: ["synapse:8008"]

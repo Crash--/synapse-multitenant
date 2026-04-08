@@ -98,6 +98,37 @@ services:
       - ./config:/data:ro
       - ./data/keys:/keys:ro
       - ./data/media:/media
+      - ./data/logs:/var/log/synapse
+      # --- Hot iteration mounts ---------------------------------------
+      # These bind-mount the patched Python files from the local source
+      # tree directly on top of the image, so editing a file + running
+      # `docker compose restart synapse` is enough — no rebuild.
+      # If you add a new patched file, add it to BOTH this list AND
+      # docker-multitenant/Dockerfile.real.
+      - ../synapse/tenant_context.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_context.py:ro
+      - ../synapse/tenant_registry.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_registry.py:ro
+      - ../synapse/tenant_background.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_background.py:ro
+      - ../synapse/handlers/user_directory.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/user_directory.py:ro
+      - ../synapse/handlers/stats.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/stats.py:ro
+      - ../synapse/handlers/pagination.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/pagination.py:ro
+      - ../synapse/config/tenants.py:/usr/local/lib/python3.13/site-packages/synapse/config/tenants.py:ro
+      - ../synapse/rest/well_known.py:/usr/local/lib/python3.13/site-packages/synapse/rest/well_known.py:ro
+      - ../synapse/http/site.py:/usr/local/lib/python3.13/site-packages/synapse/http/site.py:ro
+      - ../synapse/storage/database.py:/usr/local/lib/python3.13/site-packages/synapse/storage/database.py:ro
+      - ../synapse/storage/databases/main/__init__.py:/usr/local/lib/python3.13/site-packages/synapse/storage/databases/main/__init__.py:ro
+      - ../synapse/handlers/register.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/register.py:ro
+      - ../synapse/handlers/room.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/room.py:ro
+      - ../synapse/server.py:/usr/local/lib/python3.13/site-packages/synapse/server.py:ro
+      - ../synapse/events/builder.py:/usr/local/lib/python3.13/site-packages/synapse/events/builder.py:ro
+      - ../synapse/media/multitenant_filepath.py:/usr/local/lib/python3.13/site-packages/synapse/media/multitenant_filepath.py:ro
+      - ../synapse/crypto/multitenant_keyring.py:/usr/local/lib/python3.13/site-packages/synapse/crypto/multitenant_keyring.py:ro
+      - ../synapse/config/homeserver.py:/usr/local/lib/python3.13/site-packages/synapse/config/homeserver.py:ro
+      - ../synapse/rest/client/login.py:/usr/local/lib/python3.13/site-packages/synapse/rest/client/login.py:ro
+      - ../synapse/handlers/auth.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/auth.py:ro
+      - ../synapse/handlers/account_validity.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/account_validity.py:ro
+      - ../synapse/handlers/deactivate_account.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/deactivate_account.py:ro
+      - ../synapse/handlers/device.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/device.py:ro
+      - ../synapse/handlers/message.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/message.py:ro
     ports:
       - "8008:8008"
     networks:
@@ -123,6 +154,22 @@ services:
     networks:
       - synapse-net
 
+  # Prometheus — scrapes Synapse metrics so the test container (and a
+  # human at http://localhost:9090) can verify per-tenant labels are
+  # present on request counters, DB query timings, etc.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: synapse-mt-prometheus
+    depends_on:
+      synapse:
+        condition: service_healthy
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - synapse-net
+
   # Test Runner (optional - run with: docker compose run test)
   test:
     image: python:3.11-slim
@@ -132,6 +179,7 @@ services:
         condition: service_healthy
     volumes:
       - ./scripts:/scripts:ro
+      - ./data/logs:/synapse-logs:ro
     entrypoint: >
       sh -c "pip install -q requests &&
              python3 /scripts/test_tenants.py"
