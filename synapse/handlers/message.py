@@ -79,6 +79,7 @@ from synapse.types import (
     UserID,
     create_requester,
 )
+from synapse.tenant_background import run_as_background_process_per_tenant
 from synapse.types.state import StateFilter
 from synapse.util import log_failure, unwrapFirstError
 from synapse.util.async_helpers import Linearizer, gather_results
@@ -544,12 +545,15 @@ class EventCreationHandler:
             self.config.worker.run_background_tasks
             and self.config.server.cleanup_extremities_with_dummy_events
         ):
+            # Fan out per tenant: forward-extremities live in each
+            # tenant's room tables, so dummy-event insertion must run
+            # once per tenant with the right search_path bound.
             self.clock.looping_call(
-                lambda: self.hs.run_as_background_process(
-                    "send_dummy_events_to_fill_extremities",
-                    self._send_dummy_events_to_fill_extremities,
-                ),
+                run_as_background_process_per_tenant,
                 Duration(minutes=5),
+                "send_dummy_events_to_fill_extremities",
+                self.hs,
+                self._send_dummy_events_to_fill_extremities,
             )
 
         self._message_handler = hs.get_message_handler()

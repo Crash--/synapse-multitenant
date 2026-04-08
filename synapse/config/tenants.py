@@ -60,6 +60,23 @@ class TenantConfig:
     enable_federation: bool = True
     trusted_key_servers: list[str] = attr.Factory(list)
     max_mau_value: int = 0
+    # Public base URL announced in /.well-known/matrix/client and used to
+    # build links in outgoing emails (password reset, registration
+    # confirmation) and in OIDC callbacks. If unset, defaults to
+    # `https://{server_name}/` — the conventional Matrix discovery URL.
+    public_baseurl: str | None = None
+
+    @property
+    def effective_public_baseurl(self) -> str:
+        """Return `public_baseurl` if set, otherwise the conventional default.
+
+        The default matches what upstream Synapse derives from `server_name`
+        when `public_baseurl` is unset, so per-tenant behaviour stays
+        aligned with vanilla Synapse defaults.
+        """
+        if self.public_baseurl is not None:
+            return self.public_baseurl
+        return f"https://{self.server_name}/"
 
     @classmethod
     def from_dict(cls, config: JsonDict, base_path: str = "") -> "TenantConfig":
@@ -105,6 +122,7 @@ class TenantConfig:
             enable_federation=config.get("enable_federation", True),
             trusted_key_servers=config.get("trusted_key_servers", []),
             max_mau_value=config.get("max_mau_value", 0),
+            public_baseurl=config.get("public_baseurl"),
         )
 
 

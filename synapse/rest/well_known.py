@@ -27,6 +27,7 @@ from synapse.api.auth.mas import MasDelegatedAuth
 from synapse.api.errors import NotFoundError
 from synapse.http.server import DirectServeJsonResource
 from synapse.http.site import SynapseRequest
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict
 from synapse.util.json import json_encoder
 from synapse.util.stringutils import parse_server_name
@@ -46,7 +47,18 @@ class WellKnownBuilder:
         if not self._config.server.serve_client_wellknown:
             return None
 
-        result = {"m.homeserver": {"base_url": self._config.server.public_baseurl}}
+        # Multi-tenant: if a tenant context is bound for this request,
+        # announce the tenant's own `public_baseurl` rather than the
+        # global one. Falls back to the global config outside request
+        # context (startup-time serialisation, etc.) or when the tenant
+        # didn't set an explicit value.
+        tenant = get_current_tenant()
+        if tenant is not None:
+            base_url = tenant.effective_public_baseurl
+        else:
+            base_url = self._config.server.public_baseurl
+
+        result = {"m.homeserver": {"base_url": base_url}}
 
         if self._config.registration.default_identity_server:
             result["m.identity_server"] = {

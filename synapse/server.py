@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     from synapse.handlers.oidc import OidcHandler
     from synapse.handlers.saml import SamlHandler
     from synapse.storage._base import SQLBaseStore
+    from synapse.tenant_registry import TenantRegistry
 
 
 # The annotation for `cache_in_self` used to be
@@ -411,8 +412,36 @@ class HomeServer(metaclass=abc.ABCMeta):
                 "Cannot start background process. HomeServer has been shutdown"
             )
 
+        # Multi-tenant: capture the currently-bound tenant at scheduling
+        # time, so that nested `hs.run_as_background_process` calls from
+        # inside an already-tenant-aware loop inherit the right tenant
+        # without every callsite having to plumb it through. The metric
+        # `server_name` label also tracks the tenant (instead of being
+        # pinned to the global `self.hostname`), so Prometheus cleanly
+        # separates per-tenant bg work.
+        #
+        # If no tenant is bound (top-level loops scheduled from startup
+        # hooks, replication callbacks, etc.) this degrades to the
+        # existing single-tenant behaviour. Those top-level loops must
+        # use `run_as_background_process_per_tenant` explicitly to fan
+        # out across all configured tenants.
+        from synapse.tenant_context import get_current_tenant, tenant_context
+
+        captured_tenant = get_current_tenant()
+        if captured_tenant is not None:
+            server_name_label = captured_tenant.server_name
+
+            async def _tenant_bound_func(*a: Any, **kw: Any) -> R | None:
+                with tenant_context(captured_tenant):
+                    return await func(*a, **kw)
+
+            wrapped = _tenant_bound_func
+        else:
+            server_name_label = self.hostname
+            wrapped = func
+
         # Ignore linter error as this is the one location this should be called.
-        deferred = run_as_background_process(desc, self.hostname, func, *args, **kwargs)  # type: ignore[untracked-background-process]
+        deferred = run_as_background_process(desc, server_name_label, wrapped, *args, **kwargs)  # type: ignore[untracked-background-process]
         self._background_processes.add(deferred)
 
         def on_done(res: R) -> R:
@@ -676,6 +705,39 @@ class HomeServer(metaclass=abc.ABCMeta):
         Fetch the Twisted reactor in use by this HomeServer.
         """
         return self._reactor
+
+    @cache_in_self
+    def get_tenant_registry(self) -> "TenantRegistry":
+        """Return the cached `TenantRegistry` for this HomeServer.
+
+        This is the canonical access point for tenant lookup outside of
+        request handling — background processes, startup hooks, replication.
+        Inside request handling you usually want `get_current_tenant()` from
+        `synapse.tenant_context` instead, since that returns the *active*
+        tenant rather than the full set.
+        """
+        from synapse.tenant_registry import create_tenant_registry
+
+        return create_tenant_registry(self)
+
+    def effective_server_name(self) -> str:
+        """Return the server_name that should be used for the *current request*.
+
+        In multi-tenant mode this is the active tenant's server_name (resolved
+        from the per-request `ContextVar` set up in `synapse/http/site.py`).
+        Outside any request — startup code, background processes, replication —
+        this falls back to `self.hostname`, which is the primary server_name
+        baked into the config at process boot.
+
+        Use this anywhere you would otherwise reach for `self.hs.hostname`
+        or `self.server_name` *inside a request handler* — it's the canonical
+        way to get the right value for metric labels, response bodies, log
+        context, signing, etc.
+        """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        return tenant.server_name if tenant is not None else self.hostname
 
     def is_mine(self, domain_specific_string: DomainSpecificString) -> bool:
         # Multi-tenant: check if domain matches any local tenant

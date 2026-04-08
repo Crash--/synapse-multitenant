@@ -34,6 +34,7 @@ from synapse.handlers.worker_lock import NEW_EVENT_DURING_PURGE_LOCK_NAME
 from synapse.logging.opentracing import trace
 from synapse.rest.admin._base import assert_user_is_admin
 from synapse.streams.config import PaginationConfig
+from synapse.tenant_background import run_as_background_process_per_tenant
 from synapse.types import (
     JsonMapping,
     Requester,
@@ -167,13 +168,19 @@ class PaginationHandler:
 
         if hs.config.retention.retention_enabled and self._is_master:
             # Run the purge jobs described in the configuration file.
+            # Multi-tenant: fan out the retention sweep across every
+            # configured tenant so each per-tenant schema is scanned
+            # independently. Without this, the loop runs with no tenant
+            # bound and either no-ops (empty `public` schema) or — worse
+            # — purges against the wrong tenant.
             for job in hs.config.retention.retention_purge_jobs:
                 logger.info("Setting up purge job with config: %s", job)
 
                 self.clock.looping_call(
-                    self.hs.run_as_background_process,
+                    run_as_background_process_per_tenant,
                     Duration(milliseconds=job.interval),
                     "purge_history_for_rooms_in_range",
+                    self.hs,
                     self.purge_history_for_rooms_in_range,
                     job.shortest_max_lifetime,
                     job.longest_max_lifetime,

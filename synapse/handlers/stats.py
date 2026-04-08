@@ -31,6 +31,8 @@ from typing import (
 from synapse.api.constants import EventContentFields, EventTypes, Membership
 from synapse.metrics import SERVER_NAME_LABEL, event_processing_positions
 from synapse.storage.databases.main.state_deltas import StateDelta
+from synapse.tenant_background import run_as_background_process_per_tenant
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict
 from synapse.util.duration import Duration
 from synapse.util.events import get_plain_text_topic_from_event_content
@@ -61,11 +63,14 @@ class StatsHandler:
 
         self.stats_enabled = hs.config.stats.stats_enabled
 
-        # The current position in the current_state_delta stream
-        self.pos: int | None = None
+        # Per-tenant stream position. Each tenant has its own
+        # `stats_incremental_position` row (via the per-tenant DB
+        # schema), so positions cannot be shared across tenants.
+        self._pos_by_tenant: dict[str, int | None] = {}
 
-        # Guard to ensure we only process deltas one at a time
-        self._is_processing = False
+        # Per-tenant "is processing" guard so that tenant B is not
+        # blocked while tenant A's stats loop is running.
+        self._is_processing_by_tenant: set[str] = set()
 
         if self.stats_enabled and hs.config.worker.run_background_tasks:
             self.notifier.add_replication_callback(self.notify_new_event)
@@ -78,35 +83,57 @@ class StatsHandler:
             )
 
     def notify_new_event(self) -> None:
-        """Called when there may be more deltas to process"""
-        if not self.stats_enabled or self._is_processing:
+        """Called when there may be more deltas to process.
+
+        In multi-tenant mode this fans out to one background process per
+        configured tenant; each iteration runs `_unsafe_process` with the
+        tenant `ContextVar` bound so stats are accumulated against the
+        right schema. The per-tenant guard prevents redundant concurrent
+        work for a single tenant without serialising across tenants.
+        """
+        if not self.stats_enabled:
             return
 
-        self._is_processing = True
-
         async def process() -> None:
+            tenant = get_current_tenant()
+            tenant_key = tenant.server_name if tenant is not None else ""
+
+            if tenant_key in self._is_processing_by_tenant:
+                return
+
+            self._is_processing_by_tenant.add(tenant_key)
             try:
                 await self._unsafe_process()
             finally:
-                self._is_processing = False
+                self._is_processing_by_tenant.discard(tenant_key)
 
-        self.hs.run_as_background_process("stats.notify_new_event", process)
+        run_as_background_process_per_tenant(
+            "stats.notify_new_event", self.hs, process
+        )
 
     async def _unsafe_process(self) -> None:
-        # If self.pos is None then means we haven't fetched it from DB
-        if self.pos is None:
-            self.pos = await self.store.get_stats_positions()
+        tenant = get_current_tenant()
+        tenant_key = tenant.server_name if tenant is not None else ""
+        effective_server_name = (
+            tenant.server_name if tenant is not None else self.server_name
+        )
+
+        pos = self._pos_by_tenant.get(tenant_key)
+
+        # If pos is None then means we haven't fetched it from DB
+        if pos is None:
+            pos = await self.store.get_stats_positions()
             room_max_stream_ordering = self.store.get_room_max_stream_ordering()
-            if self.pos > room_max_stream_ordering:
+            if pos > room_max_stream_ordering:
                 # apparently, we've processed more events than exist in the database!
                 # this can happen if events are removed with history purge or similar.
                 logger.warning(
                     "Event stream ordering appears to have gone backwards (%i -> %i): "
                     "rewinding stats processor",
-                    self.pos,
+                    pos,
                     room_max_stream_ordering,
                 )
-                self.pos = room_max_stream_ordering
+                pos = room_max_stream_ordering
 
         # Loop round handling deltas until we're up to date
 
@@ -115,17 +142,18 @@ class StatsHandler:
             # deltas, since there is otherwise a chance that we could miss updates which arrive
             # after we check the deltas.
             room_max_stream_ordering = self.store.get_room_max_stream_ordering()
-            if self.pos == room_max_stream_ordering:
+            if pos == room_max_stream_ordering:
+                self._pos_by_tenant[tenant_key] = pos
                 break
 
             logger.debug(
-                "Processing room stats %s->%s", self.pos, room_max_stream_ordering
+                "Processing room stats %s->%s", pos, room_max_stream_ordering
             )
             (
                 max_pos,
                 deltas,
             ) = await self._storage_controllers.state.get_current_state_deltas(
-                self.pos, room_max_stream_ordering
+                pos, room_max_stream_ordering
             )
 
             if deltas:
@@ -145,13 +173,14 @@ class StatsHandler:
                 stream_id=max_pos,
             )
 
-            logger.debug("Handled room stats to %s -> %s", self.pos, max_pos)
+            logger.debug("Handled room stats to %s -> %s", pos, max_pos)
 
             event_processing_positions.labels(
-                name="stats", **{SERVER_NAME_LABEL: self.server_name}
+                name="stats", **{SERVER_NAME_LABEL: effective_server_name}
             ).set(max_pos)
 
-            self.pos = max_pos
+            pos = max_pos
+            self._pos_by_tenant[tenant_key] = pos
 
     async def _handle_deltas(
         self, deltas: Iterable[StateDelta]

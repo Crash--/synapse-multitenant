@@ -27,6 +27,8 @@ from synapse.api.errors import SynapseError
 from synapse.replication.http.deactivate_account import (
     ReplicationNotifyAccountDeactivatedServlet,
 )
+from synapse.tenant_background import run_as_background_process_per_tenant
+from synapse.tenant_context import get_current_tenant
 from synapse.types import Codes, Requester, UserID, create_requester
 
 if TYPE_CHECKING:
@@ -52,16 +54,22 @@ class DeactivateAccountHandler:
         self._server_name = hs.hostname
         self._third_party_rules = hs.get_module_api_callbacks().third_party_event_rules
 
-        # Flag that indicates whether the process to part users from rooms is running
-        self._user_parter_running = False
+        # Per-tenant flag set: tracks which tenants currently have a parter
+        # loop running. Each tenant has its own pending-deactivation table
+        # in its own schema, so the parter must be tracked independently
+        # per tenant or we'd block subsequent tenants behind whichever one
+        # started first.
+        self._user_parter_running_tenants: set[str] = set()
         self._third_party_rules = hs.get_module_api_callbacks().third_party_event_rules
 
         self._notify_account_deactivated_client = None
 
-        # Start the user parter loop so it can resume parting users from rooms where
-        # it left off (if it has work left to do).
+        # Start the user parter loop once per tenant so each tenant can
+        # resume parting users from rooms where it left off (if it has
+        # work left to do). Fanned out via the per-tenant background
+        # helper so the loop runs with the correct tenant context bound.
         if hs.config.worker.worker_app is None:
-            hs.get_clock().call_when_running(self._start_user_parting)
+            hs.get_clock().call_when_running(self._start_user_parting_all_tenants)
         else:
             self._notify_account_deactivated_client = (
                 ReplicationNotifyAccountDeactivatedServlet.make_client(hs)
@@ -265,20 +273,40 @@ class DeactivateAccountHandler:
                     room.room_id,
                 )
 
+    def _start_user_parting_all_tenants(self) -> None:
+        """Resume the parter loop on every configured tenant at startup."""
+        run_as_background_process_per_tenant(
+            "user_parter_loop", self.hs, self._user_parter_loop
+        )
+
     def _start_user_parting(self) -> None:
         """
         Start the process that goes through the table of users
         pending deactivation, if it isn't already running.
+
+        Called from request handlers (e.g. deactivate_account) which
+        already have a tenant bound on the context, so
+        ``hs.run_as_background_process`` will rebind that tenant on the
+        spawned coroutine. The per-tenant ``_user_parter_running_tenants``
+        flag prevents two parters racing on the same tenant's pending
+        table.
         """
-        if not self._user_parter_running:
-            self.hs.run_as_background_process(
-                "user_parter_loop", self._user_parter_loop
-            )
+        tenant = get_current_tenant()
+        tenant_key = tenant.server_name if tenant is not None else self.hs.hostname
+        if tenant_key in self._user_parter_running_tenants:
+            return
+        self.hs.run_as_background_process(
+            "user_parter_loop", self._user_parter_loop
+        )
 
     async def _user_parter_loop(self) -> None:
         """Loop that parts deactivated users from rooms"""
-        self._user_parter_running = True
-        logger.info("Starting user parter")
+        tenant = get_current_tenant()
+        tenant_key = tenant.server_name if tenant is not None else self.hs.hostname
+        if tenant_key in self._user_parter_running_tenants:
+            return
+        self._user_parter_running_tenants.add(tenant_key)
+        logger.info("Starting user parter for tenant %s", tenant_key)
         try:
             while True:
                 user_id = await self.store.get_user_pending_deactivation()
@@ -288,9 +316,9 @@ class DeactivateAccountHandler:
                 await self._part_user(user_id)
                 await self.store.del_user_pending_deactivation(user_id)
                 logger.info("User parter finished parting %r", user_id)
-            logger.info("User parter finished: stopping")
+            logger.info("User parter finished for tenant %s: stopping", tenant_key)
         finally:
-            self._user_parter_running = False
+            self._user_parter_running_tenants.discard(tenant_key)
 
     async def _part_user(self, user_id: str) -> None:
         """Causes the given user_id to leave all the rooms they're joined to"""

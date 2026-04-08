@@ -65,7 +65,7 @@ from synapse.http.server import finish_request, respond_with_html
 from synapse.http.site import SynapseRequest
 from synapse.logging.context import defer_to_thread
 from synapse.metrics import SERVER_NAME_LABEL
-from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.tenant_background import run_as_background_process_per_tenant
 from synapse.storage.databases.main.registration import (
     LoginTokenExpired,
     LoginTokenLookupResult,
@@ -240,12 +240,15 @@ class AuthHandler:
         self._clock = self.hs.get_clock()
 
         # Expire old UI auth sessions after a period of time.
+        # Fan out per tenant: UI auth session rows live in each tenant's
+        # schema, so the expiry sweep must run once per tenant with the
+        # correct search_path bound.
         if hs.config.worker.run_background_tasks:
             self._clock.looping_call(
-                run_as_background_process,
+                run_as_background_process_per_tenant,
                 Duration(minutes=5),
                 "expire_old_sessions",
-                self.server_name,
+                self.hs,
                 self._expire_old_sessions,
             )
 
@@ -1269,7 +1272,11 @@ class AuthHandler:
         if username.startswith("@"):
             qualified_user_id = username
         else:
-            qualified_user_id = UserID(username, self.hs.hostname).to_string()
+            # Multi-tenant: qualify against the active tenant's server_name,
+            # not the primary `hs.hostname`. See `HomeServer.effective_server_name`.
+            qualified_user_id = UserID(
+                username, self.hs.effective_server_name()
+            ).to_string()
 
         # Check if we've hit the failed ratelimit (but don't update it)
         if ratelimit:
@@ -1314,7 +1321,11 @@ class AuthHandler:
         if username.startswith("@"):
             qualified_user_id = username
         else:
-            qualified_user_id = UserID(username, self.hs.hostname).to_string()
+            # Multi-tenant: same reasoning as `validate_login` above —
+            # qualify with the active tenant, not the primary hostname.
+            qualified_user_id = UserID(
+                username, self.hs.effective_server_name()
+            ).to_string()
 
         login_type = login_submission.get("type")
         # we already checked that we have a valid login type

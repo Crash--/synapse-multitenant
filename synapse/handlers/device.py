@@ -54,6 +54,7 @@ from synapse.replication.http.devices import (
 from synapse.storage.databases.main.client_ips import DeviceLastConnectionInfo
 from synapse.storage.databases.main.roommember import EventIdMembership
 from synapse.storage.databases.main.state_deltas import StateDelta
+from synapse.tenant_background import run_as_background_process_per_tenant
 from synapse.types import (
     DeviceListUpdates,
     JsonDict,
@@ -185,11 +186,15 @@ class DeviceHandler:
             hs.config.worker.run_background_tasks
             and self._delete_stale_devices_after is not None
         ):
+            # Fan out per tenant: each tenant's devices live in its own
+            # schema, so the stale-device sweep must run once per tenant
+            # with the right context bound.
             self.clock.looping_call(
-                self.hs.run_as_background_process,
+                run_as_background_process_per_tenant,
                 DELETE_STALE_DEVICES_INTERVAL,
-                desc="delete_stale_devices",
-                func=self._delete_stale_devices,
+                "delete_stale_devices",
+                self.hs,
+                self._delete_stale_devices,
             )
 
     async def _delete_stale_devices(self) -> None:
@@ -1425,12 +1430,16 @@ class DeviceListUpdater(DeviceListWorkerUpdater):
         )
 
         # Attempt to resync out of sync device lists every 30s.
+        # Fan out per tenant: each tenant has its own view of which
+        # remote device lists are out of sync, so the retry sweep must
+        # run once per tenant with the tenant context bound.
         self._resync_retry_lock = Lock()
         self.clock.looping_call(
-            self.hs.run_as_background_process,
+            run_as_background_process_per_tenant,
             Duration(seconds=30),
-            func=self._maybe_retry_device_resync,
-            desc="_maybe_retry_device_resync",
+            "_maybe_retry_device_resync",
+            self.hs,
+            self._maybe_retry_device_resync,
         )
 
     @trace

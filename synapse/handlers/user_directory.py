@@ -39,6 +39,8 @@ from synapse.metrics import SERVER_NAME_LABEL
 from synapse.storage.databases.main.state_deltas import StateDelta
 from synapse.storage.databases.main.user_directory import SearchResult
 from synapse.storage.roommember import ProfileInfo
+from synapse.tenant_background import run_as_background_process_per_tenant
+from synapse.tenant_context import get_current_tenant
 from synapse.types import UserID
 from synapse.util.duration import Duration
 from synapse.util.metrics import Measure
@@ -116,11 +118,16 @@ class UserDirectoryHandler(StateDeltasHandler):
         self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker
         self._hs = hs
 
-        # The current position in the current_state_delta stream
-        self.pos: int | None = None
+        # The current position in the current_state_delta stream — kept
+        # per-tenant because each tenant has its own `current_state_delta`
+        # table (via the per-tenant DB schema). The key is the tenant
+        # `server_name`; the lone "" key is used in single-tenant mode.
+        self._pos_by_tenant: dict[str, int | None] = {}
 
-        # Guard to ensure we only process deltas one at a time
-        self._is_processing = False
+        # Guard to ensure we only process deltas one at a time *per tenant*.
+        # Without per-tenant keying, tenant B's loop would refuse to start
+        # while tenant A's was running.
+        self._is_processing_by_tenant: set[str] = set()
 
         # Guard to ensure we only have one process for refreshing remote profiles
         self._is_refreshing_remote_profiles = False
@@ -183,21 +190,33 @@ class UserDirectoryHandler(StateDeltasHandler):
         return results
 
     def notify_new_event(self) -> None:
-        """Called when there may be more deltas to process"""
+        """Called when there may be more deltas to process.
+
+        In multi-tenant mode this fans out to one background process per
+        configured tenant; each iteration runs `_unsafe_process` with the
+        tenant `ContextVar` bound, so the DB operations land in the
+        right schema. The `_is_processing` guard is keyed per tenant so
+        that tenant B isn't blocked while tenant A's loop is running.
+        """
         if not self.update_user_directory:
             return
 
-        if self._is_processing:
-            return
-
         async def process() -> None:
+            tenant = get_current_tenant()
+            tenant_key = tenant.server_name if tenant is not None else ""
+
+            if tenant_key in self._is_processing_by_tenant:
+                return
+
+            self._is_processing_by_tenant.add(tenant_key)
             try:
                 await self._unsafe_process()
             finally:
-                self._is_processing = False
+                self._is_processing_by_tenant.discard(tenant_key)
 
-        self._is_processing = True
-        self._hs.run_as_background_process("user_directory.notify_new_event", process)
+        run_as_background_process_per_tenant(
+            "user_directory.notify_new_event", self._hs, process
+        )
 
     async def handle_local_profile_change(
         self, user_id: str, profile: ProfileInfo
@@ -220,53 +239,68 @@ class UserDirectoryHandler(StateDeltasHandler):
         await self.store.remove_from_user_dir(user_id)
 
     async def _unsafe_process(self) -> None:
-        # If self.pos is None then means we haven't fetched it from DB
-        if self.pos is None:
-            self.pos = await self.store.get_user_directory_stream_pos()
+        # Per-tenant stream position. The "" key is used when there is no
+        # tenant context bound (single-tenant or test fixtures).
+        tenant = get_current_tenant()
+        tenant_key = tenant.server_name if tenant is not None else ""
+        # Use the tenant's `server_name` for metric labels and Measure
+        # blocks rather than the constructor-time `self.server_name`,
+        # which is fixed to `hs.hostname` (the primary).
+        effective_server_name = (
+            tenant.server_name if tenant is not None else self.server_name
+        )
+
+        pos = self._pos_by_tenant.get(tenant_key)
+
+        # If pos is None then means we haven't fetched it from DB
+        if pos is None:
+            pos = await self.store.get_user_directory_stream_pos()
 
             # If still None then the initial background update hasn't happened yet.
-            if self.pos is None:
+            if pos is None:
                 return None
 
             room_max_stream_ordering = self.store.get_room_max_stream_ordering()
-            if self.pos > room_max_stream_ordering:
+            if pos > room_max_stream_ordering:
                 # apparently, we've processed more events than exist in the database!
                 # this can happen if events are removed with history purge or similar.
                 logger.warning(
                     "Event stream ordering appears to have gone backwards (%i -> %i): "
                     "rewinding user directory processor",
-                    self.pos,
+                    pos,
                     room_max_stream_ordering,
                 )
-                self.pos = room_max_stream_ordering
+                pos = room_max_stream_ordering
 
         # Loop round handling deltas until we're up to date
         while True:
             with Measure(
-                self.clock, name="user_dir_delta", server_name=self.server_name
+                self.clock, name="user_dir_delta", server_name=effective_server_name
             ):
                 room_max_stream_ordering = self.store.get_room_max_stream_ordering()
-                if self.pos == room_max_stream_ordering:
+                if pos == room_max_stream_ordering:
+                    self._pos_by_tenant[tenant_key] = pos
                     return
 
                 logger.debug(
-                    "Processing user stats %s->%s", self.pos, room_max_stream_ordering
+                    "Processing user stats %s->%s", pos, room_max_stream_ordering
                 )
                 (
                     max_pos,
                     deltas,
                 ) = await self._storage_controllers.state.get_current_state_deltas(
-                    self.pos, room_max_stream_ordering
+                    pos, room_max_stream_ordering
                 )
 
                 logger.debug("Handling %d state deltas", len(deltas))
                 await self._handle_deltas(deltas)
 
-                self.pos = max_pos
+                pos = max_pos
+                self._pos_by_tenant[tenant_key] = pos
 
                 # Expose current event processing position to prometheus
                 synapse.metrics.event_processing_positions.labels(
-                    name="user_dir", **{SERVER_NAME_LABEL: self.server_name}
+                    name="user_dir", **{SERVER_NAME_LABEL: effective_server_name}
                 ).set(max_pos)
 
                 await self.store.update_user_directory_stream_pos(max_pos)

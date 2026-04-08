@@ -304,7 +304,14 @@ class LoginRestServlet(RestServlet):
         if user.startswith("@"):
             qualified_user_id = user
         else:
-            qualified_user_id = UserID(user, self.hs.hostname).to_string()
+            # Multi-tenant: qualify against the *active tenant's* server_name,
+            # not the primary `hs.hostname` from config. Otherwise a login
+            # request to acme.localhost with a bare localpart would be
+            # qualified as `@user:localhost`, miss the per-tenant schema, and
+            # fail with "Invalid username or password".
+            qualified_user_id = UserID(
+                user, self.hs.effective_server_name()
+            ).to_string()
 
         if not appservice.is_interested_in_user(qualified_user_id):
             raise LoginError(403, "Invalid access_token", errcode=Codes.FORBIDDEN)
@@ -446,7 +453,7 @@ class LoginRestServlet(RestServlet):
                 # actually log in, so we don't want to create a device/access token.
                 return LoginResponse(
                     user_id=user_id,
-                    home_server=self.hs.hostname,
+                    home_server=self.hs.effective_server_name(),
                 )
 
         initial_display_name = login_submission.get("initial_device_display_name")
@@ -483,7 +490,7 @@ class LoginRestServlet(RestServlet):
         result = LoginResponse(
             user_id=user_id,
             access_token=access_token,
-            home_server=self.hs.hostname,
+            home_server=self.hs.effective_server_name(),
             device_id=device_id,
         )
 

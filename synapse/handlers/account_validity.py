@@ -24,7 +24,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from synapse.api.errors import AuthError, StoreError, SynapseError
-from synapse.metrics.background_process_metrics import wrap_as_background_process
+from synapse.tenant_background import run_as_background_process_per_tenant
 from synapse.types import UserID
 from synapse.util import stringutils
 from synapse.util.async_helpers import delay_cancellation
@@ -73,8 +73,17 @@ class AccountValidityHandler:
             )
 
             # Check the renewal emails to send and send them every 30min.
+            # Fan out per tenant: each tenant's user table is in its own
+            # schema, so the renewal sweep must run once per tenant with the
+            # correct tenant context bound.
             if hs.config.worker.run_background_tasks:
-                self.clock.looping_call(self._send_renewal_emails, Duration(minutes=30))
+                self.clock.looping_call(
+                    run_as_background_process_per_tenant,
+                    Duration(minutes=30),
+                    "send_renewals",
+                    self.hs,
+                    self._send_renewal_emails_impl,
+                )
 
     async def is_user_expired(self, user_id: str) -> bool:
         """Checks if a user has expired against third-party modules.
@@ -122,8 +131,7 @@ class AccountValidityHandler:
         for callback in self._module_api_callbacks.on_user_login_callbacks:
             await callback(user_id, auth_provider_type, auth_provider_id)
 
-    @wrap_as_background_process("send_renewals")
-    async def _send_renewal_emails(self) -> None:
+    async def _send_renewal_emails_impl(self) -> None:
         """Gets the list of users whose account is expiring in the amount of time
         configured in the ``renew_at`` parameter from the ``account_validity``
         configuration, and sends renewal emails to all of these users as long as they
