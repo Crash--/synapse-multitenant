@@ -728,6 +728,8 @@ class DatabasePool:
 
         cursor = conn.cursor()
         try:
+            # information_schema queries are unaffected by search_path; we
+            # explicitly filter by table_schema instead.
             cursor.execute(
                 """
                 SELECT table_name
@@ -739,12 +741,13 @@ class DatabasePool:
             )
             present = {row[0] for row in cursor.fetchall()}
             expected = list(expected_tables)
-            missing = [t for t in expected if t not in present]
+            missing = sorted(t for t in expected if t not in present)
             if missing:
+                sample = missing[:10]
                 raise RuntimeError(
                     f"Tenant {tenant.server_name!r} schema "
                     f"{tenant.database_schema!r} is missing expected tables: "
-                    f"{missing[:10]}{'...' if len(missing) > 10 else ''}. "
+                    f"{sample}{'...' if len(missing) > 10 else ''}. "
                     f"This means the schema bootstrap did not run or was "
                     f"incomplete. The process will not start — see "
                     f"docs/multi_tenant_isolation_model.md."

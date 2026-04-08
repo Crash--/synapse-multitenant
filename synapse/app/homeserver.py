@@ -22,7 +22,7 @@
 import logging
 import os
 import sys
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 from twisted.internet.tcp import Port
 from twisted.web.resource import EncodingResourceWrapper, Resource
@@ -73,6 +73,9 @@ from synapse.storage import DataStore
 from synapse.types import ISynapseReactor
 from synapse.util.httpresourcetree import create_resource_tree
 from synapse.util.module_loader import load_module
+
+if TYPE_CHECKING:
+    from synapse.storage.database import LoggingDatabaseConnection
 
 logger = logging.getLogger("synapse.app.homeserver")
 
@@ -459,13 +462,15 @@ async def start(
         main_db_pool = hs.get_datastores().main.db_pool
         tenants = list(hs.config.tenants.multi_tenant.tenants.values())
 
-        def _check_tenant_isolation(raw_conn: Any) -> None:
+        def _check_tenant_isolation(raw_conn: "LoggingDatabaseConnection") -> None:
             # Derive the expected-tables list from `public` at startup
             # time (single source of truth — matches whatever the
             # bootstrap in scripts/create_tenant_schema.py cloned from
             # the same public schema).
             cursor = raw_conn.cursor()
             try:
+                # information_schema queries are unaffected by search_path;
+                # we explicitly filter by table_schema instead.
                 cursor.execute(
                     """
                     SELECT table_name
