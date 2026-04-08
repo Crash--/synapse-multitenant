@@ -79,3 +79,8 @@ book/
 
 # Don't include users' poetry configs
 /poetry.toml
+
+# Multi-tenant demo/dev rigs — secrets and runtime state
+docker-demo/certs/
+docker-demo/data/
+docker-multitenant/data/logs/

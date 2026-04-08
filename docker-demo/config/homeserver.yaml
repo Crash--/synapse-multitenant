@@ -1,0 +1,112 @@
+# Minimal multi-tenant Synapse config for the 2-tenant Element demo.
+#
+# Two tenants share a single Synapse process, each with its own
+# PostgreSQL schema, signing key, and media root.
+
+## Server ##
+server_name: "localhost"
+pid_file: /data/homeserver.pid
+web_client: false
+soft_file_limit: 0
+public_baseurl: "http://localhost/"
+
+## Multi-Tenant Mode ##
+multi_tenant:
+  enabled: true
+  default_schema: "public"
+
+## Tenants ##
+tenants:
+  - server_name: "matrix.tenant-a.com"
+    database_schema: "tenant_matrix_tenant_a_com"
+    signing_key_path: "/keys/matrix_tenant-a_com.signing.key"
+    media_store_path: "/media/tenant-a"
+    # Traefik publishes on the standard ports (80/443), so the
+    # well-known URL has no port suffix. Element reads this via
+    # /.well-known/matrix/client during homeserver discovery.
+    public_baseurl: "http://matrix.tenant-a.com/"
+    registration_enabled: true
+    enable_federation: false
+
+  - server_name: "matrix.tenant-b.com"
+    database_schema: "tenant_matrix_tenant_b_com"
+    signing_key_path: "/keys/matrix_tenant-b_com.signing.key"
+    media_store_path: "/media/tenant-b"
+    public_baseurl: "http://matrix.tenant-b.com/"
+    registration_enabled: true
+    enable_federation: false
+
+## Listeners ##
+listeners:
+  - port: 8008
+    type: http
+    tls: false
+    x_forwarded: true
+    bind_addresses: ['0.0.0.0']
+    resources:
+      - names: [client, federation]
+        compress: false
+
+## Database ##
+database:
+  name: psycopg2
+  allow_unsafe_locale: true
+  args:
+    user: synapse
+    password: synapse_password
+    database: synapse_demo
+    host: postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+
+## Logging ##
+log_config: "/data/log.config"
+
+## Media ##
+media_store_path: "/media"
+max_upload_size: "50M"
+
+## Registration ##
+# Open registration so you can create test users directly from Element.
+# Not safe for anything beyond a local demo.
+enable_registration: true
+enable_registration_without_verification: true
+registration_shared_secret: "demo_shared_secret_change_in_production"
+
+## Signing Key ##
+signing_key_path: "/keys/localhost.signing.key"
+
+## Trusted Key Servers ##
+suppress_key_server_warning: true
+trusted_key_servers: []
+
+## Security ##
+macaroon_secret_key: "demo_macaroon_secret_change_in_production"
+form_secret: "demo_form_secret_change_in_production"
+
+## Rate Limiting ##
+# Loose enough for demo clicking but still present.
+rc_message:
+  per_second: 5
+  burst_count: 20
+
+rc_registration:
+  per_second: 5
+  burst_count: 20
+
+rc_login:
+  address:
+    per_second: 5
+    burst_count: 20
+  account:
+    per_second: 5
+    burst_count: 20
+  failed_attempts:
+    per_second: 5
+    burst_count: 20
+
+## Misc ##
+enable_metrics: false
+report_stats: false
+allow_guest_access: false

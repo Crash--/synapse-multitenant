@@ -1,0 +1,218 @@
+# Multi-Tenant Synapse — 2-tenant Element demo
+#
+# Two minimalist Matrix homeservers served by a single Synapse process:
+#   - matrix.tenant-a.com
+#   - matrix.tenant-b.com
+#
+# Routing is handled by Traefik, which listens on the standard HTTP (80)
+# and HTTPS (443) ports so Element can hit `http://matrix.tenant-a.com`
+# without an explicit port suffix.
+#
+# Prerequisites
+# =============
+# 1. /etc/hosts entries so the tenant domains resolve to localhost:
+#
+#        127.0.0.1 matrix.tenant-a.com matrix.tenant-b.com
+#
+# 2. Nothing else listening on ports 80 / 443. The larger
+#    `docker-multitenant/` dev rig binds port 80 by default — stop its
+#    nginx (`docker stop synapse-mt-nginx`) before bringing the demo up.
+#
+# Optional TLS (mkcert)
+# =====================
+# To get green-padlock HTTPS (no browser warning), install mkcert
+# (https://github.com/FiloSottile/mkcert), then from this directory:
+#
+#     mkcert -install                                           # once per machine
+#     mkdir -p certs
+#     mkcert -cert-file certs/tenants.crt \
+#            -key-file  certs/tenants.key \
+#            matrix.tenant-a.com matrix.tenant-b.com
+#
+# Traefik's file provider (`traefik/dynamic.yml`) will pick the cert up
+# automatically on the next restart. Without it Traefik falls back to
+# its built-in self-signed cert and the browser will warn once.
+#
+# Bring up
+# ========
+#     docker compose up -d --build
+#     docker compose logs -f synapse
+#
+# Tear down (wipes all state — Postgres runs on tmpfs):
+#     docker compose down
+
+services:
+  # --- Reverse proxy -------------------------------------------------
+  traefik:
+    image: traefik:v2.11
+    container_name: synapse-demo-traefik
+    restart: unless-stopped
+    command:
+      - '--providers.docker=true'
+      - '--providers.docker.exposedbydefault=false'
+      - '--providers.docker.network=docker-demo_synapse-demo-net'
+      - '--providers.file.directory=/etc/traefik/dynamic'
+      - '--providers.file.watch=true'
+      - '--entrypoints.web.address=:80'
+      - '--entrypoints.websecure.address=:443'
+      - '--log.level=INFO'
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
+    networks:
+      - synapse-demo-net
+
+  # --- Database ------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: synapse-demo-postgres
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse_password
+      POSTGRES_DB: synapse_demo
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse_demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - synapse-demo-net
+
+  # --- One-shot bootstrap: keys + schemas ---------------------------
+  keygen:
+    build:
+      context: ..
+      dockerfile: docker-multitenant/Dockerfile.real
+    image: synapse-multitenant:latest
+    container_name: synapse-demo-keygen
+    user: root
+    volumes:
+      - ./data/keys:/keys
+      - ./scripts:/scripts:ro
+    environment:
+      KEYS_DIR: "/keys"
+      TENANTS: "localhost,matrix.tenant-a.com,matrix.tenant-b.com"
+    entrypoint: ["python3", "/scripts/generate_keys.py"]
+    networks:
+      - synapse-demo-net
+
+  init-schemas:
+    image: synapse-multitenant:latest
+    container_name: synapse-demo-init-schemas
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keygen:
+        condition: service_completed_successfully
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse_password
+      POSTGRES_DB: synapse_demo
+      TENANTS: "matrix.tenant-a.com,matrix.tenant-b.com"
+    entrypoint: ["python3", "/scripts/init_schemas.py"]
+    networks:
+      - synapse-demo-net
+
+  # --- Synapse -------------------------------------------------------
+  synapse:
+    image: synapse-multitenant:latest
+    container_name: synapse-demo-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keygen:
+        condition: service_completed_successfully
+      init-schemas:
+        condition: service_completed_successfully
+      traefik:
+        condition: service_started
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+    volumes:
+      - ./config:/data:ro
+      - ./data/keys:/keys:ro
+      - ./data/media:/media
+      # Hot-overlay every multi-tenant Python file from the local
+      # source tree, so editing one of them + `docker compose restart
+      # synapse` is the full inner loop — no rebuild.
+      - ../synapse/tenant_context.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_context.py:ro
+      - ../synapse/tenant_registry.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_registry.py:ro
+      - ../synapse/tenant_background.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_background.py:ro
+      - ../synapse/config/tenants.py:/usr/local/lib/python3.13/site-packages/synapse/config/tenants.py:ro
+      - ../synapse/config/homeserver.py:/usr/local/lib/python3.13/site-packages/synapse/config/homeserver.py:ro
+      - ../synapse/http/site.py:/usr/local/lib/python3.13/site-packages/synapse/http/site.py:ro
+      - ../synapse/storage/database.py:/usr/local/lib/python3.13/site-packages/synapse/storage/database.py:ro
+      - ../synapse/storage/databases/main/__init__.py:/usr/local/lib/python3.13/site-packages/synapse/storage/databases/main/__init__.py:ro
+      - ../synapse/server.py:/usr/local/lib/python3.13/site-packages/synapse/server.py:ro
+      - ../synapse/events/builder.py:/usr/local/lib/python3.13/site-packages/synapse/events/builder.py:ro
+      - ../synapse/media/multitenant_filepath.py:/usr/local/lib/python3.13/site-packages/synapse/media/multitenant_filepath.py:ro
+      - ../synapse/crypto/multitenant_keyring.py:/usr/local/lib/python3.13/site-packages/synapse/crypto/multitenant_keyring.py:ro
+      - ../synapse/rest/well_known.py:/usr/local/lib/python3.13/site-packages/synapse/rest/well_known.py:ro
+      - ../synapse/rest/client/login.py:/usr/local/lib/python3.13/site-packages/synapse/rest/client/login.py:ro
+      - ../synapse/handlers/auth.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/auth.py:ro
+      - ../synapse/handlers/register.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/register.py:ro
+      - ../synapse/handlers/room.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/room.py:ro
+      - ../synapse/handlers/user_directory.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/user_directory.py:ro
+      - ../synapse/handlers/stats.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/stats.py:ro
+      - ../synapse/handlers/pagination.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/pagination.py:ro
+      - ../synapse/handlers/account_validity.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/account_validity.py:ro
+      - ../synapse/handlers/deactivate_account.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/deactivate_account.py:ro
+      - ../synapse/handlers/device.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/device.py:ro
+      - ../synapse/handlers/message.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/message.py:ro
+    labels:
+      - 'traefik.enable=true'
+      # Both tenant hostnames route to the same Synapse container.
+      # Synapse itself resolves the tenant from the Host header that
+      # Traefik forwards.
+      - 'traefik.docker.network=docker-demo_synapse-demo-net'
+      - 'traefik.http.routers.synapse.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`)'
+      - 'traefik.http.routers.synapse.entrypoints=web'
+      - 'traefik.http.routers.synapse-tls.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`)'
+      - 'traefik.http.routers.synapse-tls.entrypoints=websecure'
+      - 'traefik.http.routers.synapse-tls.tls=true'
+      - 'traefik.http.services.synapse.loadbalancer.server.port=8008'
+    networks:
+      - synapse-demo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # --- Clone public schema into each tenant_* schema ----------------
+  # Without this step the tenant schemas exist but are empty and
+  # Postgres' search_path falls back to `public`, so both tenants
+  # would silently share the same tables.
+  copy-schemas:
+    image: synapse-multitenant:latest
+    container_name: synapse-demo-copy-schemas
+    depends_on:
+      synapse:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse_password
+      POSTGRES_DB: synapse_demo
+    entrypoint: ["python3", "/scripts/copy_tenant_tables.py"]
+    networks:
+      - synapse-demo-net
+
+networks:
+  synapse-demo-net:
+    driver: bridge
