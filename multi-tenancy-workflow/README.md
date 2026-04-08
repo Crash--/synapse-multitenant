@@ -20,19 +20,20 @@ Three synchronized scenes (switchable via tabs) show this same lifecycle
 from different angles: a flow diagram, a layered stack, and a
 diagram-plus-log split screen.
 
-## Viewing
+## Running
 
-Just open `index.html` in a modern browser:
+Requires Node.js ≥ 18. No dependencies to install.
 
-    xdg-open index.html      # Linux
-    open index.html          # macOS
+    npm start
+    # → http://127.0.0.1:8765/
 
-If your browser blocks `file://` module imports, serve over HTTP:
+Set `PORT` or `HOST` to override:
 
-    python -m http.server -d multi-tenancy-workflow 8000
-    # then open http://localhost:8000/
+    PORT=3000 npm start
 
-No build step, no npm, no network.
+You can also just open `index.html` directly via `file://`, but some
+browsers block ES module imports from the local filesystem — running
+the server avoids that.
 
 ## Keyboard
 

@@ -1,0 +1,13 @@
+{
+  "name": "multi-tenancy-workflow",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Animated explainer for multi-tenant Synapse request lifecycle",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

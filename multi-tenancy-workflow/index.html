@@ -13,7 +13,12 @@
       <button class="tab active" data-scene="A" role="tab">A · Flow</button>
       <button class="tab" data-scene="B" role="tab">B · Stack</button>
       <button class="tab" data-scene="C" role="tab">C · Log</button>
+      <button class="tab" data-scene="D" role="tab">D · vs Upstream</button>
     </nav>
+    <label class="fork-toggle">
+      <input type="checkbox" id="fork-mode" />
+      <span>Highlight fork additions</span>
+    </label>
     <label class="parallel-toggle">
       <input type="checkbox" id="parallel-mode" />
       <span>Parallel tenants</span>
@@ -28,7 +33,7 @@
     <div class="scrubber" id="scrubber"></div>
     <div class="stage-label">
       <span id="stage-name">Idle</span>
-      <span class="stage-counter"><span id="stage-index">0</span>/10</span>
+      <span class="stage-counter"><span id="stage-index">0</span>/<span id="stage-total">0</span></span>
     </div>
   </footer>
 
