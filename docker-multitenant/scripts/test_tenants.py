@@ -657,6 +657,95 @@ def test_logs_have_tenant_context():
     return False
 
 
+# -----------------------------------------------------------------------
+# PHASE 1B ISOLATION PROBES — these probes exercise whether schema-per-
+# tenant isolation is actually real, as opposed to `search_path` falling
+# through to `public`. They are expected to FAIL on the current main
+# branch and PASS after `scripts/create_tenant_schema.py` is rewritten
+# to clone tables + sequences per tenant.
+# -----------------------------------------------------------------------
+
+
+def _register_shared_secret(tenant, localpart):
+    """Helper: register a user via the shared-secret admin endpoint.
+
+    Returns True on 200, False on any error or non-200.
+    """
+    import hmac
+    import hashlib
+
+    # Shared secret must match the one in
+    # docker-multitenant/config/homeserver.yaml — verified during plan
+    # reconnaissance to be this literal string for every tenant in the rig.
+    shared_secret = b"demo_shared_secret_change_in_production"
+
+    # Step 1: fetch nonce
+    nonce_result = make_request(
+        "GET", "/_synapse/admin/v1/register", tenant
+    )
+    if nonce_result.get("status") != 200:
+        return False
+    nonce = nonce_result["data"].get("nonce")
+    if not nonce:
+        return False
+
+    # Step 2: compute HMAC
+    mac = hmac.new(key=shared_secret, digestmod=hashlib.sha1)
+    mac.update(nonce.encode("utf-8"))
+    mac.update(b"\x00")
+    mac.update(localpart.encode("utf-8"))
+    mac.update(b"\x00")
+    mac.update(b"isolation_probe_password")
+    mac.update(b"\x00")
+    mac.update(b"notadmin")
+    mac_hex = mac.hexdigest()
+
+    # Step 3: register
+    result = make_request(
+        "POST",
+        "/_synapse/admin/v1/register",
+        tenant,
+        data={
+            "nonce": nonce,
+            "username": localpart,
+            "password": "isolation_probe_password",
+            "admin": False,
+            "mac": mac_hex,
+        },
+    )
+    return result.get("status") == 200
+
+
+def test_isolation_same_localpart():
+    """Register the same localpart in two tenants and assert both succeed.
+
+    Under correct isolation, `alice` on tenant A and `alice` on tenant B
+    are `@alice:acme.localhost` and `@alice:corp.localhost` — distinct
+    fully-qualified IDs — and the `profiles.user_id` UNIQUE constraint
+    should not collide because each tenant has its own `profiles` table.
+
+    Under the current broken state, both writes hit `public.profiles`
+    and the second registration fails with a duplicate-key error.
+    """
+    # Include a run-id so re-runs against the same rig don't collide on
+    # the first tenant (which would mask the real isolation signal coming
+    # from the second tenant). The SAME localpart is used for both tenants
+    # within a single run — that's what the probe is testing.
+    localpart = f"iso_probe_alice_{int(time.time() * 1000)}"
+    ok_a = _register_shared_secret(TENANTS[0], localpart)
+    ok_b = _register_shared_secret(TENANTS[1], localpart)
+
+    if ok_a and ok_b:
+        print(f"    [PASS] same-localpart isolation "
+              f"({localpart} registered on {TENANTS[0]} and {TENANTS[1]})")
+        return True
+    else:
+        print(f"    [FAIL] same-localpart isolation "
+              f"(tenant_a={ok_a}, tenant_b={ok_b}) — "
+              "likely search_path fall-through to public.profiles")
+        return False
+
+
 def test_tenant_isolation(users):
     """Test that tokens from one tenant don't work on another."""
     if len(users) < 2:
@@ -734,6 +823,23 @@ def test_tenant(tenant):
 
 
 def main():
+    # Focused-phase dispatch: when called with `--phase <name>` we only
+    # run a targeted subset. This exists so the host-side isolation probe
+    # runner (`run_isolation_probes_host.sh`) can delegate the HTTP probe
+    # into the in-container runner without dragging the whole suite along.
+    phase = None
+    if "--phase" in sys.argv:
+        idx = sys.argv.index("--phase")
+        if idx + 1 < len(sys.argv):
+            phase = sys.argv[idx + 1]
+
+    if phase == "1b-http":
+        if not wait_for_synapse():
+            sys.exit(1)
+        print("\n=== PHASE 1B ISOLATION PROBES (HTTP only) ===")
+        ok = test_isolation_same_localpart()
+        sys.exit(0 if ok else 1)
+
     print("\n" + "=" * 60)
     print("  MULTI-TENANT SYNAPSE - INTEGRATION TESTS (REAL SYNAPSE)")
     print("=" * 60)
@@ -838,6 +944,25 @@ def main():
             total_passed += 1
         else:
             total_failed += 1
+
+    # Phase-1B isolation probes — schema-per-tenant actually holding.
+    # Expected to FAIL on current main branch and PASS after the
+    # create_tenant_schema.py rewrite back-applies per-tenant table +
+    # sequence cloning.
+    print(f"\n{'='*60}")
+    print("  PHASE 1B ISOLATION PROBES (schema isolation)")
+    print(f"{'='*60}")
+
+    try:
+        ok = test_isolation_same_localpart()
+    except Exception as e:
+        print(f"    [FAIL] test_isolation_same_localpart raised "
+              f"{type(e).__name__}: {e}")
+        ok = False
+    if ok:
+        total_passed += 1
+    else:
+        total_failed += 1
 
     # Summary
     print("\n" + "=" * 60)
