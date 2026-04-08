@@ -128,6 +128,7 @@ services:
       - ../synapse/http/site.py:/usr/local/lib/python3.13/site-packages/synapse/http/site.py:ro
       - ../synapse/storage/database.py:/usr/local/lib/python3.13/site-packages/synapse/storage/database.py:ro
       - ../synapse/storage/databases/main/__init__.py:/usr/local/lib/python3.13/site-packages/synapse/storage/databases/main/__init__.py:ro
+      - ../synapse/storage/databases/state/store.py:/usr/local/lib/python3.13/site-packages/synapse/storage/databases/state/store.py:ro
       - ../synapse/handlers/register.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/register.py:ro
       - ../synapse/handlers/room.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/room.py:ro
       - ../synapse/server.py:/usr/local/lib/python3.13/site-packages/synapse/server.py:ro

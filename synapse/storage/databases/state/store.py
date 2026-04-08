@@ -118,20 +118,27 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         # We size the non-members cache to be smaller than the members cache as the
         # vast majority of state in Matrix (today) is member events.
 
-        self._state_group_cache: DictionaryCache[int, StateKey, str] = DictionaryCache(
-            name="*stateGroupCache*",
-            clock=hs.get_clock(),
-            server_name=self.server_name,
-            # TODO: this hasn't been tuned yet
-            max_entries=50000,
-        )
-        self._state_group_members_cache: DictionaryCache[int, StateKey, str] = (
+        # Multi-tenant: the outer key is (effective_server_name, state_group)
+        # rather than a bare state_group int. Per-tenant Postgres sequences mint
+        # colliding state_group IDs across tenant schemas, so without the
+        # tenant prefix a read from one tenant could return cached state rows
+        # written under a different tenant's schema.
+        self._state_group_cache: DictionaryCache[tuple[str, int], StateKey, str] = (
             DictionaryCache(
-                name="*stateGroupMembersCache*",
+                name="*stateGroupCache*",
                 clock=hs.get_clock(),
                 server_name=self.server_name,
-                max_entries=500000,
+                # TODO: this hasn't been tuned yet
+                max_entries=50000,
             )
+        )
+        self._state_group_members_cache: DictionaryCache[
+            tuple[str, int], StateKey, str
+        ] = DictionaryCache(
+            name="*stateGroupMembersCache*",
+            clock=hs.get_clock(),
+            server_name=self.server_name,
+            max_entries=500000,
         )
 
         def get_max_state_group_txn(txn: Cursor) -> int:
@@ -224,7 +231,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
     @tag_args
     def _get_state_for_group_using_cache(
         self,
-        cache: DictionaryCache[int, StateKey, str],
+        cache: DictionaryCache[tuple[str, int], StateKey, str],
         group: int,
         state_filter: StateFilter,
     ) -> tuple[MutableStateMap[str], bool]:
@@ -248,7 +255,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         if not state_filter.has_wildcards():
             dict_keys = state_filter.concrete_types()
 
-        cache_entry = cache.get(group, dict_keys=dict_keys)
+        cache_entry = cache.get(
+            (self.hs.effective_server_name(), group), dict_keys=dict_keys
+        )
         state_dict_ids = cache_entry.value
 
         if cache_entry.full or state_filter.is_full():
@@ -348,7 +357,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
     def _get_state_for_groups_using_cache(
         self,
         groups: Iterable[int],
-        cache: DictionaryCache[int, StateKey, str],
+        cache: DictionaryCache[tuple[str, int], StateKey, str],
         state_filter: StateFilter,
     ) -> tuple[dict[int, MutableStateMap[str]], set[int]]:
         """Gets the state at each of a list of state groups, optionally
@@ -419,6 +428,8 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
         else:
             non_member_types = non_member_filter.concrete_types()
 
+        effective_server_name = self.hs.effective_server_name()
+
         for group, group_state_dict in group_to_state_dict.items():
             state_dict_members = {}
             state_dict_non_members = {}
@@ -431,14 +442,14 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
 
             self._state_group_members_cache.update(
                 cache_seq_num_members,
-                key=group,
+                key=(effective_server_name, group),
                 value=state_dict_members,
                 fetched_keys=member_types,
             )
 
             self._state_group_cache.update(
                 cache_seq_num_non_members,
-                key=group,
+                key=(effective_server_name, group),
                 value=state_dict_non_members,
                 fetched_keys=non_member_types,
             )
@@ -656,6 +667,13 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
 
             return state_group
 
+        # Capture the effective server name here, outside the txn closure, so
+        # the (server_name, state_group) cache keys used in `txn.call_after`
+        # below always reflect the tenant of the originating request — even if
+        # the contextvar is no longer bound by the time the after-callbacks
+        # fire.
+        effective_server_name = self.hs.effective_server_name()
+
         def insert_full_state_txn(
             txn: LoggingTransaction, current_state_ids: StateMap[str]
         ) -> int:
@@ -691,7 +709,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             txn.call_after(
                 self._state_group_members_cache.update,
                 self._state_group_members_cache.sequence,
-                key=state_group,
+                key=(effective_server_name, state_group),
                 value=current_member_state_ids,
             )
 
@@ -703,7 +721,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             txn.call_after(
                 self._state_group_cache.update,
                 self._state_group_cache.sequence,
-                key=state_group,
+                key=(effective_server_name, state_group),
                 value=current_non_member_state_ids,
             )
 
