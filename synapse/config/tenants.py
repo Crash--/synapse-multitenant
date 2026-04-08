@@ -65,6 +65,11 @@ class TenantConfig:
     # confirmation) and in OIDC callbacks. If unset, defaults to
     # `https://{server_name}/` — the conventional Matrix discovery URL.
     public_baseurl: str | None = None
+    # Identity server URL announced in /.well-known/matrix/client under
+    # the `m.identity_server` key. If unset, the tenant inherits whatever
+    # the global config has (which may also be unset, meaning no
+    # identity server is announced).
+    identity_server: str | None = None
 
     @property
     def effective_public_baseurl(self) -> str:
@@ -77,6 +82,16 @@ class TenantConfig:
         if self.public_baseurl is not None:
             return self.public_baseurl
         return f"https://{self.server_name}/"
+
+    @property
+    def effective_identity_server(self) -> str | None:
+        """Return `identity_server` if set, otherwise None.
+
+        Unlike `public_baseurl`, there is no default — the identity
+        server is genuinely optional and the wire format omits the
+        `m.identity_server` key entirely when unset.
+        """
+        return self.identity_server
 
     @classmethod
     def from_dict(cls, config: JsonDict, base_path: str = "") -> "TenantConfig":
@@ -123,6 +138,7 @@ class TenantConfig:
             trusted_key_servers=config.get("trusted_key_servers", []),
             max_mau_value=config.get("max_mau_value", 0),
             public_baseurl=config.get("public_baseurl"),
+            identity_server=config.get("identity_server"),
         )
 
 

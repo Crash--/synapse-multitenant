@@ -60,10 +60,17 @@ class WellKnownBuilder:
 
         result = {"m.homeserver": {"base_url": base_url}}
 
-        if self._config.registration.default_identity_server:
-            result["m.identity_server"] = {
-                "base_url": self._config.registration.default_identity_server
-            }
+        # Multi-tenant: prefer the tenant's own identity_server if bound.
+        # Falls back to the global registration default outside request
+        # context.
+        identity_server = None
+        if tenant is not None:
+            identity_server = tenant.effective_identity_server
+        if identity_server is None:
+            identity_server = self._config.registration.default_identity_server
+
+        if identity_server:
+            result["m.identity_server"] = {"base_url": identity_server}
 
         if self._config.mas.enabled:
             assert isinstance(self._auth, MasDelegatedAuth)
