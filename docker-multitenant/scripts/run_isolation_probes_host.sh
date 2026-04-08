@@ -22,8 +22,8 @@ overall_rc=0
 # check (nextval on one, verify the other unchanged) is deferred to
 # phase 2 probes.
 echo "-- stream-sequence presence --"
-for schema in tenant_acme_localhost tenant_corp_localhost; do
-    out=$(docker compose exec -T postgres psql -U synapse -d synapse -At \
+for schema in tenant_acme tenant_corp tenant_startup; do
+    out=$(docker compose exec -T postgres psql -U synapse -d synapse_multitenant -At \
           -c "SELECT last_value FROM ${schema}.events_stream_seq;" 2>&1)
     rc=$?
     if [ $rc -ne 0 ]; then

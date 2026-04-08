@@ -54,8 +54,14 @@ services:
     networks:
       - synapse-net
 
-  # Schema initializer (creates PostgreSQL schemas for tenants)
-  # Uses Synapse image which has psycopg2 pre-installed
+  # Tenant schema bootstrap.
+  #
+  # Runs AFTER synapse is healthy. Waits for the public schema to be
+  # populated by Synapse's prepare_database, then clones public into
+  # each tenant schema (with per-tenant sequences and column defaults)
+  # using scripts/create_tenant_schema.py::clone_schema_with_sequences.
+  #
+  # See docker-multitenant/scripts/init_schemas.py for details.
   init-schemas:
     build:
       context: ..
@@ -65,15 +71,23 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      synapse:
+        condition: service_healthy
     volumes:
       - ./scripts:/scripts:ro
+      # Mount the repo-level scripts/ (create_tenant_schema.py lives
+      # there) as a sibling of docker-multitenant scripts, and mount
+      # the homeserver.yaml so init_schemas can read the authoritative
+      # tenant schema names.
+      - ../scripts:/src/scripts:ro
+      - ./config:/data:ro
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       POSTGRES_USER: synapse
       POSTGRES_PASSWORD: synapse_password
       POSTGRES_DB: synapse_multitenant
-      TENANTS: "acme.localhost,corp.localhost,startup.localhost"
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
     entrypoint: ["python3", "/scripts/init_schemas.py"]
     networks:
       - synapse-net
@@ -89,8 +103,6 @@ services:
       postgres:
         condition: service_healthy
       keygen:
-        condition: service_completed_successfully
-      init-schemas:
         condition: service_completed_successfully
     environment:
       SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
@@ -147,6 +159,8 @@ services:
     depends_on:
       synapse:
         condition: service_healthy
+      init-schemas:
+        condition: service_completed_successfully
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -177,6 +191,8 @@ services:
     depends_on:
       synapse:
         condition: service_healthy
+      init-schemas:
+        condition: service_completed_successfully
     volumes:
       - ./scripts:/scripts:ro
       - ./data/logs:/synapse-logs:ro
