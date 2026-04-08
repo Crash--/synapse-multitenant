@@ -680,21 +680,75 @@ class DatabasePool:
             result = cursor.fetchone()
             original_search_path = result[0] if result else "public"
 
-            # Set the search_path to the tenant's schema
-            # We include 'public' as a fallback for shared tables
+            # Set the search_path to the tenant's schema.
             schema = tenant.database_schema
             # Use parameterized query format - but schema names can't be parameters
             # so we validate the schema name first
             if not schema.replace("_", "").isalnum():
                 raise ValueError(f"Invalid schema name: {schema}")
 
-            cursor.execute(f"SET search_path TO {schema}, public")
+            # Security-first policy: do NOT include `, public` as a fallback.
+            # Any table missing from the tenant schema must fail loud, not
+            # silently resolve in public. See
+            # docs/multi_tenant_isolation_model.md for the reasoning.
+            cursor.execute(f"SET search_path TO {schema}")
             logger.debug(
-                "Set search_path to '%s, public' for tenant %s",
+                "Set search_path to '%s' for tenant %s",
                 schema,
                 tenant.server_name,
             )
             return original_search_path
+        finally:
+            cursor.close()
+
+    def assert_tenant_schema_isolated(
+        self,
+        conn: "LoggingDatabaseConnection",
+        tenant: "TenantConfig",
+        expected_tables: Iterable[str],
+    ) -> None:
+        """Assert that every expected table resolves inside the tenant schema.
+
+        Startup-time check: runs once per tenant after the schema bootstrap,
+        raises RuntimeError if any expected table is missing from the tenant
+        schema. Protects against the `search_path` fall-through bug where
+        tenant writes silently piled into `public.<table>`.
+
+        Args:
+            conn: An open connection.
+            tenant: The tenant whose schema is being asserted.
+            expected_tables: The tables that MUST exist in the tenant schema
+                (typically derived from `discover_schema_surface("public")`).
+
+        Raises:
+            RuntimeError: if any expected table is missing.
+        """
+        if not isinstance(self.engine, PostgresEngine):
+            return
+
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT table_name
+                  FROM information_schema.tables
+                 WHERE table_schema = %s
+                   AND table_type = 'BASE TABLE'
+                """,
+                (tenant.database_schema,),
+            )
+            present = {row[0] for row in cursor.fetchall()}
+            expected = list(expected_tables)
+            missing = [t for t in expected if t not in present]
+            if missing:
+                raise RuntimeError(
+                    f"Tenant {tenant.server_name!r} schema "
+                    f"{tenant.database_schema!r} is missing expected tables: "
+                    f"{missing[:10]}{'...' if len(missing) > 10 else ''}. "
+                    f"This means the schema bootstrap did not run or was "
+                    f"incomplete. The process will not start — see "
+                    f"docs/multi_tenant_isolation_model.md."
+                )
         finally:
             cursor.close()
 
