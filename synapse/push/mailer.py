@@ -46,6 +46,7 @@ from synapse.push.push_types import (
     TemplateVars,
 )
 from synapse.storage.databases.main.event_push_actions import EmailPushAction
+from synapse.tenant_context import get_current_tenant
 from synapse.types import StateMap, UserID
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import concurrently_execute
@@ -154,8 +155,14 @@ class Mailer:
             sid: The generated session ID
         """
         params = {"token": token, "client_secret": client_secret, "sid": sid}
+        tenant = get_current_tenant()
+        base_url = (
+            tenant.effective_public_baseurl
+            if tenant is not None
+            else self.hs.config.server.public_baseurl
+        )
         link = (
-            self.hs.config.server.public_baseurl
+            base_url
             + "_synapse/client/password_reset/email/submit_token?%s"
             % urllib.parse.urlencode(params)
         )
@@ -189,8 +196,14 @@ class Mailer:
             sid: The generated session ID
         """
         params = {"token": token, "client_secret": client_secret, "sid": sid}
+        tenant = get_current_tenant()
+        base_url = (
+            tenant.effective_public_baseurl
+            if tenant is not None
+            else self.hs.config.server.public_baseurl
+        )
         link = (
-            self.hs.config.server.public_baseurl
+            base_url
             + "_matrix/client/unstable/registration/email/submit_token?%s"
             % urllib.parse.urlencode(params)
         )
@@ -244,8 +257,14 @@ class Mailer:
             sid: The generated session ID
         """
         params = {"token": token, "client_secret": client_secret, "sid": sid}
+        tenant = get_current_tenant()
+        base_url = (
+            tenant.effective_public_baseurl
+            if tenant is not None
+            else self.hs.config.server.public_baseurl
+        )
         link = (
-            self.hs.config.server.public_baseurl
+            base_url
             + "_matrix/client/unstable/add_threepid/email/submit_token?%s"
             % urllib.parse.urlencode(params)
         )
@@ -947,8 +966,14 @@ class Mailer:
             "pushkey": email_address,
         }
 
+        tenant = get_current_tenant()
+        base_url = (
+            tenant.effective_public_baseurl
+            if tenant is not None
+            else self.hs.config.server.public_baseurl
+        )
         return "%s_synapse/client/unsubscribe?%s" % (
-            self.hs.config.server.public_baseurl,
+            base_url,
             urllib.parse.urlencode(params),
         )
 

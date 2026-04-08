@@ -31,6 +31,7 @@ from synapse.api.urls import CLIENT_API_PREFIX
 from synapse.http.server import HttpServer, respond_with_html, respond_with_redirect
 from synapse.http.servlet import RestServlet, parse_string
 from synapse.http.site import SynapseRequest
+from synapse.tenant_context import get_current_tenant
 
 from ._base import client_patterns
 
@@ -104,11 +105,17 @@ class AuthRestServlet(RestServlet):
                 sitekey=self.hs.config.captcha.recaptcha_public_key,
             )
         elif stagetype == LoginType.TERMS:
+            tenant = get_current_tenant()
+            base_url = (
+                tenant.effective_public_baseurl
+                if tenant is not None
+                else self.hs.config.server.public_baseurl
+            )
             html = self.terms_template.render(
                 session=session,
                 terms_url="%s_matrix/consent?v=%s"
                 % (
-                    self.hs.config.server.public_baseurl,
+                    base_url,
                     self.hs.config.consent.user_consent_version,
                 ),
                 myurl="%s/v3/auth/%s/fallback/web"
@@ -172,11 +179,17 @@ class AuthRestServlet(RestServlet):
                 )
             except LoginError as e:
                 # Authentication failed, let user try again
+                tenant = get_current_tenant()
+                base_url = (
+                    tenant.effective_public_baseurl
+                    if tenant is not None
+                    else self.hs.config.server.public_baseurl
+                )
                 html = self.terms_template.render(
                     session=session,
                     terms_url="%s_matrix/consent?v=%s"
                     % (
-                        self.hs.config.server.public_baseurl,
+                        base_url,
                         self.hs.config.consent.user_consent_version,
                     ),
                     myurl="%s/v3/auth/%s/fallback/web"
