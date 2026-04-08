@@ -46,6 +46,38 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from synapse.config.tenants import TenantConfig
 
+# Singleton seed rows that upstream Synapse's `prepare_database` writes into
+# `public` on first boot. `CREATE TABLE ... (LIKE ... INCLUDING ALL)` clones
+# structure but NOT data, so every tenant schema starts with these tables
+# empty -- and every background loop that calls `simple_select_one` on them
+# crashes with `StoreError: 404 No row found`. The bootstrap has to copy
+# these rows into each tenant schema alongside the table clone.
+#
+# Sources (for auditability when a future Synapse delta adds a ninth row):
+#   - synapse/storage/schema/main/full_schemas/72/full.sql.postgres:1327-1333
+#     (appservice_stream_position, event_push_summary_last_receipt_stream_id,
+#      event_push_summary_stream_ordering, federation_stream_position x2,
+#      stats_incremental_position, user_directory_stream_pos)
+#   - synapse/storage/schema/main/delta/76/04_add_room_forgetter.sql:41
+#   - synapse/storage/schema/main/delta/88/01_add_delayed_events.sql:41
+#   - synapse/storage/schema/main/delta/73/12refactor_device_list_outbound_pokes.sql:59
+#
+# All tables use the `Lock CHAR(1) DEFAULT 'X' UNIQUE CHECK (Lock='X')`
+# singleton idiom (or, for federation_stream_position, a (type, instance_name)
+# unique constraint). Re-running the bootstrap is safe: the ON CONFLICT DO
+# NOTHING clause below relies on those unique constraints to reject duplicates.
+SINGLETON_SEED_TABLES: tuple[str, ...] = (
+    "appservice_stream_position",
+    "event_push_summary_last_receipt_stream_id",
+    "event_push_summary_stream_ordering",
+    "federation_stream_position",
+    "stats_incremental_position",
+    "user_directory_stream_pos",
+    "room_forgetter_stream_pos",
+    "delayed_events_stream_pos",
+    "device_lists_changes_converted_stream_position",
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -110,6 +142,7 @@ def build_clone_schema_sql(
     sequences: list,
     sequence_defaults: list,
     source_schema: str = "public",
+    seed_tables: tuple = SINGLETON_SEED_TABLES,
 ) -> list:
     """Build the SQL statements that clone a schema with per-tenant sequences.
 
@@ -172,6 +205,23 @@ def build_clone_schema_sql(
             f"ALTER TABLE {target}.{t} "
             f"ALTER COLUMN {c} "
             f"SET DEFAULT nextval('{target}.{s}')"
+        )
+
+    # 4. Copy singleton seed rows. LIKE INCLUDING ALL clones structure
+    #    but not data, so the `Lock='X'` singleton tables would start
+    #    empty and every bg loop that `simple_select_one`s them would
+    #    crash. Only copy tables that were actually cloned (intersect
+    #    with `tables`) so test fixtures with a narrow table list don't
+    #    explode. ON CONFLICT DO NOTHING makes re-runs idempotent.
+    cloned = set(tables)
+    for tbl in seed_tables:
+        if tbl not in cloned:
+            continue
+        t = _safe(tbl)
+        statements.append(
+            f"INSERT INTO {target}.{t} "
+            f"SELECT * FROM {source}.{t} "
+            f"ON CONFLICT DO NOTHING"
         )
 
     return statements
