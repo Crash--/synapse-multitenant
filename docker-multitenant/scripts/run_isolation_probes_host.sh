@@ -6,18 +6,22 @@
 # cd's to the docker-multitenant/ root before doing anything.
 
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { echo "ERROR: failed to cd to docker-multitenant/ root" >&2; exit 2; }
 
 echo "=== PHASE 1B ISOLATION PROBES (host) ==="
 echo
 
 overall_rc=0
 
-# ---- Probe: stream-sequence independence ----
-# Under correct isolation, each tenant has its OWN events_stream_seq inside
-# its schema. Under the fall-through bug, tenant_acme_localhost.events_stream_seq
-# does not exist and psql returns non-zero — which is the red signal.
-echo "-- stream-sequence independence --"
+# ---- Probe: stream-sequence presence ----
+# Under correct isolation, each tenant has its OWN events_stream_seq
+# inside its schema. Under the fall-through bug, tenant_acme_localhost.
+# events_stream_seq does not exist and psql returns non-zero — that IS
+# the red signal. This probe asserts presence+readability per-tenant,
+# which is sufficient for the phase-1 gate. A stronger independence
+# check (nextval on one, verify the other unchanged) is deferred to
+# phase 2 probes.
+echo "-- stream-sequence presence --"
 for schema in tenant_acme_localhost tenant_corp_localhost; do
     out=$(docker compose exec -T postgres psql -U synapse -d synapse -At \
           -c "SELECT last_value FROM ${schema}.events_stream_seq;" 2>&1)
@@ -32,7 +36,7 @@ for schema in tenant_acme_localhost tenant_corp_localhost; do
 done
 
 if [ $overall_rc -eq 0 ]; then
-    echo "    [PASS] stream-sequence independence (both tenants have distinct per-schema sequences)"
+    echo "    [PASS] stream-sequence presence (each tenant has its own events_stream_seq in its schema)"
 fi
 echo
 

@@ -679,41 +679,64 @@ def _register_shared_secret(tenant, localpart):
     # reconnaissance to be this literal string for every tenant in the rig.
     shared_secret = b"demo_shared_secret_change_in_production"
 
-    # Step 1: fetch nonce
-    nonce_result = make_request(
-        "GET", "/_synapse/admin/v1/register", tenant
-    )
-    if nonce_result.get("status") != 200:
-        return False
-    nonce = nonce_result["data"].get("nonce")
-    if not nonce:
-        return False
+    try:
+        # Step 1: fetch nonce
+        nonce_result = make_request(
+            "GET", "/_synapse/admin/v1/register", tenant
+        )
+        if nonce_result.get("status") != 200:
+            print(
+                f"    [debug] nonce fetch failed for {tenant}: "
+                f"status={nonce_result.get('status')}, "
+                f"body={str(nonce_result.get('data'))[:200]!r}"
+            )
+            return False
+        nonce = nonce_result["data"].get("nonce")
+        if not nonce:
+            print(
+                f"    [debug] nonce missing in response for {tenant}: "
+                f"body={str(nonce_result['data'])[:200]!r}"
+            )
+            return False
 
-    # Step 2: compute HMAC
-    mac = hmac.new(key=shared_secret, digestmod=hashlib.sha1)
-    mac.update(nonce.encode("utf-8"))
-    mac.update(b"\x00")
-    mac.update(localpart.encode("utf-8"))
-    mac.update(b"\x00")
-    mac.update(b"isolation_probe_password")
-    mac.update(b"\x00")
-    mac.update(b"notadmin")
-    mac_hex = mac.hexdigest()
+        # Step 2: compute HMAC
+        mac = hmac.new(key=shared_secret, digestmod=hashlib.sha1)
+        mac.update(nonce.encode("utf-8"))
+        mac.update(b"\x00")
+        mac.update(localpart.encode("utf-8"))
+        mac.update(b"\x00")
+        mac.update(b"isolation_probe_password")
+        mac.update(b"\x00")
+        mac.update(b"notadmin")
+        mac_hex = mac.hexdigest()
 
-    # Step 3: register
-    result = make_request(
-        "POST",
-        "/_synapse/admin/v1/register",
-        tenant,
-        data={
-            "nonce": nonce,
-            "username": localpart,
-            "password": "isolation_probe_password",
-            "admin": False,
-            "mac": mac_hex,
-        },
-    )
-    return result.get("status") == 200
+        # Step 3: register
+        result = make_request(
+            "POST",
+            "/_synapse/admin/v1/register",
+            tenant,
+            data={
+                "nonce": nonce,
+                "username": localpart,
+                "password": "isolation_probe_password",
+                "admin": False,
+                "mac": mac_hex,
+            },
+        )
+        if result.get("status") != 200:
+            print(
+                f"    [debug] register failed for {tenant} {localpart}: "
+                f"status={result.get('status')}, "
+                f"body={str(result.get('data'))[:200]!r}"
+            )
+            return False
+        return True
+    except Exception as exc:
+        print(
+            f"    [debug] request threw for {tenant}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
 
 
 def test_isolation_same_localpart():
