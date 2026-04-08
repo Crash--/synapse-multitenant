@@ -47,7 +47,25 @@ class ConsentURIBuilder:
         if hs_config.key.form_secret is None:
             raise ConfigError("form_secret not set in config")
         self._hmac_secret = hs_config.key.form_secret.encode("utf-8")
-        self._public_baseurl = hs_config.server.public_baseurl
+        self._hs_config = hs_config
+
+    def _get_public_baseurl(self) -> str:
+        """Resolve the tenant-aware public_baseurl for the current request.
+
+        This used to be captured at __init__ time, but under multi-tenant
+        mode that would return whichever tenant was bound at process
+        startup (i.e. none). Now resolved per-request from
+        get_current_tenant() with a fall-back to the global config.
+        """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.effective_public_baseurl
+        baseurl = self._hs_config.server.public_baseurl
+        if not baseurl:
+            raise ConfigError("public_baseurl not set in config")
+        return baseurl
 
     def build_user_consent_uri(self, user_id: str) -> str:
         """Build a URI which we can give to the user to do their privacy
@@ -63,7 +81,7 @@ class ConsentURIBuilder:
             key=self._hmac_secret, msg=user_id.encode("ascii"), digestmod=sha256
         ).hexdigest()
         consent_uri = "%s_matrix/consent?%s" % (
-            self._public_baseurl,
+            self._get_public_baseurl(),
             urlencode({"u": user_id, "h": mac}),
         )
         return consent_uri
@@ -71,7 +89,29 @@ class ConsentURIBuilder:
 
 class LoginSSORedirectURIBuilder:
     def __init__(self, hs_config: HomeServerConfig):
-        self._public_baseurl = hs_config.server.public_baseurl
+        self._hs_config = hs_config
+
+    def _get_public_baseurl(self) -> str:
+        """Resolve the tenant-aware public_baseurl for the current request.
+
+        This used to be captured at __init__ time, but under multi-tenant
+        mode that would return whichever tenant was bound at process
+        startup (i.e. none). Now resolved per-request from
+        get_current_tenant() with a fall-back to the global config.
+
+        SECURITY: getting this wrong lands the user on the wrong tenant's
+        SSO callback, which is an account-takeover vector. Always resolve
+        per-request.
+        """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.effective_public_baseurl
+        baseurl = self._hs_config.server.public_baseurl
+        if not baseurl:
+            raise ConfigError("public_baseurl not set in config")
+        return baseurl
 
     def build_login_sso_redirect_uri(
         self, *, idp_id: str | None, client_redirect_url: str
@@ -89,7 +129,7 @@ class LoginSSORedirectURIBuilder:
             The URI to follow when choosing a specific identity provider.
         """
         base_url = urljoin(
-            self._public_baseurl,
+            self._get_public_baseurl(),
             f"{CLIENT_API_PREFIX}/v3/login/sso/redirect",
         )
 

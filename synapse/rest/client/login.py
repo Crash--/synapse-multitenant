@@ -654,17 +654,38 @@ class SsoRedirectServlet(RestServlet):
         # make sure that the relevant handlers are instantiated, so that they
         # register themselves with the main SSOHandler.
         _load_sso_handlers(hs)
+        self.hs = hs
         self._sso_handler = hs.get_sso_handler()
-        self._public_baseurl = hs.config.server.public_baseurl
+
+    def _get_public_baseurl(self) -> str:
+        """Resolve the tenant-aware public_baseurl for the current request.
+
+        This used to be captured at __init__ time, but under multi-tenant
+        mode that would return whichever tenant was bound at process
+        startup (i.e. none). Now resolved per-request from
+        get_current_tenant() with a fall-back to the global config.
+
+        SECURITY: getting this wrong lands the user on the wrong tenant's
+        SSO callback, which is an account-takeover vector. Always resolve
+        per-request.
+        """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.effective_public_baseurl
+        baseurl = self.hs.config.server.public_baseurl
+        if not baseurl:
+            raise SynapseError(400, "SSO requires a valid public_baseurl")
+        return baseurl
 
     async def on_GET(self, request: SynapseRequest, idp_id: str | None = None) -> None:
-        if not self._public_baseurl:
-            raise SynapseError(400, "SSO requires a valid public_baseurl")
+        public_baseurl = self._get_public_baseurl()
 
         # if this isn't the expected hostname, redirect to the right one, so that we
         # get our cookies back.
         requested_uri = get_request_uri(request)
-        baseurl_bytes = self._public_baseurl.encode("utf-8")
+        baseurl_bytes = public_baseurl.encode("utf-8")
         if not requested_uri.startswith(baseurl_bytes):
             # swap out the incorrect base URL for the right one.
             #

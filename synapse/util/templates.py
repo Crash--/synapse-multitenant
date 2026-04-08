@@ -70,7 +70,7 @@ def build_jinja_env(
     env.filters.update(
         {
             "format_ts": _format_ts_filter,
-            "mxc_to_http": _create_mxc_to_http_filter(config.server.public_baseurl),
+            "mxc_to_http": _create_mxc_to_http_filter(config),
             "localpart_from_email": _localpart_from_email_filter,
         }
     )
@@ -82,17 +82,36 @@ def build_jinja_env(
 
 
 def _create_mxc_to_http_filter(
-    public_baseurl: str | None,
+    config: "HomeServerConfig",
 ) -> Callable[[str, int, int, str], str]:
     """Create and return a jinja2 filter that converts MXC urls to HTTP
 
+    The filter closure resolves the public base URL per-invocation via
+    get_current_tenant() so that templates rendered in a tenant-scoped
+    request use the tenant's effective public_baseurl rather than
+    whichever tenant happened to be bound at environment-build time
+    (i.e. none).
+
     Args:
-        public_baseurl: The public, accessible base URL of the homeserver
+        config: The homeserver config. Used for its fallback
+            ``server.public_baseurl`` when no tenant is bound.
     """
+
+    global_baseurl = config.server.public_baseurl
 
     def mxc_to_http_filter(
         value: str, width: int, height: int, resize_method: str = "crop"
     ) -> str:
+        # Lazy import to avoid circular import at module load.
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        public_baseurl = (
+            tenant.effective_public_baseurl
+            if tenant is not None
+            else global_baseurl
+        )
+
         if not public_baseurl:
             raise RuntimeError(
                 "public_baseurl must be set in the homeserver config to convert MXC URLs to HTTP URLs."

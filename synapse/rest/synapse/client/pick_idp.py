@@ -21,6 +21,7 @@
 import logging
 from typing import TYPE_CHECKING
 
+from synapse.api.errors import SynapseError
 from synapse.api.urls import LoginSSORedirectURIBuilder
 from synapse.http.server import (
     DirectServeHtmlResource,
@@ -45,13 +46,35 @@ class PickIdpResource(DirectServeHtmlResource):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__(clock=hs.get_clock())
+        self.hs = hs
         self._sso_handler = hs.get_sso_handler()
         self._sso_login_idp_picker_template = (
             hs.config.sso.sso_login_idp_picker_template
         )
         self._server_name = hs.hostname
-        self._public_baseurl = hs.config.server.public_baseurl
         self._login_sso_redirect_url_builder = LoginSSORedirectURIBuilder(hs.config)
+
+    def _get_public_baseurl(self) -> str:
+        """Resolve the tenant-aware public_baseurl for the current request.
+
+        This used to be captured at __init__ time, but under multi-tenant
+        mode that would return whichever tenant was bound at process
+        startup (i.e. none). Now resolved per-request from
+        get_current_tenant() with a fall-back to the global config.
+
+        SECURITY: getting this wrong lands the user on the wrong tenant's
+        SSO callback, which is an account-takeover vector. Always resolve
+        per-request.
+        """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return tenant.effective_public_baseurl
+        baseurl = self.hs.config.server.public_baseurl
+        if not baseurl:
+            raise SynapseError(400, "SSO requires a valid public_baseurl")
+        return baseurl
 
     async def _async_render_GET(self, request: SynapseRequest) -> None:
         client_redirect_url = parse_string(
