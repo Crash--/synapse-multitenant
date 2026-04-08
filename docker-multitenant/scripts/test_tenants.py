@@ -915,6 +915,67 @@ def test_tenant(tenant):
     return passed, failed, user
 
 
+def test_create_room_per_tenant():
+    """`POST /createRoom` must succeed on every configured tenant.
+
+    This is the gate probe for sub-phase 2a (state_groups read-side cache
+    leak). With a freshly-bootstrapped rig, `createRoom` succeeds on the
+    primary tenant (`acme.localhost`) but returns 5xx on `corp.localhost`
+    and 403 on `startup.localhost` because in-process state caches keyed
+    on bare `state_group: int` collide across tenants — corp/startup hit
+    a cached state row written under acme's schema and the event-auth
+    check then refuses the new room.
+
+    Each tenant is tested independently: a failure on one does not
+    short-circuit the rest, so the output makes the cross-tenant pattern
+    obvious.
+
+    Asserts:
+      - status 200
+      - response contains a `room_id`
+      - the `room_id` is suffixed with the tenant's own server_name
+        (e.g. `!abc:corp.localhost`, NOT `!abc:acme.localhost`)
+    """
+    all_ok = True
+    for tenant in TENANTS:
+        user = test_register(tenant)
+        if not user:
+            print(f"    [FAIL] {tenant}: could not register user (prereq)")
+            all_ok = False
+            continue
+
+        headers = {"Authorization": f"Bearer {user['access_token']}"}
+        data = {"name": f"phase2a probe - {tenant}", "preset": "private_chat"}
+        result = make_request(
+            "POST",
+            "/_matrix/client/v3/createRoom",
+            tenant,
+            data=data,
+            headers=headers,
+        )
+
+        status = result.get("status")
+        if status != 200:
+            err = result.get("data", {}).get("error", "unknown")
+            print(f"    [FAIL] {tenant}: createRoom status {status}: {err}")
+            all_ok = False
+            continue
+
+        room_id = result["data"].get("room_id", "")
+        expected_suffix = f":{tenant}"
+        if not room_id.endswith(expected_suffix):
+            print(
+                f"    [FAIL] {tenant}: createRoom returned room_id {room_id!r}, "
+                f"expected suffix {expected_suffix!r} — cross-tenant leak"
+            )
+            all_ok = False
+            continue
+
+        print(f"    [PASS] {tenant}: createRoom -> {room_id}")
+
+    return all_ok
+
+
 def main():
     # Focused-phase dispatch: when called with `--phase <name>` we only
     # run a targeted subset. This exists so the host-side isolation probe
@@ -1040,6 +1101,27 @@ def main():
             total_passed += 1
         else:
             total_failed += 1
+
+    # Phase-2A probes — state_groups read-side cache leak. createRoom
+    # must succeed on every tenant; until the in-process state caches are
+    # tenant-keyed, corp/startup return 5xx/403 because event-auth reads
+    # cached state rows that were written under acme's schema.
+    print(f"\n{'='*60}")
+    print("  PHASE 2A PROBES (state_groups cache leak)")
+    print(f"{'='*60}")
+
+    try:
+        ok = test_create_room_per_tenant()
+    except Exception as e:
+        print(
+            f"    [FAIL] test_create_room_per_tenant raised "
+            f"{type(e).__name__}: {e}"
+        )
+        ok = False
+    if ok:
+        total_passed += 1
+    else:
+        total_failed += 1
 
     # Phase-1B isolation probes — schema-per-tenant actually holding.
     # Expected to FAIL on current main branch and PASS after the
