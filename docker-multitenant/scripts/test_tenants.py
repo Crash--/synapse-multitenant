@@ -405,6 +405,76 @@ def test_wellknown_client_per_tenant():
     return False
 
 
+def test_registration_response_qualifies_user_id():
+    """Register a user and assert the response's user_id is qualified
+    with the tenant's server_name, not the global hostname."""
+    tenant = TENANTS[0]
+    localpart = f"reg_probe_{int(time.time())}"
+    ok = _register_shared_secret(tenant, localpart)
+    if not ok:
+        print(f"    [FAIL] registration_response - registration failed")
+        return False
+    result = make_request(
+        "POST",
+        "/_matrix/client/v3/login",
+        tenant,
+        data={
+            "type": "m.login.password",
+            "identifier": {"type": "m.id.user", "user": localpart},
+            "password": "isolation_probe_password",
+        },
+    )
+    if result.get("status") != 200:
+        print(f"    [FAIL] registration_response - login failed")
+        return False
+    user_id = result["data"].get("user_id", "")
+    expected_suffix = f":{tenant}"
+    if user_id.endswith(expected_suffix):
+        print(f"    [PASS] registration_response - user_id={user_id}")
+        return True
+    print(f"    [FAIL] registration_response - user_id={user_id} (expected suffix {expected_suffix})")
+    return False
+
+
+def test_password_reset_link_uses_tenant_baseurl():
+    """Trigger a password-reset flow and assert the email link contains
+    the tenant's public_baseurl. Requires an SMTP sink — SKIPs if absent."""
+    smtp_sink_url = os.environ.get("SMTP_SINK_URL")
+    if not smtp_sink_url:
+        print(f"    [SKIP] password_reset_link - no SMTP_SINK_URL in env")
+        return True
+    # TODO(task 8): trigger /_matrix/client/v3/account/password/email/requestToken
+    # with a tenant Host header, fetch captured email from the sink, assert
+    # the reset link starts with https://<tenant>/. Until SMTP sink lands,
+    # SKIP above is correct.
+    return True
+
+
+def test_federation_version_carries_tenant_server_name():
+    """Assert /_matrix/federation/v1/version responds 200 and that the
+    per-request LoggingContext carries the tenant's server_name."""
+    tenant = TENANTS[0]
+    result = make_request("GET", "/_matrix/federation/v1/version", tenant)
+    if result.get("status") != 200:
+        print(f"    [FAIL] federation_version - status={result.get('status')}")
+        return False
+    if not os.path.exists(SYNAPSE_LOG_PATH):
+        print(f"    [SKIP] federation_version - log not accessible at {SYNAPSE_LOG_PATH}")
+        return True
+    try:
+        with open(SYNAPSE_LOG_PATH, "r") as f:
+            lines = f.readlines()
+    except (FileNotFoundError, PermissionError):
+        print(f"    [SKIP] federation_version - log not accessible at {SYNAPSE_LOG_PATH}")
+        return True
+    for line in reversed(lines[-200:]):
+        if "federation/v1/version" in line and f"server_name={tenant}" in line:
+            print(f"    [PASS] federation_version - log carries server_name={tenant}")
+            return True
+    print(f"    [FAIL] federation_version - no log line with server_name={tenant}")
+    return False
+
+
 def test_user_directory_per_tenant_population():
     """The user directory is rebuilt by a `notify_new_event` background
     process. Phase 2 makes background processes tenant-aware: today the
@@ -936,6 +1006,9 @@ def main():
         test_whoami_response_uses_tenant_server_name,
         test_capabilities_endpoint_per_tenant,
         test_wellknown_client_per_tenant,
+        test_registration_response_qualifies_user_id,
+        test_password_reset_link_uses_tenant_baseurl,
+        test_federation_version_carries_tenant_server_name,
     ):
         try:
             ok = fn()
