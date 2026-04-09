@@ -39,7 +39,6 @@ from synapse.api.errors import (
     UserDeactivatedError,
     UserLockedError,
 )
-from synapse.api.ratelimiting import Ratelimiter
 from synapse.api.urls import CLIENT_API_PREFIX
 from synapse.appservice import ApplicationService
 from synapse.handlers.sso import SsoIdentityProvider
@@ -55,6 +54,7 @@ from synapse.http.servlet import (
 from synapse.http.site import RequestInfo, SynapseRequest
 from synapse.rest.client._base import client_patterns
 from synapse.rest.well_known import WellKnownBuilder
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict, UserID
 
 if TYPE_CHECKING:
@@ -120,16 +120,7 @@ class LoginRestServlet(RestServlet):
         self._account_validity_handler = hs.get_account_validity_handler()
 
         self._well_known_builder = WellKnownBuilder(hs)
-        self._address_ratelimiter = Ratelimiter(
-            store=self._main_store,
-            clock=hs.get_clock(),
-            cfg=self.hs.config.ratelimiting.rc_login_address,
-        )
-        self._account_ratelimiter = Ratelimiter(
-            store=self._main_store,
-            clock=hs.get_clock(),
-            cfg=self.hs.config.ratelimiting.rc_login_account,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
         # ensure the CAS/SAML/OIDC handlers are loaded on this worker instance.
         # The reason for this is to ensure that the auth_provider_ids are registered
@@ -219,7 +210,7 @@ class LoginRestServlet(RestServlet):
                     )
 
                 if appservice.is_rate_limited():
-                    await self._address_ratelimiter.ratelimit(
+                    await self._tenant_rl_registry.get("rc_login_address", get_current_tenant()).ratelimit(
                         None, request.getClientAddress().host
                     )
 
@@ -233,7 +224,7 @@ class LoginRestServlet(RestServlet):
                 self.jwt_enabled
                 and login_submission["type"] == LoginRestServlet.JWT_TYPE
             ):
-                await self._address_ratelimiter.ratelimit(
+                await self._tenant_rl_registry.get("rc_login_address", get_current_tenant()).ratelimit(
                     None, request.getClientAddress().host
                 )
                 result = await self._do_jwt_login(
@@ -242,7 +233,7 @@ class LoginRestServlet(RestServlet):
                     request_info=request_info,
                 )
             elif login_submission["type"] == LoginRestServlet.TOKEN_TYPE:
-                await self._address_ratelimiter.ratelimit(
+                await self._tenant_rl_registry.get("rc_login_address", get_current_tenant()).ratelimit(
                     None, request.getClientAddress().host
                 )
                 result = await self._do_token_login(
@@ -251,7 +242,7 @@ class LoginRestServlet(RestServlet):
                     request_info=request_info,
                 )
             else:
-                await self._address_ratelimiter.ratelimit(
+                await self._tenant_rl_registry.get("rc_login_address", get_current_tenant()).ratelimit(
                     None, request.getClientAddress().host
                 )
                 result = await self._do_other_login(
@@ -416,7 +407,7 @@ class LoginRestServlet(RestServlet):
         # too often. This happens here rather than before as we don't
         # necessarily know the user before now.
         if ratelimit:
-            await self._account_ratelimiter.ratelimit(None, user_id.lower())
+            await self._tenant_rl_registry.get("rc_login_account", get_current_tenant()).ratelimit(None, user_id.lower())
 
         if create_non_existent_users:
             canonical_uid = await self.auth_handler.check_user_exists(user_id)
@@ -669,8 +660,6 @@ class SsoRedirectServlet(RestServlet):
         SSO callback, which is an account-takeover vector. Always resolve
         per-request.
         """
-        from synapse.tenant_context import get_current_tenant
-
         tenant = get_current_tenant()
         if tenant is not None:
             return tenant.effective_public_baseurl

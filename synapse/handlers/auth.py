@@ -54,7 +54,6 @@ from synapse.api.errors import (
     StoreError,
     SynapseError,
 )
-from synapse.api.ratelimiting import Ratelimiter
 from synapse.handlers.ui_auth import (
     INTERACTIVE_AUTH_CHECKERS,
     UIAuthSessionDataConstants,
@@ -77,6 +76,7 @@ from synapse.util.async_helpers import delay_cancellation, maybe_awaitable
 from synapse.util.duration import Duration
 from synapse.util.msisdn import phone_number_to_msisdn
 from synapse.util.stringutils import base62_encode
+from synapse.tenant_context import get_current_tenant
 from synapse.util.threepids import canonicalise_email
 
 if TYPE_CHECKING:
@@ -219,23 +219,10 @@ class AuthHandler:
         self._account_validity_handler = hs.get_account_validity_handler()
         self._pusher_pool = hs.get_pusherpool()
 
-        # Ratelimiter for failed auth during UIA. Uses same ratelimit config
-        # as per `rc_login.failed_attempts`.
-        self._failed_uia_attempts_ratelimiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=self.hs.config.ratelimiting.rc_login_failed_attempts,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
         # The number of seconds to keep a UI auth session active.
         self._ui_auth_session_timeout = hs.config.auth.ui_auth_session_timeout
-
-        # Ratelimiter for failed /login attempts
-        self._failed_login_attempts_ratelimiter = Ratelimiter(
-            store=self.store,
-            clock=hs.get_clock(),
-            cfg=self.hs.config.ratelimiting.rc_login_failed_attempts,
-        )
 
         self._clock = self.hs.get_clock()
 
@@ -353,7 +340,7 @@ class AuthHandler:
         requester_user_id = requester.user.to_string()
 
         # Check if we should be ratelimited due to too many previous failed attempts
-        await self._failed_uia_attempts_ratelimiter.ratelimit(requester, update=False)
+        await self._tenant_rl_registry.get("rc_login_failed_attempts", get_current_tenant()).ratelimit(requester, update=False)
 
         # build a list of supported flows
         supported_ui_auth_types = await self._get_available_ui_auth_types(
@@ -374,7 +361,7 @@ class AuthHandler:
             )
         except LoginError:
             # Update the ratelimiter to say we failed (`can_do_action` doesn't raise).
-            await self._failed_uia_attempts_ratelimiter.can_do_action(
+            await self._tenant_rl_registry.get("rc_login_failed_attempts", get_current_tenant()).can_do_action(
                 requester,
             )
             raise
@@ -1217,7 +1204,7 @@ class AuthHandler:
             # We also apply account rate limiting using the 3PID as a key, as
             # otherwise using 3PID bypasses the ratelimiting based on user ID.
             if ratelimit:
-                await self._failed_login_attempts_ratelimiter.ratelimit(
+                await self._tenant_rl_registry.get("rc_login_failed_attempts", get_current_tenant()).ratelimit(
                     None, (medium, address), update=False
                 )
 
@@ -1251,7 +1238,7 @@ class AuthHandler:
                 # this code path, which is fine as then the per-user ratelimit
                 # will kick in below.
                 if ratelimit:
-                    await self._failed_login_attempts_ratelimiter.can_do_action(
+                    await self._tenant_rl_registry.get("rc_login_failed_attempts", get_current_tenant()).can_do_action(
                         None, (medium, address)
                     )
                 raise LoginError(
@@ -1280,7 +1267,7 @@ class AuthHandler:
 
         # Check if we've hit the failed ratelimit (but don't update it)
         if ratelimit:
-            await self._failed_login_attempts_ratelimiter.ratelimit(
+            await self._tenant_rl_registry.get("rc_login_failed_attempts", get_current_tenant()).ratelimit(
                 None, qualified_user_id.lower(), update=False
             )
 
@@ -1292,7 +1279,7 @@ class AuthHandler:
             # exception and masking the LoginError. The actual ratelimiting
             # should have happened above.
             if ratelimit:
-                await self._failed_login_attempts_ratelimiter.can_do_action(
+                await self._tenant_rl_registry.get("rc_login_failed_attempts", get_current_tenant()).can_do_action(
                     None, qualified_user_id.lower()
                 )
             raise

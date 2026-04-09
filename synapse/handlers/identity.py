@@ -34,10 +34,10 @@ from synapse.api.errors import (
     HttpResponseException,
     SynapseError,
 )
-from synapse.api.ratelimiting import Ratelimiter
 from synapse.http import RequestTimedOutError
 from synapse.http.client import SimpleHttpClient
 from synapse.http.site import SynapseRequest
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict, Requester
 from synapse.util.hash import sha256_and_url_safe_base64
 from synapse.util.json import json_decoder
@@ -71,17 +71,7 @@ class IdentityHandler:
 
         self._web_client_location = hs.config.email.invite_client_location
 
-        # Ratelimiters for `/requestToken` endpoints.
-        self._3pid_validation_ratelimiter_ip = Ratelimiter(
-            store=self.store,
-            clock=hs.get_clock(),
-            cfg=hs.config.ratelimiting.rc_3pid_validation,
-        )
-        self._3pid_validation_ratelimiter_address = Ratelimiter(
-            store=self.store,
-            clock=hs.get_clock(),
-            cfg=hs.config.ratelimiting.rc_3pid_validation,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
     async def ratelimit_request_token_requests(
         self,
@@ -97,10 +87,10 @@ class IdentityHandler:
             address: The actual threepid ID, e.g. the phone number or email address
         """
 
-        await self._3pid_validation_ratelimiter_ip.ratelimit(
+        await self._tenant_rl_registry.get("rc_3pid_validation", get_current_tenant()).ratelimit(
             None, (medium, request.getClientAddress().host)
         )
-        await self._3pid_validation_ratelimiter_address.ratelimit(
+        await self._tenant_rl_registry.get("rc_3pid_validation", get_current_tenant()).ratelimit(
             None, (medium, address)
         )
 

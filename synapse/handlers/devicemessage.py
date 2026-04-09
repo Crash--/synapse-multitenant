@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any
 
 from synapse.api.constants import EduTypes, EventContentFields, ToDeviceEventTypes
 from synapse.api.errors import Codes, SynapseError
-from synapse.api.ratelimiting import Ratelimiter
 from synapse.logging.context import run_in_background
 from synapse.logging.opentracing import (
     SynapseTags,
@@ -33,6 +32,7 @@ from synapse.logging.opentracing import (
     log_kv,
     set_tag,
 )
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict, Requester, StreamKeyType, UserID, get_domain_from_id
 from synapse.util.json import json_encoder
 from synapse.util.stringutils import random_string
@@ -77,13 +77,7 @@ class DeviceMessageHandler:
                 hs.config.worker.writers.to_device,
             )
 
-        # a rate limiter for room key requests.  The keys are
-        # (sending_user_id, sending_device_id).
-        self._ratelimiter = Ratelimiter(
-            store=self.store,
-            clock=hs.get_clock(),
-            cfg=hs.config.ratelimiting.rc_key_requests,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
     async def on_direct_to_device_edu(self, origin: str, content: JsonDict) -> None:
         """
@@ -117,7 +111,7 @@ class DeviceMessageHandler:
 
             # Ratelimit key requests by the sending user.
             if message_type == ToDeviceEventTypes.RoomKeyRequest:
-                allowed, _ = await self._ratelimiter.can_do_action(
+                allowed, _ = await self._tenant_rl_registry.get("rc_key_requests", get_current_tenant()).can_do_action(
                     None, (sender_user_id, None)
                 )
                 if not allowed:
@@ -249,7 +243,7 @@ class DeviceMessageHandler:
                 message_type == ToDeviceEventTypes.RoomKeyRequest
                 and user_id != sender_user_id
             ):
-                allowed, _ = await self._ratelimiter.can_do_action(
+                allowed, _ = await self._tenant_rl_registry.get("rc_key_requests", get_current_tenant()).can_do_action(
                     requester, (sender_user_id, requester.device_id)
                 )
                 if not allowed:
