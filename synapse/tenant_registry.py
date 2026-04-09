@@ -252,7 +252,7 @@ class TenantRegistry:
         Raises:
             TenantNotFoundError: If the target server_name doesn't exist.
         """
-        if server_name not in self._tenants:
+        if server_name not in self._tenants or server_name in self._inactive_tenants:
             raise TenantNotFoundError(server_name)
         self._hostname_aliases[alias] = server_name
         logger.info("Added hostname alias: %s -> %s", alias, server_name)
@@ -307,7 +307,7 @@ class TenantRegistry:
         This is useful during startup to ensure all keys are valid
         and loaded into memory.
         """
-        for server_name in self._tenants:
+        for server_name in self.get_all_server_names():
             try:
                 self.load_signing_key(server_name)
             except Exception as e:
