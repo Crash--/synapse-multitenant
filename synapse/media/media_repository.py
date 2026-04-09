@@ -60,6 +60,7 @@ from synapse.media._base import (
     respond_with_responder,
 )
 from synapse.media.filepath import MediaFilePaths
+from synapse.media.multitenant_filepath import create_media_file_paths
 from synapse.media.media_storage import (
     MediaStorage,
     SHA256TransparentIOReader,
@@ -107,7 +108,13 @@ class MediaRepository:
         Thumbnailer.set_limits(self.max_image_pixels)
 
         self.primary_base_path: str = hs.config.media.media_store_path
-        self.filepaths: MediaFilePaths = MediaFilePaths(self.primary_base_path)
+        self.filepaths: MediaFilePaths = create_media_file_paths(
+            self.primary_base_path,
+            multi_tenant_enabled=bool(
+                getattr(hs.config, "tenants", None)
+                and hs.config.tenants.multi_tenant.enabled
+            ),
+        )
 
         self.dynamic_thumbnails = hs.config.media.dynamic_thumbnails
         self.thumbnail_requirements = hs.config.media.thumbnail_requirements

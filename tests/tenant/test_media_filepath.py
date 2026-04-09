@@ -284,3 +284,16 @@ class TestTenantMediaPathDirectory(TestCase):
 
         tenant_base = os.path.join(self.base_path, "acme.com")
         self.assertTrue(all(d.startswith(tenant_base) for d in dirs))
+
+
+class TestCreateMediaFilePathsFactory(TestCase):
+    """Tests for the create_media_file_paths factory."""
+
+    def test_returns_multitenant_when_enabled(self) -> None:
+        result = create_media_file_paths("/var/media", multi_tenant_enabled=True)
+        self.assertIsInstance(result, MultiTenantMediaFilePaths)
+
+    def test_returns_plain_when_disabled(self) -> None:
+        result = create_media_file_paths("/var/media", multi_tenant_enabled=False)
+        self.assertIsInstance(result, MediaFilePaths)
+        self.assertNotIsInstance(result, MultiTenantMediaFilePaths)
