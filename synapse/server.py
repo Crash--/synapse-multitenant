@@ -720,6 +720,40 @@ class HomeServer(metaclass=abc.ABCMeta):
 
         return create_tenant_registry(self)
 
+    @cache_in_self
+    def get_tenant_ratelimiter_registry(
+        self,
+    ) -> "TenantRatelimiterRegistry":
+        from synapse.api.tenant_ratelimiting import TenantRatelimiterRegistry
+
+        rl = self.config.ratelimiting
+        global_settings: dict[str, "RatelimitSettings"] = {
+            "rc_message": rl.rc_message,
+            "rc_registration": rl.rc_registration,
+            "rc_registration_token_validity": rl.rc_registration_token_validity,
+            "rc_login_address": rl.rc_login_address,
+            "rc_login_account": rl.rc_login_account,
+            "rc_login_failed_attempts": rl.rc_login_failed_attempts,
+            "rc_joins_local": rl.rc_joins_local,
+            "rc_joins_remote": rl.rc_joins_remote,
+            "rc_joins_per_room": rl.rc_joins_per_room,
+            "rc_invites_per_room": rl.rc_invites_per_room,
+            "rc_invites_per_user": rl.rc_invites_per_user,
+            "rc_invites_per_issuer": rl.rc_invites_per_issuer,
+            "rc_third_party_invite": rl.rc_third_party_invite,
+            "rc_3pid_validation": rl.rc_3pid_validation,
+            "rc_media_create": rl.rc_media_create,
+            "rc_presence_per_user": rl.rc_presence_per_user,
+            "rc_user_directory": rl.rc_user_directory,
+            "rc_key_requests": rl.rc_key_requests,
+            "remote_media_downloads": rl.remote_media_downloads,
+        }
+        return TenantRatelimiterRegistry(
+            store=self.get_datastores().main,
+            clock=self.get_clock(),
+            global_settings=global_settings,
+        )
+
     def effective_server_name(self) -> str:
         """Return the server_name that should be used for the *current request*.
 
