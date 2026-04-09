@@ -390,6 +390,112 @@ def cmd_init_schema(args) -> int:
         return 1
 
 
+def cmd_backup(args) -> int:
+    """Back up a tenant's database schema and media tree to a .tar.gz archive."""
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import tempfile
+    from datetime import datetime, timezone
+
+    # Check pg_dump is available
+    if shutil.which("pg_dump") is None:
+        logger.error("pg_dump not found in PATH. Install postgresql-client.")
+        return 1
+
+    try:
+        config = load_config(args.config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return 1
+
+    tenants = get_tenants_from_config(config)
+    tenant = None
+    for t in tenants:
+        if t.get("server_name") == args.server_name:
+            tenant = t
+            break
+
+    if tenant is None:
+        logger.error(f"Tenant '{args.server_name}' not found in configuration")
+        return 1
+
+    server_name = tenant["server_name"]
+    database_schema = tenant.get("database_schema", f"tenant_{server_name.replace('.', '_')}")
+    media_store_path = tenant.get("media_store_path", "")
+    output_path = args.output
+
+    # Build pg_dump connection args from config
+    db_config = config.get("database", {}).get("args", {})
+    pg_env = os.environ.copy()
+    pg_args = ["pg_dump", "--schema=" + database_schema, "--no-owner", "--no-acl"]
+    if db_config.get("host"):
+        pg_args.extend(["--host", db_config["host"]])
+    if db_config.get("port"):
+        pg_args.extend(["--port", str(db_config["port"])])
+    if db_config.get("user"):
+        pg_args.extend(["--username", db_config["user"]])
+    if db_config.get("password"):
+        pg_env["PGPASSWORD"] = db_config["password"]
+    pg_args.append(db_config.get("database", "synapse"))
+
+    tmpdir = tempfile.mkdtemp(prefix="synapse_backup_")
+    try:
+        # 1. Dump schema
+        schema_path = os.path.join(tmpdir, "schema.sql")
+        print(f"Dumping database schema '{database_schema}'...")
+        result = subprocess.run(
+            pg_args, capture_output=True, text=True, env=pg_env
+        )
+        if result.returncode != 0:
+            logger.error(f"pg_dump failed: {result.stderr}")
+            return 1
+        with open(schema_path, "w") as f:
+            f.write(result.stdout)
+        print(f"  Schema dumped: {os.path.getsize(schema_path)} bytes")
+
+        # 2. Copy media tree
+        media_src = os.path.join(media_store_path, server_name)
+        media_dst = os.path.join(tmpdir, "media")
+        media_count = 0
+        if os.path.isdir(media_src):
+            print(f"Copying media tree from {media_src}...")
+            shutil.copytree(media_src, media_dst)
+            for _root, _dirs, files in os.walk(media_dst):
+                media_count += len(files)
+            print(f"  Media files: {media_count}")
+        else:
+            os.makedirs(media_dst)
+            print(f"  No media directory found at {media_src}, creating empty media/")
+
+        # 3. Write manifest
+        manifest = {
+            "server_name": server_name,
+            "database_schema": database_schema,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "media_files_count": media_count,
+        }
+        manifest_path = os.path.join(tmpdir, "manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        # 4. Create archive
+        print(f"Creating archive: {output_path}")
+        with tarfile.open(output_path, "w:gz") as tar:
+            tar.add(manifest_path, arcname="manifest.json")
+            tar.add(schema_path, arcname="schema.sql")
+            tar.add(media_dst, arcname="media")
+
+        print(f"\nBackup complete: {output_path}")
+        print(f"  Schema: {database_schema}")
+        print(f"  Media files: {media_count}")
+        return 0
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Synapse Multi-Tenant CLI Tool",
@@ -519,6 +625,20 @@ Examples:
         help="Schema to use as template (default: public)",
     )
 
+    # Backup command
+    backup_parser = subparsers.add_parser(
+        "backup", help="Back up a tenant's database and media to a .tar.gz archive"
+    )
+    backup_parser.add_argument(
+        "-c", "--config-path", required=True, help="Path to homeserver.yaml"
+    )
+    backup_parser.add_argument(
+        "--server-name", required=True, help="Server name of the tenant to back up"
+    )
+    backup_parser.add_argument(
+        "--output", "-o", required=True, help="Output path for the backup archive"
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -531,6 +651,7 @@ Examples:
         "validate": cmd_validate,
         "generate-key": cmd_generate_key,
         "init-schema": cmd_init_schema,
+        "backup": cmd_backup,
     }
 
     return commands[args.command](args)
