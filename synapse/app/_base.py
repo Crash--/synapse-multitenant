@@ -694,6 +694,37 @@ async def start(hs: "HomeServer", *, freeze: bool = True) -> None:
     register_sighup(hs, refresh_certificate, hs)
     register_sighup(hs, reload_cache_config, hs.config)
 
+    def _reload_tenants(hs: "HomeServer") -> None:
+        """SIGHUP callback: re-read tenant config and reload all registries."""
+        registry = hs.get_tenant_registry()
+        if not registry.enabled:
+            return
+        try:
+            hs.config.reload_config_section("tenants")
+            new_mt_config = hs.config.tenants.multi_tenant
+
+            result = registry.reload(new_mt_config)
+
+            keyring = hs.get_multi_tenant_keyring()
+            if keyring:
+                keyring.reload(registry)
+
+            hs.get_tenant_app_service_registry().reload(registry)
+            hs.get_tenant_ratelimiter_registry().reload(registry)
+
+            logger.info(
+                "SIGHUP tenant reload: added=%s removed=%s unchanged=%d",
+                result["added"],
+                result["removed"],
+                len(result["unchanged"]),
+            )
+        except Exception:
+            logger.exception(
+                "SIGHUP tenant reload failed — running config is unchanged"
+            )
+
+    register_sighup(hs, _reload_tenants, hs)
+
     # Apply the cache config.
     hs.config.caches.resize_all_caches()
 
