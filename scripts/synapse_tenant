@@ -652,6 +652,91 @@ def cmd_restore(args) -> int:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def cmd_drop(args) -> int:
+    """Destructively remove a tenant's database schema and media tree."""
+    import shutil
+
+    if not args.confirm_destructive:
+        logger.error(
+            "This command permanently deletes data. "
+            "Pass --confirm-destructive to proceed."
+        )
+        return 1
+
+    try:
+        config = load_config(args.config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return 1
+
+    tenants = get_tenants_from_config(config)
+    tenant = None
+    for t in tenants:
+        if t.get("server_name") == args.server_name:
+            tenant = t
+            break
+
+    if tenant is None:
+        logger.error(f"Tenant '{args.server_name}' not found in configuration")
+        return 1
+
+    server_name = tenant["server_name"]
+    database_schema = tenant.get("database_schema", f"tenant_{server_name.replace('.', '_')}")
+    media_store_path = tenant.get("media_store_path", "")
+
+    print(f"Dropping tenant: {server_name}")
+    print(f"  Schema: {database_schema}")
+    print(f"  Media: {os.path.join(media_store_path, server_name)}")
+    print()
+
+    # Drop database schema
+    if psycopg2 is None:
+        logger.error("psycopg2 required for schema drop")
+        return 1
+
+    db_config = config.get("database", {}).get("args", {})
+    try:
+        conn = psycopg2.connect(
+            host=db_config.get("host"),
+            port=db_config.get("port"),
+            user=db_config.get("user"),
+            password=db_config.get("password"),
+            dbname=db_config.get("database", "synapse"),
+        )
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (database_schema,),
+        )
+        if cur.fetchone():
+            print(f"Dropping schema '{database_schema}'...")
+            cur.execute(f"DROP SCHEMA {database_schema} CASCADE")
+            print(f"  Schema dropped.")
+        else:
+            print(f"  Schema '{database_schema}' does not exist, skipping.")
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to drop schema: {e}")
+        return 1
+
+    # Delete media tree
+    media_dir = os.path.join(media_store_path, server_name)
+    if os.path.isdir(media_dir):
+        print(f"Deleting media directory: {media_dir}")
+        shutil.rmtree(media_dir)
+        print(f"  Media directory deleted.")
+    else:
+        print(f"  Media directory '{media_dir}' does not exist, skipping.")
+
+    print(f"\nTenant '{server_name}' dropped.")
+    print("Remember to remove the tenant from homeserver.yaml and send SIGHUP.")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Synapse Multi-Tenant CLI Tool",
@@ -814,6 +899,22 @@ Examples:
         help="Drop existing schema before restoring",
     )
 
+    # Drop command
+    drop_parser = subparsers.add_parser(
+        "drop", help="Destructively remove a tenant's schema and media"
+    )
+    drop_parser.add_argument(
+        "-c", "--config-path", required=True, help="Path to homeserver.yaml"
+    )
+    drop_parser.add_argument(
+        "--server-name", required=True, help="Server name of the tenant to drop"
+    )
+    drop_parser.add_argument(
+        "--confirm-destructive",
+        action="store_true",
+        help="Required flag to confirm destructive operation",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -828,6 +929,7 @@ Examples:
         "init-schema": cmd_init_schema,
         "backup": cmd_backup,
         "restore": cmd_restore,
+        "drop": cmd_drop,
     }
 
     return commands[args.command](args)
