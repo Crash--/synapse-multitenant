@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 from synapse.api.ratelimiting import Ratelimiter
 from synapse.config.ratelimiting import RatelimitSettings
@@ -39,9 +39,23 @@ class TenantRatelimiterRegistry:
         self._cache: dict[tuple[str, str], Ratelimiter] = {}
 
     def get(
-        self, limiter_key: str, tenant: "TenantConfig | None" = None
+        self,
+        limiter_key: str,
+        tenant: "TenantConfig | None" = None,
+        ratelimit_callbacks: Optional[Callable] = None,
     ) -> Ratelimiter:
-        """Return the Ratelimiter for the given limiter key and tenant."""
+        """Return the Ratelimiter for the given limiter key and tenant.
+
+        Args:
+            limiter_key: The config key identifying which limiter to use (e.g.
+                ``"rc_joins_local"``).
+            tenant: The tenant context for this request. If *None* (or the tenant
+                has no per-tenant ratelimit overrides) the global settings are used.
+            ratelimit_callbacks: Optional module-API ratelimit callback.  When
+                provided the returned ``Ratelimiter`` is **not** cached because the
+                callback reference is bound to a specific handler instance and may
+                differ across call sites.
+        """
         tenant_setting = None
         if tenant is not None and tenant.ratelimit is not None:
             tenant_setting = getattr(tenant.ratelimit, limiter_key, None)
@@ -56,6 +70,16 @@ class TenantRatelimiterRegistry:
                 raise KeyError(
                     f"No global RatelimitSettings for limiter key {limiter_key!r}"
                 )
+
+        # When callbacks are provided we skip the cache to avoid sharing a
+        # Ratelimiter that has a different callback reference.
+        if ratelimit_callbacks is not None:
+            return Ratelimiter(
+                store=self._store,
+                clock=self._clock,
+                cfg=settings,
+                ratelimit_callbacks=ratelimit_callbacks,
+            )
 
         if cache_key not in self._cache:
             self._cache[cache_key] = Ratelimiter(

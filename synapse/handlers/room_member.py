@@ -40,7 +40,6 @@ from synapse.api.errors import (
     ShadowBanError,
     SynapseError,
 )
-from synapse.api.ratelimiting import Ratelimiter
 from synapse.event_auth import get_named_level, get_power_level_event
 from synapse.events import EventBase, is_creator
 from synapse.events.snapshot import EventContext
@@ -66,7 +65,7 @@ from synapse.types import (
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import Linearizer
 from synapse.util.distributor import user_left_room
-from synapse.tenant_context import get_effective_server_notices_mxid
+from synapse.tenant_context import get_current_tenant, get_effective_server_notices_mxid
 from synapse.util.duration import Duration
 
 if TYPE_CHECKING:
@@ -131,65 +130,12 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         self._enable_lookup = hs.config.registration.enable_3pid_lookup
         self.allow_per_room_profiles = self.config.server.allow_per_room_profiles
 
-        self._join_rate_limiter_local = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_joins_local,
-        )
-        # Tracks joins from local users to rooms this server isn't a member of.
-        # I.e. joins this server makes by requesting /make_join /send_join from
-        # another server.
-        self._join_rate_limiter_remote = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_joins_remote,
-        )
-        # TODO: find a better place to keep this Ratelimiter.
-        #   It needs to be
-        #    - written to by event persistence code
-        #    - written to by something which can snoop on replication streams
-        #    - read by the RoomMemberHandler to rate limit joins from local users
-        #    - read by the FederationServer to rate limit make_joins and send_joins from
-        #      other homeservers
-        #   I wonder if a homeserver-wide collection of rate limiters might be cleaner?
-        self._join_rate_per_room_limiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_joins_per_room,
-        )
-
-        # Ratelimiter for invites, keyed by room (across all issuers, all
-        # recipients).
-        self._invites_per_room_limiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_invites_per_room,
-            ratelimit_callbacks=hs.get_module_api_callbacks().ratelimit,
-        )
-
-        # Ratelimiter for invites, keyed by recipient (across all rooms, all
-        # issuers).
-        self._invites_per_recipient_limiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_invites_per_user,
-            ratelimit_callbacks=hs.get_module_api_callbacks().ratelimit,
-        )
-
-        # Ratelimiter for invites, keyed by issuer (across all rooms, all
-        # recipients).
-        self._invites_per_issuer_limiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_invites_per_issuer,
-            ratelimit_callbacks=hs.get_module_api_callbacks().ratelimit,
-        )
-
-        self._third_party_invite_limiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_third_party_invite,
-        )
+        # Per-tenant rate limiter registry: resolves the correct Ratelimiter at
+        # request time based on the active tenant context.
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
+        # Module-API ratelimit callbacks, stored separately so they can be
+        # forwarded to invite limiters that support per-module overrides.
+        self._ratelimit_callbacks = hs.get_module_api_callbacks().ratelimit
 
         self.request_ratelimiter = hs.get_request_ratelimiter()
         hs.get_notifier().add_new_join_in_room_callback(self._on_user_joined_room)
@@ -213,7 +159,9 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         Joins actioned by this worker should use the usual `ratelimit` method, which
         checks the limit and increments the counter in one go.
         """
-        self._join_rate_per_room_limiter.record_action(requester=None, key=room_id)
+        self._tenant_rl_registry.get(
+            "rc_joins_per_room", get_current_tenant()
+        ).record_action(requester=None, key=room_id)
 
     @abc.abstractmethod
     async def _remote_join(
@@ -367,7 +315,11 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         Raises:
             LimitExceededError: The requester can't send that many invites in the room.
         """
-        await self._invites_per_room_limiter.ratelimit(
+        await self._tenant_rl_registry.get(
+            "rc_invites_per_room",
+            get_current_tenant(),
+            ratelimit_callbacks=self._ratelimit_callbacks,
+        ).ratelimit(
             requester,
             room_id,
             update=update,
@@ -385,11 +337,23 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         If room ID is missing then we just rate limit by target user.
         """
         if room_id:
-            await self._invites_per_room_limiter.ratelimit(requester, room_id)
+            await self._tenant_rl_registry.get(
+                "rc_invites_per_room",
+                get_current_tenant(),
+                ratelimit_callbacks=self._ratelimit_callbacks,
+            ).ratelimit(requester, room_id)
 
-        await self._invites_per_recipient_limiter.ratelimit(requester, invitee_user_id)
+        await self._tenant_rl_registry.get(
+            "rc_invites_per_user",
+            get_current_tenant(),
+            ratelimit_callbacks=self._ratelimit_callbacks,
+        ).ratelimit(requester, invitee_user_id)
         if requester is not None:
-            await self._invites_per_issuer_limiter.ratelimit(requester)
+            await self._tenant_rl_registry.get(
+                "rc_invites_per_issuer",
+                get_current_tenant(),
+                ratelimit_callbacks=self._ratelimit_callbacks,
+            ).ratelimit(requester)
 
     async def _local_membership_update(
         self,
@@ -635,10 +599,12 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
                     room_id,
                 )
                 if current_membership != Membership.JOIN:
-                    await self._join_rate_limiter_local.ratelimit(requester)
-                    await self._join_rate_per_room_limiter.ratelimit(
-                        requester, key=room_id, update=False
-                    )
+                    await self._tenant_rl_registry.get(
+                        "rc_joins_local", get_current_tenant()
+                    ).ratelimit(requester)
+                    await self._tenant_rl_registry.get(
+                        "rc_joins_per_room", get_current_tenant()
+                    ).ratelimit(requester, key=room_id, update=False)
             elif action == Membership.INVITE:
                 await self.ratelimit_invite(requester, room_id, target.to_string())
 
@@ -1071,10 +1037,14 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             )
             if remote_join:
                 if ratelimit:
-                    await self._join_rate_limiter_remote.ratelimit(
+                    await self._tenant_rl_registry.get(
+                        "rc_joins_remote", get_current_tenant()
+                    ).ratelimit(
                         requester,
                     )
-                    await self._join_rate_per_room_limiter.ratelimit(
+                    await self._tenant_rl_registry.get(
+                        "rc_joins_per_room", get_current_tenant()
+                    ).ratelimit(
                         requester,
                         key=room_id,
                         update=False,
@@ -1657,7 +1627,9 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
 
         # We need to rate limit *before* we send out any 3PID invites, so we
         # can't just rely on the standard ratelimiting of events.
-        await self._third_party_invite_limiter.ratelimit(requester)
+        await self._tenant_rl_registry.get(
+            "rc_third_party_invite", get_current_tenant()
+        ).ratelimit(requester)
 
         can_invite = await self._third_party_event_rules.check_threepid_can_be_invited(
             medium, address, room_id
