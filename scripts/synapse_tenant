@@ -496,6 +496,162 @@ def cmd_backup(args) -> int:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def cmd_restore(args) -> int:
+    """Restore a tenant from a .tar.gz backup archive."""
+    import json
+    import shutil
+    import subprocess
+    import tarfile
+    import tempfile
+
+    # Check psql is available
+    if shutil.which("psql") is None:
+        logger.error("psql not found in PATH. Install postgresql-client.")
+        return 1
+
+    archive_path = args.archive
+    if not os.path.isfile(archive_path):
+        logger.error(f"Archive not found: {archive_path}")
+        return 1
+
+    try:
+        config = load_config(args.config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        return 1
+
+    tenants = get_tenants_from_config(config)
+    tenant = None
+    for t in tenants:
+        if t.get("server_name") == args.server_name:
+            tenant = t
+            break
+
+    if tenant is None:
+        logger.error(
+            f"Tenant '{args.server_name}' not found in configuration. "
+            "Add it to homeserver.yaml first."
+        )
+        return 1
+
+    server_name = tenant["server_name"]
+    database_schema = tenant.get("database_schema", f"tenant_{server_name.replace('.', '_')}")
+    media_store_path = tenant.get("media_store_path", "")
+
+    tmpdir = tempfile.mkdtemp(prefix="synapse_restore_")
+    try:
+        # Extract archive
+        print(f"Extracting archive: {archive_path}")
+        with tarfile.open(archive_path, "r:gz") as tar:
+            tar.extractall(path=tmpdir)
+
+        # Validate manifest
+        manifest_path = os.path.join(tmpdir, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            logger.error("Archive missing manifest.json")
+            return 1
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        if manifest.get("server_name") != server_name:
+            logger.error(
+                f"Manifest server_name '{manifest.get('server_name')}' "
+                f"does not match --server-name '{server_name}'"
+            )
+            return 1
+
+        schema_path = os.path.join(tmpdir, "schema.sql")
+        if not os.path.isfile(schema_path):
+            logger.error("Archive missing schema.sql")
+            return 1
+
+        # Build psql connection args
+        db_config = config.get("database", {}).get("args", {})
+        pg_env = os.environ.copy()
+        pg_args = ["psql", "--set", "ON_ERROR_STOP=1"]
+        if db_config.get("host"):
+            pg_args.extend(["--host", db_config["host"]])
+        if db_config.get("port"):
+            pg_args.extend(["--port", str(db_config["port"])])
+        if db_config.get("user"):
+            pg_args.extend(["--username", db_config["user"]])
+        if db_config.get("password"):
+            pg_env["PGPASSWORD"] = db_config["password"]
+        db_name = db_config.get("database", "synapse")
+        pg_args.extend(["--dbname", db_name])
+
+        if psycopg2 is None:
+            logger.error("psycopg2 required for schema existence check")
+            return 1
+
+        # Check if schema exists
+        conn = psycopg2.connect(
+            host=db_config.get("host"),
+            port=db_config.get("port"),
+            user=db_config.get("user"),
+            password=db_config.get("password"),
+            dbname=db_name,
+        )
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+            (database_schema,),
+        )
+        schema_exists = cur.fetchone() is not None
+
+        if schema_exists and not args.overwrite:
+            logger.error(
+                f"Schema '{database_schema}' already exists. "
+                "Use --overwrite to drop and recreate."
+            )
+            cur.close()
+            conn.close()
+            return 1
+
+        if schema_exists and args.overwrite:
+            print(f"Dropping existing schema '{database_schema}'...")
+            cur.execute(f"DROP SCHEMA {database_schema} CASCADE")
+
+        # Create schema
+        print(f"Creating schema '{database_schema}'...")
+        cur.execute(f"CREATE SCHEMA {database_schema}")
+        cur.close()
+        conn.close()
+
+        # Restore schema
+        print("Restoring database schema...")
+        with open(schema_path, "r") as f:
+            result = subprocess.run(
+                pg_args, stdin=f, capture_output=True, text=True, env=pg_env
+            )
+        if result.returncode != 0:
+            logger.error(f"psql restore failed: {result.stderr}")
+            return 1
+
+        # Restore media
+        media_src = os.path.join(tmpdir, "media")
+        media_dst = os.path.join(media_store_path, server_name)
+        if os.path.isdir(media_src) and os.listdir(media_src):
+            print(f"Restoring media tree to {media_dst}...")
+            if os.path.exists(media_dst):
+                shutil.rmtree(media_dst)
+            shutil.copytree(media_src, media_dst)
+            media_count = sum(
+                len(files) for _, _, files in os.walk(media_dst)
+            )
+            print(f"  Media files restored: {media_count}")
+        else:
+            print("  No media files in archive")
+
+        print(f"\nRestore complete for tenant '{server_name}'")
+        return 0
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Synapse Multi-Tenant CLI Tool",
@@ -639,6 +795,25 @@ Examples:
         "--output", "-o", required=True, help="Output path for the backup archive"
     )
 
+    # Restore command
+    restore_parser = subparsers.add_parser(
+        "restore", help="Restore a tenant from a .tar.gz backup archive"
+    )
+    restore_parser.add_argument(
+        "-c", "--config-path", required=True, help="Path to homeserver.yaml"
+    )
+    restore_parser.add_argument(
+        "--server-name", required=True, help="Server name of the tenant to restore"
+    )
+    restore_parser.add_argument(
+        "--from", dest="archive", required=True, help="Path to the backup archive"
+    )
+    restore_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Drop existing schema before restoring",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -652,6 +827,7 @@ Examples:
         "generate-key": cmd_generate_key,
         "init-schema": cmd_init_schema,
         "backup": cmd_backup,
+        "restore": cmd_restore,
     }
 
     return commands[args.command](args)
