@@ -122,24 +122,63 @@ class OidcHandler:
     """Handles requests related to the OpenID Connect login flow."""
 
     def __init__(self, hs: "HomeServer"):
+        self._hs = hs
         self._sso_handler = hs.get_sso_handler()
-
-        provider_confs = hs.config.oidc.oidc_providers
-        # we should not have been instantiated if there is no configured provider.
-        assert provider_confs
-
         self._macaroon_generator = hs.get_macaroon_generator()
-        self._providers: dict[str, "OidcProvider"] = {
+
+        # Global providers (used by tenants without OIDC override)
+        global_confs = hs.config.oidc.oidc_providers
+        # we should not have been instantiated if there is no configured provider.
+        assert global_confs
+
+        self._global_providers: dict[str, "OidcProvider"] = {
             p.idp_id: OidcProvider(hs, self._macaroon_generator, p)
-            for p in provider_confs
+            for p in global_confs
         }
+
+        # Per-tenant providers: dict[server_name, dict[idp_id, OidcProvider]]
+        self._tenant_providers: dict[str, dict[str, "OidcProvider"]] = {}
+        self._build_tenant_providers(hs)
+
+    def _build_tenant_providers(self, hs: "HomeServer") -> None:
+        """Build OidcProvider sets for tenants with OIDC overrides."""
+        from synapse.config.oidc import _parse_oidc_provider_configs
+
+        mt_config = getattr(hs.config, "multi_tenant", None)
+        if not mt_config or not mt_config.enabled:
+            return
+
+        for tenant in mt_config.tenants.values():
+            if tenant.oidc is None:
+                continue
+            synthetic = {"oidc_providers": list(tenant.oidc.providers)}
+            parsed = tuple(_parse_oidc_provider_configs(synthetic))
+            self._tenant_providers[tenant.server_name] = {
+                p.idp_id: OidcProvider(
+                    hs,
+                    self._macaroon_generator,
+                    p,
+                    tenant_server_name=tenant.server_name,
+                    tenant_public_baseurl=tenant.effective_public_baseurl,
+                )
+                for p in parsed
+            }
+
+    def _get_providers(self) -> dict[str, "OidcProvider"]:
+        """Return OIDC providers for the current tenant context."""
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant and tenant.server_name in self._tenant_providers:
+            return self._tenant_providers[tenant.server_name]
+        return self._global_providers
 
     async def load_metadata(self) -> None:
         """Validate the config and load the metadata from the remote endpoint.
 
         Called at startup to ensure we have everything we need.
         """
-        for idp_id, p in self._providers.items():
+        for idp_id, p in self._global_providers.items():
             try:
                 await p.load_metadata()
                 if not p._uses_userinfo:
@@ -148,6 +187,18 @@ class OidcHandler:
                 raise Exception(
                     "Error while initialising OIDC provider %r" % (idp_id,)
                 ) from e
+
+        for server_name, providers in self._tenant_providers.items():
+            for idp_id, p in providers.items():
+                try:
+                    await p.load_metadata()
+                    if not p._uses_userinfo:
+                        await p.load_jwks()
+                except Exception as e:
+                    raise Exception(
+                        "Error initialising OIDC provider %r for tenant %s"
+                        % (idp_id, server_name)
+                    ) from e
 
     async def handle_oidc_callback(self, request: SynapseRequest) -> None:
         """Handle an incoming request to /_synapse/client/oidc/callback
@@ -254,7 +305,7 @@ class OidcHandler:
 
         logger.info("Received OIDC callback for IdP %s", session_data.idp_id)
 
-        oidc_provider = self._providers.get(session_data.idp_id)
+        oidc_provider = self._get_providers().get(session_data.idp_id)
         if not oidc_provider:
             logger.error("OIDC session uses unknown IdP %r", oidc_provider)
             self._sso_handler.render_error(request, "unknown_idp", "Unknown IdP")
@@ -334,7 +385,7 @@ class OidcHandler:
         # Now that we know the audience and the issuer, we can figure out from
         # what provider it is coming from
         oidc_provider: OidcProvider | None = None
-        for provider in self._providers.values():
+        for provider in self._get_providers().values():
             if provider.issuer == issuer and provider.client_id in audience:
                 oidc_provider = provider
                 break
@@ -371,6 +422,8 @@ class OidcProvider:
         hs: "HomeServer",
         macaroon_generator: MacaroonGenerator,
         provider: OidcProviderConfig,
+        tenant_server_name: str | None = None,
+        tenant_public_baseurl: str | None = None,
     ):
         self._store = hs.get_datastores().main
         self._clock = hs.get_clock()
@@ -383,11 +436,14 @@ class OidcProvider:
         if provider.redirect_uri is not None:
             self._callback_url = provider.redirect_uri
         else:
-            self._callback_url = hs.config.oidc.oidc_callback_url
+            base = tenant_public_baseurl or hs.config.server.public_baseurl
+            self._callback_url = base + "_synapse/client/oidc/callback"
 
         # Calculate the prefix for OIDC callback paths based on the public_baseurl.
         # We'll insert this into the Path= parameter of any session cookies we set.
-        public_baseurl_path = urlparse(hs.config.server.public_baseurl).path
+        public_baseurl_path = urlparse(
+            tenant_public_baseurl or hs.config.server.public_baseurl
+        ).path
         self._callback_path_prefix = (
             public_baseurl_path.encode("utf-8") + b"_synapse/client/oidc"
         )
@@ -442,7 +498,7 @@ class OidcProvider:
         self._allow_existing_users = provider.allow_existing_users
 
         self._http_client = hs.get_proxied_http_client()
-        self._server_name: str = hs.config.server.server_name
+        self._server_name: str = tenant_server_name or hs.config.server.server_name
 
         # identifier for the external_ids table
         self.idp_id = provider.idp_id
