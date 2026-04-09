@@ -608,6 +608,53 @@ def test_stats_loop_per_tenant():
     return False
 
 
+def test_presence_loop_per_tenant():
+    """The presence timeout loop (`_handle_timeouts`) is a LoopingCall in
+    `synapse/handlers/presence.py`. Under multi-tenant it must fire once
+    per tenant so that (a) the Prometheus metric carries per-tenant
+    `server_name` labels and (b) the DB writes (persist, timeout-based
+    state transitions) go through the correct tenant schema.
+
+    The docker rig enables presence tracking, so after a few seconds the
+    `handle_presence_timeouts` background process start counter should
+    appear for each configured tenant.
+    """
+    time.sleep(10)
+
+    body = fetch_text("/_synapse/metrics")
+    if body.startswith("__error__"):
+        print(f"    [FAIL] could not scrape metrics: {body}")
+        return False
+
+    needed = {
+        "acme.localhost": False,
+        "corp.localhost": False,
+        "startup.localhost": False,
+    }
+    for line in body.splitlines():
+        if "synapse_background_process_start_count" not in line:
+            continue
+        if 'name="handle_presence_timeouts"' not in line:
+            continue
+        for tenant in needed:
+            if f'server_name="{tenant}"' in line:
+                needed[tenant] = True
+
+    if all(needed.values()):
+        found = ", ".join(t for t, v in needed.items() if v)
+        print(f"    [PASS] presence timeouts ran per tenant "
+              f"(background_process_start_count "
+              f"{{name='handle_presence_timeouts'}} present for "
+              f"{found})")
+        return True
+
+    missing = ", ".join(t for t, v in needed.items() if not v)
+    print(f"    [FAIL] presence timeouts not per-tenant — missing "
+          f"background_process_start_count "
+          f"{{name='handle_presence_timeouts'}} for: {missing}")
+    return False
+
+
 def test_retention_purge_per_tenant():
     """The retention purge is a `looping_call` in
     `synapse/handlers/pagination.py`. It previously ran as a single
@@ -1122,6 +1169,24 @@ def main():
         total_passed += 1
     else:
         total_failed += 1
+
+    # Phase-2C probes — presence per-tenant fan-out + server_notices.
+    print(f"\n{'='*60}")
+    print("  PHASE 2C PROBES (presence + server_notices)")
+    print(f"{'='*60}")
+
+    for fn in (
+        test_presence_loop_per_tenant,
+    ):
+        try:
+            ok = fn()
+        except Exception as e:
+            print(f"    [FAIL] {fn.__name__} raised {type(e).__name__}: {e}")
+            ok = False
+        if ok:
+            total_passed += 1
+        else:
+            total_failed += 1
 
     # Phase-1B isolation probes — schema-per-tenant actually holding.
     # Expected to FAIL on current main branch and PASS after the

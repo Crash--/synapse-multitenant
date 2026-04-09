@@ -122,6 +122,7 @@ services:
       - ../synapse/tenant_background.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_background.py:ro
       - ../synapse/handlers/user_directory.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/user_directory.py:ro
       - ../synapse/handlers/stats.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/stats.py:ro
+      - ../synapse/handlers/presence.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/presence.py:ro
       - ../synapse/handlers/pagination.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/pagination.py:ro
       - ../synapse/config/tenants.py:/usr/local/lib/python3.13/site-packages/synapse/config/tenants.py:ro
       - ../synapse/rest/well_known.py:/usr/local/lib/python3.13/site-packages/synapse/rest/well_known.py:ro

@@ -103,6 +103,8 @@ from synapse.metrics import SERVER_NAME_LABEL, LaterGauge
 from synapse.metrics.background_process_metrics import (
     wrap_as_background_process,
 )
+from synapse.tenant_background import run_as_background_process_per_tenant
+from synapse.tenant_context import get_current_tenant
 from synapse.replication.http.presence import (
     ReplicationBumpPresenceActiveTime,
     ReplicationPresenceSetState,
@@ -864,7 +866,7 @@ class PresenceHandler(BasePresenceHandler):
             self.clock.call_later(
                 Duration(seconds=30),
                 self.clock.looping_call,
-                self._handle_timeouts,
+                self._dispatch_handle_timeouts,
                 Duration(seconds=5),
             )
 
@@ -874,7 +876,7 @@ class PresenceHandler(BasePresenceHandler):
             self.clock.call_later(
                 Duration(minutes=1),
                 self.clock.looping_call,
-                self._persist_unpersisted_changes,
+                self._dispatch_persist_unpersisted,
                 Duration(minutes=1),
             )
 
@@ -887,10 +889,150 @@ class PresenceHandler(BasePresenceHandler):
         if self._track_presence:
             self.notifier.add_replication_callback(self.notify_new_event)
 
-        # Presence is best effort and quickly heals itself, so lets just always
-        # stream from the current state when we restart.
-        self._event_pos = self.store.get_room_max_stream_ordering()
-        self._event_processing = False
+        # Per-tenant event-stream positions and processing guards. Under
+        # multi-tenant each tenant schema has its own events stream, so a
+        # single scalar _event_pos would alias across tenants.
+        self._event_pos_by_tenant: dict[str, int] = {}
+        self._event_processing_by_tenant: set[str] = set()
+
+    def _effective_server_name(self) -> str:
+        """Return the current tenant's server_name for metric labels,
+        falling back to the primary hostname outside a tenant context."""
+        tenant = get_current_tenant()
+        return tenant.server_name if tenant is not None else self.server_name
+
+    # ------------------------------------------------------------------
+    # Per-tenant looping-call dispatchers
+    #
+    # The looping-call fires the dispatcher, which collects work from
+    # shared state (wheel_timer, unpersisted_users_changes) exactly once,
+    # then fans out via `run_as_background_process_per_tenant` so each
+    # tenant iteration gets its own BackgroundProcessLoggingContext, its
+    # own Prometheus `server_name` label, and the right ContextVar bound
+    # for DB writes.
+    # ------------------------------------------------------------------
+
+    def _dispatch_handle_timeouts(self) -> None:
+        """Looping-call entry point. Fetches expired users from the
+        shared wheel timer once, then dispatches per-tenant."""
+        now = self.clock.time_msec()
+
+        # Fetch from the shared wheel timer (destructive — removes items).
+        users_to_check = set(self.wheel_timer.fetch(now))
+
+        # Also check expired external-process syncs.
+        expired_process_ids = [
+            process_id
+            for process_id, last_update
+            in self.external_process_last_updated_ms.items()
+            if now - last_update > EXTERNAL_PROCESS_EXPIRY
+        ]
+        for process_id in expired_process_ids:
+            users_to_check.update(
+                user_id
+                for user_id, device_id
+                in self.external_process_to_current_syncs.pop(process_id, ())
+            )
+            self.external_process_last_updated_ms.pop(process_id)
+
+        if not users_to_check:
+            # Still fan out so that per-tenant metrics are emitted even
+            # when there's no work (the counter increment makes the time
+            # series visible in Prometheus).
+            run_as_background_process_per_tenant(
+                "handle_presence_timeouts", self.hs,
+                self._handle_timeouts_noop,
+            )
+            return
+
+        run_as_background_process_per_tenant(
+            "handle_presence_timeouts", self.hs,
+            self._handle_timeouts_for_tenant, users_to_check, now,
+        )
+
+    async def _handle_timeouts_noop(self) -> None:
+        """No-op handler that ensures the per-tenant metric series is
+        created even when no users need timeout processing."""
+        pass
+
+    async def _handle_timeouts_for_tenant(
+        self, all_users: set[str], now: int,
+    ) -> None:
+        """Per-tenant timeout handler. Filters `all_users` to those
+        belonging to the current tenant and processes only those."""
+        tenant = get_current_tenant()
+        tenant_server = tenant.server_name if tenant is not None else self.server_name
+
+        my_users = {
+            uid for uid in all_users if uid.endswith(":" + tenant_server)
+        }
+        if not my_users:
+            return
+
+        states = [
+            self.user_to_current_state.get(
+                user_id, UserPresenceState.default(user_id)
+            )
+            for user_id in my_users
+        ]
+
+        timers_fired_counter.labels(
+            **{SERVER_NAME_LABEL: tenant_server}
+        ).inc(len(states))
+
+        syncing_user_devices = {
+            user_id_device_id
+            for user_id_device_id, count
+            in self._user_device_to_num_current_syncs.items()
+            if count
+        }
+        syncing_user_devices.update(
+            itertools.chain(*self.external_process_to_current_syncs.values())
+        )
+
+        changes = handle_timeouts(
+            states,
+            is_mine_fn=self.is_mine_id,
+            syncing_user_devices=syncing_user_devices,
+            user_to_devices=self._user_to_device_to_current_state,
+            now=now,
+        )
+
+        return await self._update_states(changes)
+
+    def _dispatch_persist_unpersisted(self) -> None:
+        """Looping-call entry point. Swaps the dirty set once, then fans
+        out per-tenant for DB writes."""
+        unpersisted = self.unpersisted_users_changes
+        self.unpersisted_users_changes = set()
+        if not unpersisted:
+            return
+
+        run_as_background_process_per_tenant(
+            "persist_presence_changes", self.hs,
+            self._persist_unpersisted_for_tenant, unpersisted,
+        )
+
+    async def _persist_unpersisted_for_tenant(
+        self, all_unpersisted: set[str],
+    ) -> None:
+        """Per-tenant persist handler."""
+        tenant = get_current_tenant()
+        tenant_server = tenant.server_name if tenant is not None else self.server_name
+
+        my_users = {
+            uid for uid in all_unpersisted if uid.endswith(":" + tenant_server)
+        }
+        if not my_users:
+            return
+
+        logger.info(
+            "Persisting %d unpersisted presence updates for %s",
+            len(my_users), tenant_server,
+        )
+        await self.store.update_presence(
+            [self.user_to_current_state[uid] for uid in my_users]
+        )
 
     @wrap_as_background_process("PresenceHandler._on_shutdown")
     async def _on_shutdown(self) -> None:
@@ -921,19 +1063,9 @@ class PresenceHandler(BasePresenceHandler):
             )
         logger.info("Finished _on_shutdown")
 
-    @wrap_as_background_process("persist_presence_changes")
-    async def _persist_unpersisted_changes(self) -> None:
-        """We periodically persist the unpersisted changes, as otherwise they
-        may stack up and slow down shutdown times.
-        """
-        unpersisted = self.unpersisted_users_changes
-        self.unpersisted_users_changes = set()
-
-        if unpersisted:
-            logger.info("Persisting %d unpersisted presence updates", len(unpersisted))
-            await self.store.update_presence(
-                [self.user_to_current_state[user_id] for user_id in unpersisted]
-            )
+    # _persist_unpersisted_changes — replaced by
+    # _dispatch_persist_unpersisted + _persist_unpersisted_for_tenant
+    # (see per-tenant dispatchers above).
 
     async def _update_states(
         self,
@@ -961,8 +1093,11 @@ class PresenceHandler(BasePresenceHandler):
         now = self.clock.time_msec()
 
         with Measure(
-            self.clock, name="presence_update_states", server_name=self.server_name
+            self.clock, name="presence_update_states",
+            server_name=self._effective_server_name(),
         ):
+            effective_sn = self._effective_server_name()
+
             # NOTE: We purposefully don't await between now and when we've
             # calculated what we want to do with the new states, to avoid races.
 
@@ -990,7 +1125,7 @@ class PresenceHandler(BasePresenceHandler):
                     prev_state,
                     new_state,
                     is_mine=self.is_mine_id(user_id),
-                    our_server_name=self.server_name,
+                    our_server_name=effective_sn,
                     wheel_timer=self.wheel_timer,
                     now=now,
                     # When overriding disabled presence, don't kick off all the
@@ -1011,12 +1146,12 @@ class PresenceHandler(BasePresenceHandler):
             # TODO: We should probably ensure there are no races hereafter
 
             presence_updates_counter.labels(
-                **{SERVER_NAME_LABEL: self.server_name}
+                **{SERVER_NAME_LABEL: effective_sn}
             ).inc(len(new_states))
 
             if to_notify:
                 notified_presence_counter.labels(
-                    **{SERVER_NAME_LABEL: self.server_name}
+                    **{SERVER_NAME_LABEL: effective_sn}
                 ).inc(len(to_notify))
                 await self._persist_and_notify(list(to_notify.values()))
 
@@ -1037,7 +1172,7 @@ class PresenceHandler(BasePresenceHandler):
             }
             if to_federation_ping:
                 federation_presence_out_counter.labels(
-                    **{SERVER_NAME_LABEL: self.server_name}
+                    **{SERVER_NAME_LABEL: effective_sn}
                 ).inc(len(to_federation_ping))
 
                 hosts_to_states = await get_interested_remotes(
@@ -1051,66 +1186,8 @@ class PresenceHandler(BasePresenceHandler):
                         states, destinations
                     )
 
-    @wrap_as_background_process("handle_presence_timeouts")
-    async def _handle_timeouts(self) -> None:
-        """Checks the presence of users that have timed out and updates as
-        appropriate.
-        """
-        logger.debug("Handling presence timeouts")
-        now = self.clock.time_msec()
-
-        # Fetch the list of users that *may* have timed out. Things may have
-        # changed since the timeout was set, so we won't necessarily have to
-        # take any action.
-        users_to_check = set(self.wheel_timer.fetch(now))
-
-        # Check whether the lists of syncing processes from an external
-        # process have expired.
-        expired_process_ids = [
-            process_id
-            for process_id, last_update in self.external_process_last_updated_ms.items()
-            if now - last_update > EXTERNAL_PROCESS_EXPIRY
-        ]
-        for process_id in expired_process_ids:
-            # For each expired process drop tracking info and check the users
-            # that were syncing on that process to see if they need to be timed
-            # out.
-            users_to_check.update(
-                user_id
-                for user_id, device_id in self.external_process_to_current_syncs.pop(
-                    process_id, ()
-                )
-            )
-            self.external_process_last_updated_ms.pop(process_id)
-
-        states = [
-            self.user_to_current_state.get(user_id, UserPresenceState.default(user_id))
-            for user_id in users_to_check
-        ]
-
-        timers_fired_counter.labels(**{SERVER_NAME_LABEL: self.server_name}).inc(
-            len(states)
-        )
-
-        # Set of user ID & device IDs which are currently syncing.
-        syncing_user_devices = {
-            user_id_device_id
-            for user_id_device_id, count in self._user_device_to_num_current_syncs.items()
-            if count
-        }
-        syncing_user_devices.update(
-            itertools.chain(*self.external_process_to_current_syncs.values())
-        )
-
-        changes = handle_timeouts(
-            states,
-            is_mine_fn=self.is_mine_id,
-            syncing_user_devices=syncing_user_devices,
-            user_to_devices=self._user_to_device_to_current_state,
-            now=now,
-        )
-
-        return await self._update_states(changes)
+    # _handle_timeouts — replaced by _dispatch_handle_timeouts +
+    # _handle_timeouts_for_tenant (see per-tenant dispatchers above).
 
     async def bump_presence_active_time(
         self, user: UserID, device_id: str | None
@@ -1124,7 +1201,7 @@ class PresenceHandler(BasePresenceHandler):
 
         user_id = user.to_string()
 
-        bump_active_time_counter.labels(**{SERVER_NAME_LABEL: self.server_name}).inc()
+        bump_active_time_counter.labels(**{SERVER_NAME_LABEL: self._effective_server_name()}).inc()
 
         now = self.clock.time_msec()
 
@@ -1510,44 +1587,63 @@ class PresenceHandler(BasePresenceHandler):
     def notify_new_event(self) -> None:
         """Called when new events have happened. Handles users and servers
         joining rooms and require being sent presence.
+
+        Multi-tenant: fans out via `run_as_background_process_per_tenant`
+        so each tenant's event-stream delta processing runs with the
+        correct tenant ContextVar bound, and per-tenant stream positions
+        are tracked independently.
         """
-
-        if self._event_processing:
-            return
-
         async def _process_presence() -> None:
-            assert not self._event_processing
+            tenant = get_current_tenant()
+            tenant_key = tenant.server_name if tenant is not None else ""
 
-            self._event_processing = True
+            if tenant_key in self._event_processing_by_tenant:
+                return
+
+            self._event_processing_by_tenant.add(tenant_key)
             try:
                 await self._unsafe_process()
             finally:
-                self._event_processing = False
+                self._event_processing_by_tenant.discard(tenant_key)
 
-        self.hs.run_as_background_process(
-            "presence.notify_new_event", _process_presence
+        run_as_background_process_per_tenant(
+            "presence.notify_new_event", self.hs, _process_presence
         )
 
     async def _unsafe_process(self) -> None:
+        # Per-tenant stream position. The "" key is used when there is no
+        # tenant context bound (single-tenant or test fixtures).
+        tenant = get_current_tenant()
+        tenant_key = tenant.server_name if tenant is not None else ""
+        effective_server_name = (
+            tenant.server_name if tenant is not None else self.server_name
+        )
+
+        event_pos = self._event_pos_by_tenant.get(tenant_key)
+        if event_pos is None:
+            event_pos = self.store.get_room_max_stream_ordering()
+
         # Loop round handling deltas until we're up to date
         while True:
             with Measure(
-                self.clock, name="presence_delta", server_name=self.server_name
+                self.clock, name="presence_delta",
+                server_name=effective_server_name,
             ):
                 room_max_stream_ordering = self.store.get_room_max_stream_ordering()
-                if self._event_pos >= room_max_stream_ordering:
+                if event_pos >= room_max_stream_ordering:
+                    self._event_pos_by_tenant[tenant_key] = event_pos
                     return
 
                 logger.debug(
                     "Processing presence stats %s->%s",
-                    self._event_pos,
+                    event_pos,
                     room_max_stream_ordering,
                 )
                 (
                     max_pos,
                     deltas,
                 ) = await self._storage_controllers.state.get_current_state_deltas(
-                    self._event_pos, room_max_stream_ordering
+                    event_pos, room_max_stream_ordering
                 )
 
                 # We may get multiple deltas for different rooms, but we want to
@@ -1560,11 +1656,13 @@ class PresenceHandler(BasePresenceHandler):
                 for room_id, deltas_for_room in deltas_by_room.items():
                     await self._handle_state_delta(room_id, deltas_for_room)
 
-                self._event_pos = max_pos
+                event_pos = max_pos
+                self._event_pos_by_tenant[tenant_key] = event_pos
 
                 # Expose current event processing position to prometheus
                 synapse.metrics.event_processing_positions.labels(
-                    name="presence", **{SERVER_NAME_LABEL: self.server_name}
+                    name="presence",
+                    **{SERVER_NAME_LABEL: effective_server_name},
                 ).set(max_pos)
 
     async def _handle_state_delta(self, room_id: str, deltas: list[StateDelta]) -> None:
