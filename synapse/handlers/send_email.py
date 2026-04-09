@@ -114,20 +114,72 @@ class SendEmailHandler:
 
         self._reactor = hs.get_reactor()
 
-        self._from = hs.config.email.email_notif_from
-        self._smtp_host = hs.config.email.email_smtp_host
-        self._smtp_port = hs.config.email.email_smtp_port
+        # Store global config as fallback for when no tenant context is set.
+        self._global_from = hs.config.email.email_notif_from
+        self._global_smtp_host = hs.config.email.email_smtp_host
+        self._global_smtp_port = hs.config.email.email_smtp_port
 
         user = hs.config.email.email_smtp_user
-        self._smtp_user = user.encode("utf-8") if user is not None else None
+        self._global_smtp_user = user.encode("utf-8") if user is not None else None
         passwd = hs.config.email.email_smtp_pass
-        self._smtp_pass = passwd.encode("utf-8") if passwd is not None else None
-        self._require_transport_security = hs.config.email.require_transport_security
-        self._enable_tls = hs.config.email.enable_smtp_tls
-        self._force_tls = hs.config.email.force_tls
-        self._tlsname = hs.config.email.email_tlsname
+        self._global_smtp_pass = passwd.encode("utf-8") if passwd is not None else None
+        self._global_require_transport_security = (
+            hs.config.email.require_transport_security
+        )
+        self._global_enable_tls = hs.config.email.enable_smtp_tls
+        self._global_force_tls = hs.config.email.force_tls
+        self._global_tlsname = hs.config.email.email_tlsname
 
         self._sendmail = _sendmail
+
+    def _get_smtp_config(
+        self,
+    ) -> tuple[
+        str,  # from
+        str,  # smtp_host
+        int,  # smtp_port
+        bytes | None,  # smtp_user
+        bytes | None,  # smtp_pass
+        bool,  # require_transport_security
+        bool,  # enable_tls
+        bool,  # force_tls
+        str | None,  # tlsname
+    ]:
+        """Resolve SMTP config from tenant context, falling back to global."""
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None and tenant.email is not None:
+            te = tenant.email
+            smtp_user = (
+                te.smtp_user.encode("utf-8") if te.smtp_user is not None else None
+            )
+            smtp_pass = (
+                te.smtp_pass.encode("utf-8") if te.smtp_pass is not None else None
+            )
+            return (
+                te.notif_from,
+                te.smtp_host,
+                te.smtp_port,
+                smtp_user,
+                smtp_pass,
+                te.require_transport_security,
+                te.enable_tls,
+                te.force_tls,
+                te.tlsname,
+            )
+
+        return (
+            self._global_from,
+            self._global_smtp_host,
+            self._global_smtp_port,
+            self._global_smtp_user,
+            self._global_smtp_pass,
+            self._global_require_transport_security,
+            self._global_enable_tls,
+            self._global_force_tls,
+            self._global_tlsname,
+        )
 
     async def send_email(
         self,
@@ -148,10 +200,22 @@ class SendEmailHandler:
             text: The plain text content to include in the email.
             additional_headers: A map of additional headers to include.
         """
+        (
+            notif_from,
+            smtp_host,
+            smtp_port,
+            smtp_user,
+            smtp_pass,
+            require_transport_security,
+            enable_tls,
+            force_tls,
+            tlsname,
+        ) = self._get_smtp_config()
+
         try:
-            from_string = self._from % {"app": app_name}  # type: ignore[operator]
+            from_string = notif_from % {"app": app_name}  # type: ignore[operator]
         except (KeyError, TypeError):
-            from_string = self._from
+            from_string = notif_from
 
         raw_from = email.utils.parseaddr(from_string)[1]
         raw_to = email.utils.parseaddr(email_address)[1]
@@ -194,16 +258,16 @@ class SendEmailHandler:
 
         await self._sendmail(
             self._reactor,
-            self._smtp_host,
-            self._smtp_port,
+            smtp_host,
+            smtp_port,
             raw_from,
             raw_to,
             multipart_msg.as_string().encode("utf8"),
-            username=self._smtp_user,
-            password=self._smtp_pass,
-            require_auth=self._smtp_user is not None,
-            require_tls=self._require_transport_security,
-            enable_tls=self._enable_tls,
-            force_tls=self._force_tls,
-            tlsname=self._tlsname,
+            username=smtp_user,
+            password=smtp_pass,
+            require_auth=smtp_user is not None,
+            require_tls=require_transport_security,
+            enable_tls=enable_tls,
+            force_tls=force_tls,
+            tlsname=tlsname,
         )
