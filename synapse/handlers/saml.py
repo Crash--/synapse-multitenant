@@ -62,14 +62,14 @@ class SamlHandler:
         self.store = hs.get_datastores().main
         self.clock = hs.get_clock()
         self.server_name = hs.hostname
-        self._saml_client = Saml2Client(hs.config.saml2.saml2_sp_config)
-        self._saml_idp_entityid = hs.config.saml2.saml2_idp_entityid
+        self._global_saml_client = Saml2Client(hs.config.saml2.saml2_sp_config)
+        self._global_saml_idp_entityid = hs.config.saml2.saml2_idp_entityid
 
-        self._saml2_session_lifetime = hs.config.saml2.saml2_session_lifetime
+        self._global_saml2_session_lifetime = hs.config.saml2.saml2_session_lifetime
         self._grandfathered_mxid_source_attribute = (
             hs.config.saml2.saml2_grandfathered_mxid_source_attribute
         )
-        self._saml2_attribute_requirements = hs.config.saml2.attribute_requirements
+        self._global_saml2_attribute_requirements = hs.config.saml2.attribute_requirements
 
         # plugin to do custom mapping from saml response to mxid
         self._user_mapping_provider = hs.config.saml2.saml2_user_mapping_provider_class(
@@ -95,6 +95,32 @@ class SamlHandler:
         self._sso_handler = hs.get_sso_handler()
         self._sso_handler.register_identity_provider(self)
 
+    # ------------------------------------------------------------------
+    # Tenant-aware config accessors
+    # ------------------------------------------------------------------
+
+    def _get_saml_client(self) -> Saml2Client:
+        # Full Saml2Client construction from per-tenant raw_config is not yet
+        # supported; return the global fallback.
+        return self._global_saml_client
+
+    def _get_saml_idp_entityid(self) -> "str | None":
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant and tenant.saml:
+            return tenant.saml.idp_entityid
+        return self._global_saml_idp_entityid
+
+    def _get_saml2_session_lifetime(self) -> int:
+        # Per-tenant session_lifetime is stored as a string (e.g. "15m"); full
+        # parsing into milliseconds is not yet wired up — return global fallback.
+        return self._global_saml2_session_lifetime
+
+    def _get_saml2_attribute_requirements(self) -> list:
+        # Per-tenant attribute requirements not yet supported; return global fallback.
+        return self._global_saml2_attribute_requirements
+
     async def handle_redirect_request(
         self,
         request: SynapseRequest,
@@ -119,8 +145,8 @@ class SamlHandler:
             # (which will never get used).
             client_redirect_url = b"unused"
 
-        reqid, info = self._saml_client.prepare_for_authenticate(
-            entityid=self._saml_idp_entityid, relay_state=client_redirect_url
+        reqid, info = self._get_saml_client().prepare_for_authenticate(
+            entityid=self._get_saml_idp_entityid(), relay_state=client_redirect_url
         )
 
         # Since SAML sessions timeout it is useful to log when they were created.
@@ -157,7 +183,7 @@ class SamlHandler:
         self.expire_sessions()
 
         try:
-            saml2_auth = self._saml_client.parse_authn_request_response(
+            saml2_auth = self._get_saml_client().parse_authn_request_response(
                 resp_bytes,
                 saml2.BINDING_HTTP_POST,
                 outstanding=self._outstanding_requests_dict,
@@ -247,7 +273,7 @@ class SamlHandler:
         # Ensure that the attributes of the logged in user meet the required
         # attributes.
         if not self._sso_handler.check_required_attributes(
-            request, saml2_auth.ava, self._saml2_attribute_requirements
+            request, saml2_auth.ava, self._get_saml2_attribute_requirements()
         ):
             return
 
@@ -368,7 +394,7 @@ class SamlHandler:
         return remote_user_id
 
     def expire_sessions(self) -> None:
-        expire_before = self.clock.time_msec() - self._saml2_session_lifetime
+        expire_before = self.clock.time_msec() - self._get_saml2_session_lifetime()
         to_expire = set()
         for reqid, data in self._outstanding_requests_dict.items():
             if data.creation_time < expire_before:
