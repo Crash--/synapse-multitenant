@@ -42,16 +42,25 @@ class PusherFactory:
             "http": HttpPusher
         }
 
-        logger.info("email enable notifs: %r", hs.config.email.email_enable_notifs)
-        if hs.config.email.email_enable_notifs:
-            self.mailers: dict[str, Mailer] = {}
+        self._global_email_enable_notifs = hs.config.email.email_enable_notifs
+        logger.info("email enable notifs: %r", self._global_email_enable_notifs)
 
-            self._notif_template_html = hs.config.email.email_notif_template_html
-            self._notif_template_text = hs.config.email.email_notif_template_text
+        self.mailers: dict[str, Mailer] = {}
+        self._notif_template_html = hs.config.email.email_notif_template_html
+        self._notif_template_text = hs.config.email.email_notif_template_text
 
-            self.pusher_types["email"] = self._create_email_pusher
+        self.pusher_types["email"] = self._create_email_pusher
 
-            logger.info("defined email pusher type")
+        logger.info("defined email pusher type")
+
+    def _email_notifs_enabled(self) -> bool:
+        """Return whether email notifications are enabled for the current tenant."""
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant and tenant.email:
+            return True  # presence of tenant email config implies notifs enabled
+        return self._global_email_enable_notifs
 
     def create_pusher(self, pusher_config: PusherConfig) -> Pusher | None:
         kind = pusher_config.kind
@@ -63,7 +72,9 @@ class PusherFactory:
 
     def _create_email_pusher(
         self, _hs: "HomeServer", pusher_config: PusherConfig
-    ) -> EmailPusher:
+    ) -> EmailPusher | None:
+        if not self._email_notifs_enabled():
+            return None
         app_name = self._app_name_from_pusherdict(pusher_config)
         mailer = self.mailers.get(app_name)
         if not mailer:

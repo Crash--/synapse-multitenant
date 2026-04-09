@@ -136,9 +136,22 @@ class Mailer:
         self.state_handler = self.hs.get_state_handler()
         self._storage_controllers = hs.get_storage_controllers()
         self.app_name = app_name
-        self.email_subjects: EmailSubjectConfig = hs.config.email.email_subjects
+        self._global_email_subjects: EmailSubjectConfig = hs.config.email.email_subjects
+        self._global_riot_base_url: str | None = hs.config.email.email_riot_base_url
 
         logger.info("Created Mailer for app_name %s", app_name)
+
+    def _get_email_subjects(self) -> EmailSubjectConfig:
+        """Return the email subjects config for the current tenant (or global fallback)."""
+        # TenantEmailConfig does not carry subjects yet; this accessor is a future-proofing hook.
+        return self._global_email_subjects
+
+    def _get_riot_base_url(self) -> str | None:
+        """Return the Riot/Element base URL for the current tenant (or global fallback)."""
+        tenant = get_current_tenant()
+        if tenant and tenant.email and tenant.email.riot_base_url:
+            return tenant.email.riot_base_url
+        return self._global_riot_base_url
 
     async def send_password_reset_mail(
         self, email_address: str, token: str, client_secret: str, sid: str
@@ -176,7 +189,7 @@ class Mailer:
 
         await self.send_email(
             email_address,
-            self.email_subjects.password_reset
+            self._get_email_subjects().password_reset
             % {"server_name": self.hs.config.server.server_name, "app": self.app_name},
             template_vars,
         )
@@ -217,7 +230,7 @@ class Mailer:
 
         await self.send_email(
             email_address,
-            self.email_subjects.email_validation
+            self._get_email_subjects().email_validation
             % {"server_name": self.hs.config.server.server_name, "app": self.app_name},
             template_vars,
         )
@@ -236,7 +249,7 @@ class Mailer:
 
         await self.send_email(
             email_address,
-            self.email_subjects.email_already_in_use
+            self._get_email_subjects().email_already_in_use
             % {"server_name": self.hs.config.server.server_name, "app": self.app_name},
             {},
         )
@@ -278,7 +291,7 @@ class Mailer:
 
         await self.send_email(
             email_address,
-            self.email_subjects.email_validation
+            self._get_email_subjects().email_validation
             % {"server_name": self.hs.config.server.server_name, "app": self.app_name},
             template_vars,
         )
@@ -728,7 +741,7 @@ class Mailer:
                     inviter_name = name_from_member_event(inviter_member_event)
 
             if room_name is None:
-                return self.email_subjects.invite_from_person % {
+                return self._get_email_subjects().invite_from_person % {
                     "person": inviter_name,
                     "app": self.app_name,
                 }
@@ -744,13 +757,13 @@ class Mailer:
                     and create_event.content.get(EventContentFields.ROOM_TYPE)
                     == RoomTypes.SPACE
                 ):
-                    return self.email_subjects.invite_from_person_to_space % {
+                    return self._get_email_subjects().invite_from_person_to_space % {
                         "person": inviter_name,
                         "space": room_name,
                         "app": self.app_name,
                     }
 
-            return self.email_subjects.invite_from_person_to_room % {
+            return self._get_email_subjects().invite_from_person_to_room % {
                 "person": inviter_name,
                 "room": room_name,
                 "app": self.app_name,
@@ -766,19 +779,19 @@ class Mailer:
                 sender_name = name_from_member_event(state_event)
 
             if sender_name is not None and room_name is not None:
-                return self.email_subjects.message_from_person_in_room % {
+                return self._get_email_subjects().message_from_person_in_room % {
                     "person": sender_name,
                     "room": room_name,
                     "app": self.app_name,
                 }
             elif sender_name is not None:
-                return self.email_subjects.message_from_person % {
+                return self._get_email_subjects().message_from_person % {
                     "person": sender_name,
                     "app": self.app_name,
                 }
 
             # The sender is unknown, just use the room name (or ID).
-            return self.email_subjects.messages_in_room % {
+            return self._get_email_subjects().messages_in_room % {
                 "room": room_name or room_id,
                 "app": self.app_name,
             }
@@ -786,7 +799,7 @@ class Mailer:
             # There's more than one notification for this room, so just
             # say there are several
             if room_name is not None:
-                return self.email_subjects.messages_in_room % {
+                return self._get_email_subjects().messages_in_room % {
                     "room": room_name,
                     "app": self.app_name,
                 }
@@ -817,7 +830,7 @@ class Mailer:
         # Stuff's happened in multiple different rooms
         # ...but we still refer to the 'reason' room which triggered the mail
         if reason["room_name"] is not None:
-            return self.email_subjects.messages_in_room_and_others % {
+            return self._get_email_subjects().messages_in_room_and_others % {
                 "room": reason["room_name"],
                 "app": self.app_name,
             }
@@ -882,20 +895,20 @@ class Mailer:
             # No member events were found! Maybe the room is empty?
             # Fallback to the room ID (note that if there was a room name this
             # would already have been used previously).
-            return self.email_subjects.messages_in_room % {
+            return self._get_email_subjects().messages_in_room % {
                 "room": room_id,
                 "app": self.app_name,
             }
 
         # There was a single sender.
         if len(member_events) == 1:
-            return self.email_subjects.messages_from_person % {
+            return self._get_email_subjects().messages_from_person % {
                 "person": descriptor_from_member_events(member_events.values()),
                 "app": self.app_name,
             }
 
         # There was more than one sender, use the first one and a tweaked template.
-        return self.email_subjects.messages_from_person_and_others % {
+        return self._get_email_subjects().messages_from_person_and_others % {
             "person": descriptor_from_member_events(list(member_events.values())[:1]),
             "app": self.app_name,
         }
@@ -910,8 +923,8 @@ class Mailer:
         Returns:
              A link to open a room in the web client.
         """
-        if self.hs.config.email.email_riot_base_url:
-            base_url = "%s/#/room" % (self.hs.config.email.email_riot_base_url)
+        if self._get_riot_base_url():
+            base_url = "%s/#/room" % (self._get_riot_base_url())
         elif self.app_name == "Vector":
             # need /beta for Universal Links to work on iOS
             base_url = "https://vector.im/beta/#/room"
@@ -929,9 +942,9 @@ class Mailer:
         Returns:
              A link to open the notification in the web client.
         """
-        if self.hs.config.email.email_riot_base_url:
+        if self._get_riot_base_url():
             return "%s/#/room/%s/%s" % (
-                self.hs.config.email.email_riot_base_url,
+                self._get_riot_base_url(),
                 notif.room_id,
                 notif.event_id,
             )
