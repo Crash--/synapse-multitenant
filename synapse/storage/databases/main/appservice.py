@@ -107,10 +107,28 @@ class ApplicationServiceWorkerStore(RoomMemberWorkerStore):
         super().__init__(database, db_conn, hs)
 
     def get_app_services(self) -> list[ApplicationService]:
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            try:
+                registry = self.hs.get_tenant_app_service_registry()
+                return registry.get_app_services(tenant)
+            except Exception:
+                pass
         return self.services_cache
 
     def get_if_app_services_interested_in_user(self, user_id: str) -> bool:
         """Check if the user is one associated with an app service (exclusively)"""
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            try:
+                registry = self.hs.get_tenant_app_service_registry()
+                return registry.get_if_app_services_interested_in_user(user_id, tenant)
+            except Exception:
+                pass
         if self.exclusive_user_regex:
             return bool(self.exclusive_user_regex.match(user_id))
         else:
@@ -129,6 +147,15 @@ class ApplicationServiceWorkerStore(RoomMemberWorkerStore):
         Returns:
             The application service or None.
         """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            try:
+                registry = self.hs.get_tenant_app_service_registry()
+                return registry.get_app_service_by_user_id(user_id, tenant)
+            except Exception:
+                pass
         for service in self.services_cache:
             if service.sender.to_string() == user_id:
                 return service
@@ -142,6 +169,15 @@ class ApplicationServiceWorkerStore(RoomMemberWorkerStore):
         Returns:
             The application service or None.
         """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            try:
+                registry = self.hs.get_tenant_app_service_registry()
+                return registry.get_app_service_by_token(token, tenant)
+            except Exception:
+                pass
         for service in self.services_cache:
             if service.token == token:
                 return service

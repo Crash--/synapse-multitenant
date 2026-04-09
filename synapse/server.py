@@ -754,6 +754,16 @@ class HomeServer(metaclass=abc.ABCMeta):
             global_settings=global_settings,
         )
 
+    @cache_in_self
+    def get_tenant_app_service_registry(
+        self,
+    ) -> "TenantAppServiceRegistry":
+        from synapse.appservice.tenant_registry import TenantAppServiceRegistry
+
+        registry = self.get_tenant_registry()
+        tenants = registry.get_all_tenants() if registry else []
+        return TenantAppServiceRegistry(tenants)
+
     def effective_server_name(self) -> str:
         """Return the server_name that should be used for the *current request*.
 
