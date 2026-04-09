@@ -26,6 +26,7 @@ import shutil
 from typing import TYPE_CHECKING, Callable
 
 from synapse.config._base import Config
+from synapse.tenant_context import get_current_tenant
 from synapse.logging.context import defer_to_thread, run_in_background
 from synapse.logging.opentracing import start_active_span, trace_with_opname
 from synapse.util.async_helpers import maybe_awaitable
@@ -148,6 +149,20 @@ class FileStorageProviderBackend(StorageProvider):
         self.cache_directory = hs.config.media.media_store_path
         self.base_directory = config
 
+    def _tenant_base(self, base: str) -> str:
+        """Return a tenant-scoped subdirectory when a tenant context is active.
+
+        Args:
+            base: The base directory (cache or backup).
+
+        Returns:
+            ``<base>/<server_name>`` if a tenant is set, otherwise ``base``.
+        """
+        tenant = get_current_tenant()
+        if tenant is not None:
+            return os.path.join(base, tenant.server_name)
+        return base
+
     def __str__(self) -> str:
         return "FileStorageProviderBackend[%s]" % (self.base_directory,)
 
@@ -155,8 +170,8 @@ class FileStorageProviderBackend(StorageProvider):
     async def store_file(self, path: str, file_info: FileInfo) -> None:
         """See StorageProvider.store_file"""
 
-        primary_fname = os.path.join(self.cache_directory, path)
-        backup_fname = os.path.join(self.base_directory, path)
+        primary_fname = os.path.join(self._tenant_base(self.cache_directory), path)
+        backup_fname = os.path.join(self._tenant_base(self.base_directory), path)
 
         dirname = os.path.dirname(backup_fname)
         os.makedirs(dirname, exist_ok=True)
@@ -175,7 +190,7 @@ class FileStorageProviderBackend(StorageProvider):
     async def fetch(self, path: str, file_info: FileInfo) -> Responder | None:
         """See StorageProvider.fetch"""
 
-        backup_fname = os.path.join(self.base_directory, path)
+        backup_fname = os.path.join(self._tenant_base(self.base_directory), path)
         if os.path.isfile(backup_fname):
             # Import here to avoid circular import
             from .media_storage import FileResponder
