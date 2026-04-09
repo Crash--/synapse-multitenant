@@ -134,6 +134,24 @@ class TenantSamlConfig:
 
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)
+class TenantPushConfig:
+    """Per-tenant push notification configuration."""
+    include_content: bool = True
+    enabled: bool = True
+    group_unread_count_by_room: bool = True
+    jitter_delay_ms: int | None = None
+
+    @classmethod
+    def from_dict(cls, d: "JsonDict") -> "TenantPushConfig":
+        return cls(
+            include_content=d.get("include_content", True),
+            enabled=d.get("enabled", True),
+            group_unread_count_by_room=d.get("group_unread_count_by_room", True),
+            jitter_delay_ms=d.get("jitter_delay_ms"),
+        )
+
+
+@attr.s(auto_attribs=True, slots=True, frozen=True)
 class TenantConfig:
     """Configuration for a single tenant in a multi-tenant deployment.
 
@@ -191,6 +209,7 @@ class TenantConfig:
     oidc: TenantOidcConfig | None = None
     cas: TenantCasConfig | None = None
     saml: TenantSamlConfig | None = None
+    push: TenantPushConfig | None = None
 
     @property
     def effective_public_baseurl(self) -> str:
@@ -272,6 +291,9 @@ class TenantConfig:
         saml_dict = config.get("saml")
         saml_cfg = TenantSamlConfig.from_dict(saml_dict) if saml_dict else None
 
+        push_dict = config.get("push")
+        push_cfg = TenantPushConfig.from_dict(push_dict) if push_dict is not None else None
+
         return cls(
             server_name=server_name,
             database_schema=database_schema,
@@ -291,6 +313,7 @@ class TenantConfig:
             oidc=oidc_cfg,
             cas=cas_cfg,
             saml=saml_cfg,
+            push=push_cfg,
         )
 
 
