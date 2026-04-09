@@ -17,6 +17,7 @@ from synapse.config.ratelimiting import RatelimitSettings
 if TYPE_CHECKING:
     from synapse.config.tenants import TenantConfig
     from synapse.storage.databases.main import DataStore
+    from synapse.tenant_registry import TenantRegistry
     from synapse.util import Clock
 
 logger = logging.getLogger(__name__)
@@ -89,3 +90,17 @@ class TenantRatelimiterRegistry:
             )
 
         return self._cache[cache_key]
+
+    def reload(self, registry: "TenantRegistry") -> None:
+        """Clear cached limiters for tenants no longer active.
+
+        New tenants don't need setup — their limiters are lazy-created via get().
+        """
+        active_names = set(t.server_name for t in registry.get_all_tenants())
+        for key in list(self._cache.keys()):
+            server_name, _ = key
+            if server_name != _GLOBAL and server_name not in active_names:
+                del self._cache[key]
+                logger.info(
+                    "Cleared cached rate limiter for inactive tenant: %s", server_name
+                )
