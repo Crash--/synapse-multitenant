@@ -89,7 +89,7 @@ from synapse.types import (
 )
 from synapse.types.handlers import ShutdownRoomParams, ShutdownRoomResponse
 from synapse.types.state import StateFilter
-from synapse.tenant_context import get_current_tenant
+from synapse.tenant_context import get_current_tenant, get_effective_server_notices_mxid
 from synapse.util import stringutils
 from synapse.util.async_helpers import concurrently_execute
 from synapse.util.caches.response_cache import ResponseCache
@@ -188,7 +188,7 @@ class RoomCreationHandler:
             server_name=self.server_name,
             timeout_ms=FIVE_MINUTES_IN_MS,
         )
-        self._server_notices_mxid = hs.config.servernotices.server_notices_mxid
+        self._global_server_notices_mxid = hs.config.servernotices.server_notices_mxid
 
         self._third_party_event_rules = (
             hs.get_module_api_callbacks().third_party_event_rules
@@ -1110,9 +1110,10 @@ class RoomCreationHandler:
             await self.common_request_ratelimiter.ratelimit(requester)
             await self.creation_ratelimiter.ratelimit(requester)
 
+        effective_mxid = get_effective_server_notices_mxid(self._global_server_notices_mxid)
         if (
-            self._server_notices_mxid is not None
-            and user_id == self._server_notices_mxid
+            effective_mxid is not None
+            and user_id == effective_mxid
         ):
             # allow the server notices mxid to create rooms
             is_requester_admin = True

@@ -74,6 +74,7 @@ from synapse.types.state import StateFilter
 from synapse.util.async_helpers import Linearizer
 from synapse.util.duration import Duration
 from synapse.util.retryutils import NotRetryingDestination
+from synapse.tenant_context import get_effective_server_notices_mxid
 from synapse.visibility import filter_events_for_server
 
 if TYPE_CHECKING:
@@ -144,7 +145,7 @@ class FederationHandler:
         self.event_creation_handler = hs.get_event_creation_handler()
         self.event_builder_factory = hs.get_event_builder_factory()
         self._event_auth_handler = hs.get_event_auth_handler()
-        self._server_notices_mxid = hs.config.servernotices.server_notices_mxid
+        self._global_server_notices_mxid = hs.config.servernotices.server_notices_mxid
         self.config = hs.config
         self.http_client = hs.get_proxied_blocklisted_http_client()
         self._replication = hs.get_replication_data_handler()
@@ -1078,7 +1079,8 @@ class FederationHandler:
             raise SynapseError(400, "The invite event must be for this server")
 
         # block any attempts to invite the server notices mxid
-        if event.state_key == self._server_notices_mxid:
+        effective_mxid = get_effective_server_notices_mxid(self._global_server_notices_mxid)
+        if event.state_key == effective_mxid:
             raise SynapseError(HTTPStatus.FORBIDDEN, "Cannot invite this user")
 
         # check the invitee's configuration and apply rules

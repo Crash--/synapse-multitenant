@@ -66,6 +66,7 @@ from synapse.types import (
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import Linearizer
 from synapse.util.distributor import user_left_room
+from synapse.tenant_context import get_effective_server_notices_mxid
 from synapse.util.duration import Duration
 
 if TYPE_CHECKING:
@@ -126,7 +127,7 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         self._third_party_event_rules = (
             hs.get_module_api_callbacks().third_party_event_rules
         )
-        self._server_notices_mxid = self.config.servernotices.server_notices_mxid
+        self._global_server_notices_mxid = self.config.servernotices.server_notices_mxid
         self._enable_lookup = hs.config.registration.enable_3pid_lookup
         self.allow_per_room_profiles = self.config.server.allow_per_room_profiles
 
@@ -745,9 +746,10 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             content = dict(content)
 
         # allow the server notices mxid to set room-level profile
+        effective_mxid = get_effective_server_notices_mxid(self._global_server_notices_mxid)
         is_requester_server_notices_user = (
-            self._server_notices_mxid is not None
-            and requester.user.to_string() == self._server_notices_mxid
+            effective_mxid is not None
+            and requester.user.to_string() == effective_mxid
         )
 
         # The requester may be a regular user, but puppeted by the server.
@@ -871,14 +873,15 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             target_id = target.to_string()
 
             # block any attempts to invite the server notices mxid
-            if target_id == self._server_notices_mxid:
+            effective_mxid = get_effective_server_notices_mxid(self._global_server_notices_mxid)
+            if target_id == effective_mxid:
                 raise SynapseError(HTTPStatus.FORBIDDEN, "Cannot invite this user")
 
             block_invite_result: tuple[Codes, dict] | None = None
 
             if (
-                self._server_notices_mxid is not None
-                and requester.user.to_string() == self._server_notices_mxid
+                effective_mxid is not None
+                and requester.user.to_string() == effective_mxid
             ):
                 # allow the server notices mxid to send invites
                 is_requester_admin = True
@@ -1025,9 +1028,10 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
 
             # Figure out whether the user is a server admin to determine whether they
             # should be able to bypass the spam checker.
+            effective_mxid = get_effective_server_notices_mxid(self._global_server_notices_mxid)
             if (
-                self._server_notices_mxid is not None
-                and requester.user.to_string() == self._server_notices_mxid
+                effective_mxid is not None
+                and requester.user.to_string() == effective_mxid
             ):
                 # allow the server notices mxid to join rooms
                 bypass_spam_checker = True

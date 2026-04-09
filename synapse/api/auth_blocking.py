@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from synapse.api.constants import LimitBlockingTypes, UserTypes
 from synapse.api.errors import Codes, ResourceLimitError
 from synapse.config.server import is_threepid_reserved
+from synapse.tenant_context import get_effective_server_notices_mxid
 from synapse.types import Requester
 
 if TYPE_CHECKING:
@@ -37,7 +38,7 @@ class AuthBlocking:
     def __init__(self, hs: "HomeServer"):
         self.store = hs.get_datastores().main
 
-        self._server_notices_mxid = hs.config.servernotices.server_notices_mxid
+        self._global_server_notices_mxid = hs.config.servernotices.server_notices_mxid
         self._hs_disabled = hs.config.server.hs_disabled
         self._hs_disabled_message = hs.config.server.hs_disabled_message
         self._admin_contact = hs.config.server.admin_contact
@@ -98,7 +99,8 @@ class AuthBlocking:
         # Never fail an auth check for the server notices users or support user
         # This can be a problem where event creation is prohibited due to blocking
         if user_id is not None:
-            if user_id == self._server_notices_mxid:
+            effective_mxid = get_effective_server_notices_mxid(self._global_server_notices_mxid)
+            if user_id == effective_mxid:
                 return
             if await self.store.is_support_user(user_id):
                 return

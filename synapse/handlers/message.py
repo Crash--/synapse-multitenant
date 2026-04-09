@@ -80,6 +80,7 @@ from synapse.types import (
     create_requester,
 )
 from synapse.tenant_background import run_as_background_process_per_tenant
+from synapse.tenant_context import get_effective_server_notices_mxid
 from synapse.types.state import StateFilter
 from synapse.util import log_failure, unwrapFirstError
 from synapse.util.async_helpers import Linearizer, gather_results
@@ -844,10 +845,10 @@ class EventCreationHandler:
         user = UserID.from_string(user_id)
 
         # exempt the system notices user
-        if (
-            self.config.servernotices.server_notices_mxid is not None
-            and user_id == self.config.servernotices.server_notices_mxid
-        ):
+        effective_mxid = get_effective_server_notices_mxid(
+            self.config.servernotices.server_notices_mxid
+        )
+        if effective_mxid is not None and user_id == effective_mxid:
             return
 
         u = await self.store.get_user_by_id(user_id)

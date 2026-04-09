@@ -57,7 +57,7 @@ from synapse.replication.http.register import (
 from synapse.spam_checker_api import RegistrationBehaviour
 from synapse.types import GUEST_USER_ID_PATTERN, RoomAlias, UserID, create_requester
 from synapse.types.state import StateFilter
-from synapse.tenant_context import get_current_tenant
+from synapse.tenant_context import get_current_tenant, get_effective_server_notices_mxid
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -127,7 +127,7 @@ class RegistrationHandler:
         self.macaroon_gen = hs.get_macaroon_generator()
         self._account_validity_handler = hs.get_account_validity_handler()
         self._user_consent_version = self.hs.config.consent.user_consent_version
-        self._server_notices_mxid = hs.config.servernotices.server_notices_mxid
+        self._global_server_notices_mxid = hs.config.servernotices.server_notices_mxid
         self._user_types_config = hs.config.user_types
 
         self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker
@@ -697,8 +697,9 @@ class RegistrationHandler:
         self, user_id: str, allowed_appservice: ApplicationService | None = None
     ) -> None:
         # don't allow people to register the server notices mxid
-        if self._server_notices_mxid is not None:
-            if user_id == self._server_notices_mxid:
+        effective_mxid = get_effective_server_notices_mxid(self._global_server_notices_mxid)
+        if effective_mxid is not None:
+            if user_id == effective_mxid:
                 raise SynapseError(
                     400, "This user ID is reserved.", errcode=Codes.EXCLUSIVE
                 )

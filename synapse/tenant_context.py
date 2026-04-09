@@ -162,6 +162,16 @@ def is_multi_tenant_context() -> bool:
     return _current_tenant.get() is not None
 
 
+def get_effective_server_notices_mxid(
+    global_mxid: str | None,
+) -> str | None:
+    """Return the server_notices MXID for the current tenant, or the global fallback."""
+    tenant = get_current_tenant()
+    if tenant:
+        return tenant.effective_server_notices_mxid
+    return global_mxid
+
+
 class TenantContextMiddleware:
     """Middleware helper for managing tenant context in request handlers.
 
