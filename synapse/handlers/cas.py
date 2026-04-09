@@ -30,6 +30,7 @@ from twisted.web.client import PartialDownloadError
 from synapse.api.errors import HttpResponseException
 from synapse.handlers.sso import MappingException, UserAttributes
 from synapse.http.site import SynapseRequest
+from synapse.tenant_context import get_current_tenant
 from synapse.types import UserID, map_username_to_mxid_localpart
 
 if TYPE_CHECKING:
@@ -72,14 +73,14 @@ class CasHandler:
         self._auth_handler = hs.get_auth_handler()
         self._registration_handler = hs.get_registration_handler()
 
-        self._cas_server_url = hs.config.cas.cas_server_url
-        self._cas_service_url = hs.config.cas.cas_service_url
-        self._cas_protocol_version = hs.config.cas.cas_protocol_version
-        self._cas_displayname_attribute = hs.config.cas.cas_displayname_attribute
-        self._cas_required_attributes = hs.config.cas.cas_required_attributes
-        self._cas_enable_registration = hs.config.cas.cas_enable_registration
-        self._cas_allow_numeric_ids = hs.config.cas.cas_allow_numeric_ids
-        self._cas_numeric_ids_prefix = hs.config.cas.cas_numeric_ids_prefix
+        self._global_cas_server_url = hs.config.cas.cas_server_url
+        self._global_cas_service_url = hs.config.cas.cas_service_url
+        self._global_cas_protocol_version = hs.config.cas.cas_protocol_version
+        self._global_cas_displayname_attribute = hs.config.cas.cas_displayname_attribute
+        self._global_cas_required_attributes = hs.config.cas.cas_required_attributes
+        self._global_cas_enable_registration = hs.config.cas.cas_enable_registration
+        self._global_cas_allow_numeric_ids = hs.config.cas.cas_allow_numeric_ids
+        self._global_cas_numeric_ids_prefix = hs.config.cas.cas_numeric_ids_prefix
 
         self._http_client = hs.get_proxied_http_client()
 
@@ -87,17 +88,90 @@ class CasHandler:
         self.idp_id = "cas"
 
         # user-facing name of this auth provider
-        self.idp_name = hs.config.cas.idp_name
+        self._global_idp_name = hs.config.cas.idp_name
 
         # MXC URI for icon for this auth provider
-        self.idp_icon = hs.config.cas.idp_icon
+        self._global_idp_icon = hs.config.cas.idp_icon
 
         # optional brand identifier for this auth provider
-        self.idp_brand = hs.config.cas.idp_brand
+        self._global_idp_brand = hs.config.cas.idp_brand
 
         self._sso_handler = hs.get_sso_handler()
 
         self._sso_handler.register_identity_provider(self)
+
+    # --- Tenant-aware config resolvers ---
+
+    @property
+    def idp_name(self) -> str:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.idp_name
+        return self._global_idp_name
+
+    @property
+    def idp_icon(self) -> str | None:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.idp_icon
+        return self._global_idp_icon
+
+    @property
+    def idp_brand(self) -> str | None:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.idp_brand
+        return self._global_idp_brand
+
+    def _get_cas_server_url(self) -> str:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.server_url
+        return self._global_cas_server_url
+
+    def _get_cas_service_url(self) -> str | None:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.effective_public_baseurl + "_matrix/client/r0/login/cas/ticket"
+        return self._global_cas_service_url
+
+    def _get_cas_protocol_version(self) -> int | None:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.protocol_version
+        return self._global_cas_protocol_version
+
+    def _get_cas_displayname_attribute(self) -> str | None:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.displayname_attribute
+        return self._global_cas_displayname_attribute
+
+    def _get_cas_required_attributes(self) -> dict:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.required_attributes
+        return self._global_cas_required_attributes
+
+    def _get_cas_enable_registration(self) -> bool:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.enable_registration
+        return self._global_cas_enable_registration
+
+    def _get_cas_allow_numeric_ids(self) -> bool:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.allow_numeric_ids
+        return self._global_cas_allow_numeric_ids
+
+    def _get_cas_numeric_ids_prefix(self) -> str:
+        tenant = get_current_tenant()
+        if tenant and tenant.cas:
+            return tenant.cas.numeric_ids_prefix
+        return self._global_cas_numeric_ids_prefix
+
+    # --- End tenant-aware config resolvers ---
 
     def _build_service_param(self, args: dict[str, str]) -> str:
         """
@@ -111,7 +185,7 @@ class CasHandler:
             The URL to use as a "service" parameter.
         """
         return "%s?%s" % (
-            self._cas_service_url,
+            self._get_cas_service_url(),
             urllib.parse.urlencode(args),
         )
 
@@ -132,10 +206,10 @@ class CasHandler:
         Returns:
             The parsed CAS response.
         """
-        if self._cas_protocol_version == 3:
-            uri = self._cas_server_url + "/p3/proxyValidate"
+        if self._get_cas_protocol_version() == 3:
+            uri = self._get_cas_server_url() + "/p3/proxyValidate"
         else:
-            uri = self._cas_server_url + "/proxyValidate"
+            uri = self._get_cas_server_url() + "/proxyValidate"
         args = {
             "ticket": ticket,
             "service": self._build_service_param(service_args),
@@ -191,8 +265,8 @@ class CasHandler:
             if child.tag.endswith("user"):
                 user = child.text
                 # if numeric user IDs are allowed and username is numeric then we add the prefix so Synapse can handle it
-                if self._cas_allow_numeric_ids and user is not None and user.isdigit():
-                    user = f"{self._cas_numeric_ids_prefix}{user}"
+                if self._get_cas_allow_numeric_ids() and user is not None and user.isdigit():
+                    user = f"{self._get_cas_numeric_ids_prefix()}{user}"
             if child.tag.endswith("attributes"):
                 for attribute in child:
                     # ElementTree library expands the namespace in
@@ -239,7 +313,7 @@ class CasHandler:
             {"service": self._build_service_param(service_args)}
         )
 
-        return "%s/login?%s" % (self._cas_server_url, args)
+        return "%s/login?%s" % (self._get_cas_server_url(), args)
 
     async def handle_ticket(
         self,
@@ -327,7 +401,7 @@ class CasHandler:
         # Ensure that the attributes of the logged in user meet the required
         # attributes.
         if not self._sso_handler.check_required_attributes(
-            request, cas_response.attributes, self._cas_required_attributes
+            request, cas_response.attributes, self._get_cas_required_attributes()
         ):
             return
 
@@ -378,7 +452,7 @@ class CasHandler:
 
             # Arbitrarily use the first attribute found.
             display_name = cas_response.attributes.get(
-                self._cas_displayname_attribute,  # type: ignore[arg-type]
+                self._get_cas_displayname_attribute(),  # type: ignore[arg-type]
                 [None],
             )[0]
 
@@ -409,5 +483,5 @@ class CasHandler:
             client_redirect_url,
             cas_response_to_user_attributes,
             grandfather_existing_users,
-            registration_enabled=self._cas_enable_registration,
+            registration_enabled=self._get_cas_enable_registration(),
         )
