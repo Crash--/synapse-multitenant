@@ -67,7 +67,8 @@ class TenantRegistry:
             multi_tenant_config: The multi-tenant configuration from Synapse config.
         """
         self._config = multi_tenant_config
-        self._tenants = multi_tenant_config.tenants
+        self._tenants = dict(multi_tenant_config.tenants)
+        self._inactive_tenants: set[str] = set()
         self._signing_keys: dict[str, list] = {}
         self._hostname_aliases: dict[str, str] = {}
 
@@ -88,6 +89,71 @@ class TenantRegistry:
         """The default database schema for shared data."""
         return self._config.default_schema
 
+    def reload(
+        self, new_config: MultiTenantConfig
+    ) -> dict[str, list[str]]:
+        """Reload the registry with a new configuration.
+
+        Performs an in-place update so cached references (e.g. via
+        ``@cache_in_self`` on ``HomeServer``) remain valid.
+
+        - Tenants present in new_config but not currently active are added
+          (and reactivated if previously inactive).
+        - Tenants absent from new_config become inactive.
+        - Unchanged tenants keep their existing state.
+
+        Args:
+            new_config: The new multi-tenant configuration.
+
+        Returns:
+            A dict with ``added``, ``removed``, and ``unchanged`` lists
+            of server names.
+        """
+        new_names = set(new_config.tenants.keys())
+        old_active = set(self._tenants.keys()) - self._inactive_tenants
+
+        added: list[str] = []
+        removed: list[str] = []
+        unchanged: list[str] = []
+
+        # Determine added / reactivated tenants
+        for name in sorted(new_names):
+            if name in old_active:
+                # Update the config in place for unchanged tenants
+                self._tenants[name] = new_config.tenants[name]
+                unchanged.append(name)
+            else:
+                # New or reactivated
+                self._tenants[name] = new_config.tenants[name]
+                self._inactive_tenants.discard(name)
+                self._signing_keys.pop(name, None)
+                added.append(name)
+
+        # Determine removed tenants
+        for name in sorted(old_active - new_names):
+            self._inactive_tenants.add(name)
+            removed.append(name)
+
+        logger.info(
+            "Tenant registry reloaded: added=%s removed=%s unchanged=%s",
+            added,
+            removed,
+            unchanged,
+        )
+
+        return {"added": added, "removed": removed, "unchanged": unchanged}
+
+    def is_inactive(self, server_name: str) -> bool:
+        """Check if a tenant is inactive (removed via reload).
+
+        Args:
+            server_name: The server name to check.
+
+        Returns:
+            True if the tenant exists but is inactive, False otherwise.
+        """
+        return server_name in self._inactive_tenants
+
     def get_tenant(self, server_name: str) -> TenantConfig | None:
         """Get the tenant configuration for a given server name.
 
@@ -95,8 +161,11 @@ class TenantRegistry:
             server_name: The Matrix server name to look up.
 
         Returns:
-            The TenantConfig if found, None otherwise.
+            The TenantConfig if found and active, None otherwise.
         """
+        if server_name in self._inactive_tenants:
+            return None
+
         # First check direct mapping
         tenant = self._tenants.get(server_name)
         if tenant:
@@ -104,7 +173,7 @@ class TenantRegistry:
 
         # Check hostname aliases
         aliased_name = self._hostname_aliases.get(server_name)
-        if aliased_name:
+        if aliased_name and aliased_name not in self._inactive_tenants:
             return self._tenants.get(aliased_name)
 
         return None
@@ -127,20 +196,28 @@ class TenantRegistry:
         return tenant
 
     def get_all_tenants(self) -> list[TenantConfig]:
-        """Get all configured tenants.
+        """Get all configured active tenants.
 
         Returns:
-            List of all TenantConfig instances.
+            List of all active TenantConfig instances.
         """
-        return list(self._tenants.values())
+        return [
+            t
+            for name, t in self._tenants.items()
+            if name not in self._inactive_tenants
+        ]
 
     def get_all_server_names(self) -> list[str]:
-        """Get all configured server names.
+        """Get all configured active server names.
 
         Returns:
-            List of all tenant server names.
+            List of all active tenant server names.
         """
-        return list(self._tenants.keys())
+        return [
+            name
+            for name in self._tenants.keys()
+            if name not in self._inactive_tenants
+        ]
 
     def is_local_server_name(self, server_name: str) -> bool:
         """Check if a server name belongs to a local tenant.
@@ -154,7 +231,14 @@ class TenantRegistry:
         Returns:
             True if the server name is a local tenant, False otherwise.
         """
-        return server_name in self._tenants or server_name in self._hostname_aliases
+        if server_name in self._inactive_tenants:
+            return False
+        if server_name in self._tenants:
+            return True
+        aliased = self._hostname_aliases.get(server_name)
+        if aliased and aliased not in self._inactive_tenants:
+            return True
+        return False
 
     def add_hostname_alias(self, alias: str, server_name: str) -> None:
         """Add a hostname alias for a tenant.
