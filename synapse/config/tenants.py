@@ -32,6 +32,49 @@ logger = logging.getLogger(__name__)
 
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)
+class TenantEmailConfig:
+    """Per-tenant email/SMTP configuration.
+
+    When present on a TenantConfig, fully replaces the global email
+    config for that tenant (no field-level merge).
+    """
+
+    notif_from: str
+    smtp_host: str = "localhost"
+    smtp_port: int = 25  # overridden to 465 by from_dict when force_tls
+    smtp_user: str | None = None
+    smtp_pass: str | None = None
+    require_transport_security: bool = False
+    enable_tls: bool = True
+    force_tls: bool = False
+    tlsname: str | None = None
+    app_name: str = "Matrix"
+    riot_base_url: str | None = None
+    notif_delay_before_mail_ms: int = 300_000  # 5 minutes default
+
+    @classmethod
+    def from_dict(cls, d: "JsonDict") -> "TenantEmailConfig":
+        force_tls = d.get("force_tls", False)
+        default_port = 465 if force_tls else 25
+        return cls(
+            notif_from=d["notif_from"],
+            smtp_host=d.get("smtp_host", "localhost"),
+            smtp_port=d.get("smtp_port", default_port),
+            smtp_user=d.get("smtp_user"),
+            smtp_pass=d.get("smtp_pass"),
+            require_transport_security=d.get("require_transport_security", False),
+            enable_tls=d.get("enable_tls", True),
+            force_tls=force_tls,
+            tlsname=d.get("tlsname"),
+            app_name=d.get("app_name", "Matrix"),
+            riot_base_url=d.get("riot_base_url"),
+            notif_delay_before_mail_ms=d.get(
+                "notif_delay_before_mail_ms", 300_000
+            ),
+        )
+
+
+@attr.s(auto_attribs=True, slots=True, frozen=True)
 class TenantConfig:
     """Configuration for a single tenant in a multi-tenant deployment.
 
@@ -79,6 +122,10 @@ class TenantConfig:
     # falls back to the conventional `@notices:{server_name}` form so
     # MXIDs always live on the sending tenant's domain.
     server_notices_mxid: str | None = None
+    # Per-tenant email/SMTP configuration. When set, fully replaces the
+    # global email config for this tenant (no field-level merge). When
+    # None, the tenant inherits the global email config unchanged.
+    email: TenantEmailConfig | None = None
 
     @property
     def effective_public_baseurl(self) -> str:
@@ -148,6 +195,9 @@ class TenantConfig:
         default_media_path = f"{base_path}/media_store/{server_name}"
         media_store_path = config.get("media_store_path", default_media_path)
 
+        email_dict = config.get("email")
+        email_cfg = TenantEmailConfig.from_dict(email_dict) if email_dict else None
+
         return cls(
             server_name=server_name,
             database_schema=database_schema,
@@ -163,6 +213,7 @@ class TenantConfig:
             public_baseurl=config.get("public_baseurl"),
             identity_server=config.get("identity_server"),
             server_notices_mxid=config.get("server_notices_mxid"),
+            email=email_cfg,
         )
 
 
