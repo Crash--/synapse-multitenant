@@ -25,7 +25,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from synapse.api.errors import AuthError, Codes, LimitExceededError, SynapseError
-from synapse.api.ratelimiting import Ratelimiter
+from synapse.tenant_context import get_current_tenant
 from synapse.handlers.presence import format_user_presence_state
 from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
@@ -52,11 +52,7 @@ class PresenceStatusRestServlet(RestServlet):
         self.store = hs.get_datastores().main
 
         # Ratelimiter for presence updates, keyed by requester.
-        self._presence_per_user_limiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_presence_per_user,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str
@@ -93,7 +89,7 @@ class PresenceStatusRestServlet(RestServlet):
 
         # ignore the presence update if the ratelimit is exceeded
         try:
-            await self._presence_per_user_limiter.ratelimit(requester)
+            await self._tenant_rl_registry.get("rc_presence_per_user", get_current_tenant()).ratelimit(requester)
         except LimitExceededError as e:
             logger.debug("User presence ratelimit exceeded; ignoring it.")
             return 429, {

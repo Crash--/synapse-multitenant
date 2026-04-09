@@ -24,7 +24,7 @@ import re
 from typing import TYPE_CHECKING
 
 from synapse.api.errors import LimitExceededError
-from synapse.api.ratelimiting import Ratelimiter
+from synapse.tenant_context import get_current_tenant
 from synapse.http.server import respond_with_json
 from synapse.http.servlet import RestServlet
 from synapse.http.site import SynapseRequest
@@ -48,17 +48,13 @@ class CreateResource(RestServlet):
         self.max_pending_media_uploads = hs.config.media.max_pending_media_uploads
 
         # A rate limiter for creating new media IDs.
-        self._create_media_rate_limiter = Ratelimiter(
-            store=hs.get_datastores().main,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_media_create,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
     async def on_POST(self, request: SynapseRequest) -> None:
         requester = await self.auth.get_user_by_req(request)
 
         # If the create media requests for the user are over the limit, drop them.
-        await self._create_media_rate_limiter.ratelimit(requester)
+        await self._tenant_rl_registry.get("rc_media_create", get_current_tenant()).ratelimit(requester)
 
         if not requester.app_service or requester.app_service.is_rate_limited():
             (

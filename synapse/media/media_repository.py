@@ -43,6 +43,7 @@ from synapse.api.errors import (
     cs_error,
 )
 from synapse.api.ratelimiting import Ratelimiter
+from synapse.tenant_context import get_current_tenant
 from synapse.config.repository import ThumbnailRequirement
 from synapse.http.server import respond_with_json
 from synapse.http.site import SynapseRequest
@@ -121,11 +122,7 @@ class MediaRepository:
         )
         self.prevent_media_downloads_from = hs.config.media.prevent_media_downloads_from
 
-        self.download_ratelimiter = Ratelimiter(
-            store=hs.get_storage_controllers().main,
-            clock=hs.get_clock(),
-            cfg=hs.config.ratelimiting.remote_media_downloads,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
         # List of StorageProviders where we should search for media and
         # potentially upload to.
@@ -632,7 +629,7 @@ class MediaRepository:
                 server_name,
                 media_id,
                 max_timeout_ms,
-                self.download_ratelimiter,
+                self._tenant_rl_registry.get("remote_media_downloads", get_current_tenant()),
                 ip_address,
                 use_federation_endpoint,
                 allow_authenticated,
@@ -703,7 +700,7 @@ class MediaRepository:
                 server_name,
                 media_id,
                 max_timeout_ms,
-                self.download_ratelimiter,
+                self._tenant_rl_registry.get("remote_media_downloads", get_current_tenant()),
                 ip_address,
                 use_federation,
                 allow_authenticated,

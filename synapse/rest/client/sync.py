@@ -29,7 +29,7 @@ from synapse.api.constants import AccountDataTypes, EduTypes, Membership, Presen
 from synapse.api.errors import Codes, StoreError, SynapseError
 from synapse.api.filtering import FilterCollection
 from synapse.api.presence import UserPresenceState
-from synapse.api.ratelimiting import Ratelimiter
+from synapse.tenant_context import get_current_tenant
 from synapse.events.utils import (
     SerializeEventConfig,
     format_event_for_client_v2_without_room_id,
@@ -132,11 +132,7 @@ class SyncRestServlet(RestServlet):
         )
 
         # Ratelimiter for presence updates, keyed by requester.
-        self._presence_per_user_limiter = Ratelimiter(
-            store=self.store,
-            clock=self.clock,
-            cfg=hs.config.ratelimiting.rc_presence_per_user,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
     async def on_GET(self, request: SynapseRequest) -> tuple[int, JsonDict]:
         # This will always be set by the time Twisted calls us.
@@ -252,7 +248,7 @@ class SyncRestServlet(RestServlet):
         await self._server_notices_sender.on_user_syncing(user.to_string())
 
         # ignore the presence update if the ratelimit is exceeded but do not pause the request
-        allowed, _ = await self._presence_per_user_limiter.can_do_action(requester)
+        allowed, _ = await self._tenant_rl_registry.get("rc_presence_per_user", get_current_tenant()).can_do_action(requester)
         if not allowed:
             affect_presence = False
             logger.debug("User set_presence ratelimit exceeded; ignoring it.")

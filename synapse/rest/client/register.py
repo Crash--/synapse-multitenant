@@ -41,7 +41,7 @@ from synapse.api.errors import (
     ThreepidValidationError,
     UnrecognizedRequestError,
 )
-from synapse.api.ratelimiting import Ratelimiter
+from synapse.tenant_context import get_current_tenant
 from synapse.config import ConfigError
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.ratelimiting import FederationRatelimitSettings
@@ -401,14 +401,10 @@ class RegistrationTokenValidityRestServlet(RestServlet):
         super().__init__()
         self.hs = hs
         self.store = hs.get_datastores().main
-        self.ratelimiter = Ratelimiter(
-            store=self.store,
-            clock=hs.get_clock(),
-            cfg=hs.config.ratelimiting.rc_registration_token_validity,
-        )
+        self._tenant_rl_registry = hs.get_tenant_ratelimiter_registry()
 
     async def on_GET(self, request: Request) -> tuple[int, JsonDict]:
-        await self.ratelimiter.ratelimit(None, (request.getClientAddress().host,))
+        await self._tenant_rl_registry.get("rc_registration_token_validity", get_current_tenant()).ratelimit(None, (request.getClientAddress().host,))
 
         if not self.hs.config.registration.enable_registration:
             raise SynapseError(
