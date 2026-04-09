@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Optional
 
 from prometheus_client import Counter
 
+from synapse.tenant_context import get_current_tenant
+
 from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 from twisted.internet.interfaces import IDelayedCall
 
@@ -122,12 +124,13 @@ class HttpPusher(Pusher):
         self.failing_since = pusher_config.failing_since
         self.timed_call: Optional[IDelayedCall] = None
         self._is_processing = False
-        self._group_unread_count_by_room = (
+        self._global_group_unread_count_by_room = (
             hs.config.push.push_group_unread_count_by_room
         )
         self._pusherpool = hs.get_pusherpool()
 
-        self.push_jitter_delay_ms = hs.config.push.push_jitter_delay_ms
+        self._global_push_jitter_delay_ms = hs.config.push.push_jitter_delay_ms
+        self._global_push_include_content = hs.config.push.push_include_content
 
         self.data = pusher_config.data
         if self.data is None:
@@ -166,6 +169,24 @@ class HttpPusher(Pusher):
         del self.data_minus_url["url"]
         self.badge_count_last_call: int | None = None
 
+    def _get_push_include_content(self) -> bool:
+        tenant = get_current_tenant()
+        if tenant and tenant.push:
+            return tenant.push.include_content
+        return self._global_push_include_content
+
+    def _get_push_jitter_delay_ms(self) -> Optional[int]:
+        tenant = get_current_tenant()
+        if tenant and tenant.push:
+            return tenant.push.jitter_delay_ms
+        return self._global_push_jitter_delay_ms
+
+    def _get_group_unread_count_by_room(self) -> bool:
+        tenant = get_current_tenant()
+        if tenant and tenant.push:
+            return tenant.push.group_unread_count_by_room
+        return self._global_group_unread_count_by_room
+
     def on_started(self, should_check_for_notifs: bool) -> None:
         """Called when this pusher has been started.
 
@@ -192,7 +213,7 @@ class HttpPusher(Pusher):
         badge = await push_tools.get_badge_count(
             self.hs.get_datastores().main,
             self.user_id,
-            group_by_room=self._group_unread_count_by_room,
+            group_by_room=self._get_group_unread_count_by_room(),
         )
         if self.badge_count_last_call is None or self.badge_count_last_call != badge:
             self.badge_count_last_call = badge
@@ -353,7 +374,7 @@ class HttpPusher(Pusher):
         badge = await push_tools.get_badge_count(
             self.hs.get_datastores().main,
             self.user_id,
-            group_by_room=self._group_unread_count_by_room,
+            group_by_room=self._get_group_unread_count_by_room(),
         )
 
         event = await self.store.get_event(push_action.event_id, allow_none=True)
@@ -368,8 +389,9 @@ class HttpPusher(Pusher):
         # at once. If we just slept the random amount each loop then the last
         # push notification in the set could be delayed by many times the max
         # delay.
-        if self.push_jitter_delay_ms:
-            delay_ms = random.randint(1, self.push_jitter_delay_ms)
+        push_jitter_delay_ms = self._get_push_jitter_delay_ms()
+        if push_jitter_delay_ms:
+            delay_ms = random.randint(1, push_jitter_delay_ms)
             diff_ms = event.origin_server_ts + delay_ms - self.clock.time_msec()
             if diff_ms > 0:
                 await self.clock.sleep(Duration(milliseconds=diff_ms))
@@ -511,7 +533,7 @@ class HttpPusher(Pusher):
             if event.type == "m.room.member" and event.is_state():
                 content["membership"] = event.content["membership"]
                 content["user_is_target"] = event.state_key == self.user_id
-            if self.hs.config.push.push_include_content and event.content:
+            if self._get_push_include_content() and event.content:
                 content["content"] = event.content
 
             # We no longer send aliases separately, instead, we send the human

@@ -59,6 +59,8 @@ from synapse.util.caches import register_cache
 from synapse.util.metrics import measure_func
 from synapse.visibility import filter_event_for_clients_with_state
 
+from synapse.tenant_context import get_current_tenant
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
@@ -135,7 +137,7 @@ class BulkPushRuleEvaluator:
         self.server_name = hs.hostname  # nb must be called this for @measure_func
         self.clock = hs.get_clock()  # nb must be called this for @measure_func
         self._event_auth_handler = hs.get_event_auth_handler()
-        self.should_calculate_push_rules = self.hs.config.push.enable_push
+        self._global_enable_push = self.hs.config.push.enable_push
 
         self._related_event_match_enabled = self.hs.config.experimental.msc3664_enabled
 
@@ -146,6 +148,13 @@ class BulkPushRuleEvaluator:
             resizable=False,
             server_name=self.server_name,
         )
+
+    @property
+    def should_calculate_push_rules(self) -> bool:
+        tenant = get_current_tenant()
+        if tenant and tenant.push:
+            return tenant.push.enabled
+        return self._global_enable_push
 
     async def _get_rules_for_event(
         self,
