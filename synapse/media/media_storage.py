@@ -58,6 +58,7 @@ from synapse.util.file_consumer import BackgroundFileConsumer
 from ..types import JsonDict
 from ._base import FileInfo, Responder, ThreadedFileSender
 from .filepath import MediaFilePaths
+from synapse.tenant_context import get_current_tenant
 
 if TYPE_CHECKING:
     from synapse.media.storage_provider import StorageProvider
@@ -178,6 +179,21 @@ class MediaStorage:
         self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker
         self.clock = hs.get_clock()
 
+    def _local_path(self, rel_path: str) -> str:
+        """Join local_media_directory with rel_path, inserting tenant prefix if active.
+
+        Args:
+            rel_path: Relative path from ``_file_info_to_path``.
+
+        Returns:
+            Absolute path under the (possibly tenant-scoped) local media directory.
+        """
+        base = self.local_media_directory
+        tenant = get_current_tenant()
+        if tenant is not None:
+            base = os.path.join(base, tenant.server_name)
+        return os.path.join(base, rel_path)
+
     @trace_with_opname("MediaStorage.store_file")
     async def store_file(self, source: IO, file_info: FileInfo) -> str:
         """Write `source` to the on disk media store, and also any other
@@ -229,7 +245,7 @@ class MediaStorage:
         is_temp_file = False
 
         if self.local_provider:
-            media_filepath = os.path.join(self.local_media_directory, path)  # type: ignore[arg-type]
+            media_filepath = self._local_path(path)
             os.makedirs(os.path.dirname(media_filepath), exist_ok=True)
 
             with start_active_span("writing to main media repo"):
@@ -291,7 +307,7 @@ class MediaStorage:
         if file_info.url_cache:
             path = self._file_info_to_path(file_info)
             if self.local_provider:
-                local_path = os.path.join(self.local_media_directory, path)  # type: ignore[arg-type]
+                local_path = self._local_path(path)
                 if os.path.isfile(local_path):
                     # Import here to avoid circular import
                     from .media_storage import FileResponder
@@ -355,7 +371,7 @@ class MediaStorage:
         """
         path = self._file_info_to_path(file_info)
         if self.local_provider:
-            local_path = os.path.join(self.local_media_directory, path)  # type: ignore[arg-type]
+            local_path = self._local_path(path)
             if os.path.exists(local_path):
                 yield local_path
                 return
@@ -370,10 +386,7 @@ class MediaStorage:
                     height=file_info.thumbnail.height,
                     content_type=file_info.thumbnail.type,
                 )
-                legacy_local_path = os.path.join(
-                    self.local_media_directory,  # type: ignore[arg-type]
-                    legacy_path,
-                )
+                legacy_local_path = self._local_path(legacy_path)
                 if os.path.exists(legacy_local_path):
                     yield legacy_local_path
                     return
