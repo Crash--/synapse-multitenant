@@ -230,6 +230,34 @@ class MultiTenantKeyring:
         """
         return server_name in self._signing_keys
 
+    def reload(self, registry: "TenantRegistry") -> None:
+        """Reload signing keys based on the current registry state.
+
+        Loads keys for any new tenants and removes keys for inactive ones.
+        """
+        self._registry = registry
+
+        active_names = set(t.server_name for t in registry.get_all_tenants())
+
+        # Load keys for new tenants
+        for tenant in registry.get_all_tenants():
+            if tenant.server_name not in self._signing_keys:
+                try:
+                    self._load_tenant_keys(tenant)
+                except Exception as e:
+                    logger.error(
+                        "Failed to load signing keys for tenant %s during reload: %s",
+                        tenant.server_name,
+                        e,
+                    )
+
+        # Remove keys for inactive tenants
+        for name in list(self._signing_keys.keys()):
+            if name not in active_names:
+                del self._signing_keys[name]
+                self._verify_keys.pop(name, None)
+                logger.info("Removed signing keys for inactive tenant: %s", name)
+
     def reload_tenant_keys(self, server_name: str) -> None:
         """Reload signing keys for a specific tenant.
 
