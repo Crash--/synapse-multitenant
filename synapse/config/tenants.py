@@ -75,6 +75,65 @@ class TenantEmailConfig:
 
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)
+class TenantOidcConfig:
+    """Per-tenant OIDC configuration.
+    Stores raw provider dicts that get parsed by _parse_oidc_provider_configs
+    at handler init time."""
+    providers: tuple = attr.Factory(tuple)
+
+    @classmethod
+    def from_list(cls, providers: list) -> "TenantOidcConfig":
+        return cls(providers=tuple(providers))
+
+
+@attr.s(auto_attribs=True, slots=True, frozen=True)
+class TenantCasConfig:
+    """Per-tenant CAS configuration."""
+    server_url: str
+    protocol_version: int | None = None
+    displayname_attribute: str | None = None
+    required_attributes: dict = attr.Factory(dict)
+    enable_registration: bool = True
+    allow_numeric_ids: bool = False
+    numeric_ids_prefix: str = "u"
+    idp_name: str = "CAS"
+    idp_icon: str | None = None
+    idp_brand: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: "JsonDict") -> "TenantCasConfig":
+        return cls(
+            server_url=d["server_url"],
+            protocol_version=d.get("protocol_version"),
+            displayname_attribute=d.get("displayname_attribute"),
+            required_attributes=d.get("required_attributes", {}),
+            enable_registration=d.get("enable_registration", True),
+            allow_numeric_ids=d.get("allow_numeric_ids", False),
+            numeric_ids_prefix=d.get("numeric_ids_prefix", "u"),
+            idp_name=d.get("idp_name", "CAS"),
+            idp_icon=d.get("idp_icon"),
+            idp_brand=d.get("idp_brand"),
+        )
+
+
+@attr.s(auto_attribs=True, slots=True, frozen=True)
+class TenantSamlConfig:
+    """Per-tenant SAML configuration. Minimal: stores IdP entity ID and session lifetime.
+    Full Saml2Config SP construction is deferred to handler init."""
+    idp_entityid: str | None = None
+    session_lifetime: str = "15m"
+    raw_config: dict = attr.Factory(dict)
+
+    @classmethod
+    def from_dict(cls, d: "JsonDict") -> "TenantSamlConfig":
+        return cls(
+            idp_entityid=d.get("idp_entityid"),
+            session_lifetime=d.get("session_lifetime", "15m"),
+            raw_config=dict(d),
+        )
+
+
+@attr.s(auto_attribs=True, slots=True, frozen=True)
 class TenantConfig:
     """Configuration for a single tenant in a multi-tenant deployment.
 
@@ -126,6 +185,12 @@ class TenantConfig:
     # global email config for this tenant (no field-level merge). When
     # None, the tenant inherits the global email config unchanged.
     email: TenantEmailConfig | None = None
+    # Per-tenant SSO configuration. When set, configures the respective
+    # SSO provider for this tenant. When None, the tenant inherits the
+    # global SSO config (or has no SSO if not configured globally).
+    oidc: TenantOidcConfig | None = None
+    cas: TenantCasConfig | None = None
+    saml: TenantSamlConfig | None = None
 
     @property
     def effective_public_baseurl(self) -> str:
@@ -198,6 +263,15 @@ class TenantConfig:
         email_dict = config.get("email")
         email_cfg = TenantEmailConfig.from_dict(email_dict) if email_dict else None
 
+        oidc_list = config.get("oidc_providers")
+        oidc_cfg = TenantOidcConfig.from_list(oidc_list) if oidc_list else None
+
+        cas_dict = config.get("cas")
+        cas_cfg = TenantCasConfig.from_dict(cas_dict) if cas_dict else None
+
+        saml_dict = config.get("saml")
+        saml_cfg = TenantSamlConfig.from_dict(saml_dict) if saml_dict else None
+
         return cls(
             server_name=server_name,
             database_schema=database_schema,
@@ -214,6 +288,9 @@ class TenantConfig:
             identity_server=config.get("identity_server"),
             server_notices_mxid=config.get("server_notices_mxid"),
             email=email_cfg,
+            oidc=oidc_cfg,
+            cas=cas_cfg,
+            saml=saml_cfg,
         )
 
 
