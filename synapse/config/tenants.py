@@ -152,6 +152,73 @@ class TenantPushConfig:
 
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)
+class TenantRatelimitConfig:
+    """Per-tenant rate-limit settings.
+
+    Each field is a RatelimitSettings or None. None means "inherit
+    the global RatelimitConfig value for this limiter".
+    """
+
+    rc_message: "RatelimitSettings | None" = None
+    rc_registration: "RatelimitSettings | None" = None
+    rc_registration_token_validity: "RatelimitSettings | None" = None
+    rc_login_address: "RatelimitSettings | None" = None
+    rc_login_account: "RatelimitSettings | None" = None
+    rc_login_failed_attempts: "RatelimitSettings | None" = None
+    rc_joins_local: "RatelimitSettings | None" = None
+    rc_joins_remote: "RatelimitSettings | None" = None
+    rc_joins_per_room: "RatelimitSettings | None" = None
+    rc_invites_per_room: "RatelimitSettings | None" = None
+    rc_invites_per_user: "RatelimitSettings | None" = None
+    rc_invites_per_issuer: "RatelimitSettings | None" = None
+    rc_third_party_invite: "RatelimitSettings | None" = None
+    rc_3pid_validation: "RatelimitSettings | None" = None
+    rc_media_create: "RatelimitSettings | None" = None
+    rc_presence_per_user: "RatelimitSettings | None" = None
+    rc_user_directory: "RatelimitSettings | None" = None
+
+    @classmethod
+    def from_dict(cls, d: "JsonDict") -> "TenantRatelimitConfig":
+        from synapse.config.ratelimiting import RatelimitSettings
+
+        def _parse(key: str) -> "RatelimitSettings | None":
+            rl_config = d
+            for part in key.split("."):
+                if not isinstance(rl_config, dict):
+                    return None
+                rl_config = rl_config.get(part)
+                if rl_config is None:
+                    return None
+            if not isinstance(rl_config, dict):
+                return None
+            return RatelimitSettings(
+                key=key,
+                per_second=float(rl_config.get("per_second", 0.17)),
+                burst_count=int(rl_config.get("burst_count", 3)),
+            )
+
+        return cls(
+            rc_message=_parse("rc_message"),
+            rc_registration=_parse("rc_registration"),
+            rc_registration_token_validity=_parse("rc_registration_token_validity"),
+            rc_login_address=_parse("rc_login.address"),
+            rc_login_account=_parse("rc_login.account"),
+            rc_login_failed_attempts=_parse("rc_login.failed_attempts"),
+            rc_joins_local=_parse("rc_joins.local"),
+            rc_joins_remote=_parse("rc_joins.remote"),
+            rc_joins_per_room=_parse("rc_joins_per_room"),
+            rc_invites_per_room=_parse("rc_invites.per_room"),
+            rc_invites_per_user=_parse("rc_invites.per_user"),
+            rc_invites_per_issuer=_parse("rc_invites.per_issuer"),
+            rc_third_party_invite=_parse("rc_third_party_invite"),
+            rc_3pid_validation=_parse("rc_3pid_validation"),
+            rc_media_create=_parse("rc_media_create"),
+            rc_presence_per_user=_parse("rc_presence.per_user"),
+            rc_user_directory=_parse("rc_user_directory"),
+        )
+
+
+@attr.s(auto_attribs=True, slots=True, frozen=True)
 class TenantConfig:
     """Configuration for a single tenant in a multi-tenant deployment.
 
@@ -210,6 +277,14 @@ class TenantConfig:
     cas: TenantCasConfig | None = None
     saml: TenantSamlConfig | None = None
     push: TenantPushConfig | None = None
+    # Per-tenant rate-limit overrides. When set, individual limiters
+    # override the corresponding global rc_* setting. When None, the
+    # tenant inherits all global rate limits unchanged.
+    ratelimit: TenantRatelimitConfig | None = None
+    # Per-tenant app service config file paths. When set, only these
+    # AS registrations apply to this tenant. When None, no app services
+    # are active for this tenant.
+    app_service_config_files: list[str] | None = None
 
     @property
     def effective_public_baseurl(self) -> str:
@@ -294,6 +369,14 @@ class TenantConfig:
         push_dict = config.get("push")
         push_cfg = TenantPushConfig.from_dict(push_dict) if push_dict is not None else None
 
+        ratelimit_dict = config.get("ratelimit")
+        ratelimit_cfg = (
+            TenantRatelimitConfig.from_dict(ratelimit_dict)
+            if ratelimit_dict
+            else None
+        )
+        as_config_files = config.get("app_service_config_files")
+
         return cls(
             server_name=server_name,
             database_schema=database_schema,
@@ -314,6 +397,8 @@ class TenantConfig:
             cas=cas_cfg,
             saml=saml_cfg,
             push=push_cfg,
+            ratelimit=ratelimit_cfg,
+            app_service_config_files=as_config_files,
         )
 
 
