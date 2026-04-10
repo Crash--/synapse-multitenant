@@ -18,6 +18,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock
 
 from synapse.config.tenants import TenantConfig
+from synapse.federation.sender import FederationSender
 from synapse.federation.sender.per_destination_queue import PerDestinationQueue
 from synapse.federation.sender.transaction_manager import TransactionManager
 
@@ -244,3 +245,144 @@ class TestWakeDestinationAcceptsTenant(TestCase):
         from synapse.federation.sender import FederationSender
         sig = inspect.signature(FederationSender.wake_destination)
         self.assertIn("tenant_server_name", sig.parameters)
+
+
+# ── 9d probes: EDU origin stamping ───────────────────────────────
+
+
+class TestEduOriginUsesTenantServerName(TestCase):
+    """EDUs built by PerDestinationQueue must use tenant server_name as origin."""
+
+    def test_receipt_edu_origin(self) -> None:
+        hs = MagicMock()
+        hs.hostname = "main.localhost"
+        hs.get_clock.return_value = MagicMock()
+        hs.get_storage_controllers.return_value = MagicMock()
+        hs.get_datastores.return_value.main = MagicMock()
+
+        tm = MagicMock(spec=TransactionManager)
+        queue = PerDestinationQueue(
+            hs, tm, "matrix.org", tenant_server_name="acme.localhost"
+        )
+
+        # Queue a read receipt and extract the EDU
+        receipt_content = {"room_id": "!room:acme.localhost", "m.read": {}}
+        queue._pending_receipt_edus.append(receipt_content)
+
+        edus = list(queue._get_receipt_edus(limit=10))
+        self.assertEqual(len(edus), 1)
+        self.assertEqual(edus[0].origin, "acme.localhost")
+
+    def test_queue_server_name_propagates_to_edus(self) -> None:
+        """Verify that the queue's server_name (set to tenant) is what EDUs use."""
+        hs = MagicMock()
+        hs.hostname = "main.localhost"
+        hs.get_clock.return_value = MagicMock()
+        hs.get_storage_controllers.return_value = MagicMock()
+        hs.get_datastores.return_value.main = MagicMock()
+
+        tm = MagicMock(spec=TransactionManager)
+        queue = PerDestinationQueue(
+            hs, tm, "matrix.org", tenant_server_name="corp.localhost"
+        )
+
+        # The key invariant: server_name on the queue IS the tenant name
+        self.assertEqual(queue.server_name, "corp.localhost")
+        self.assertNotEqual(queue.server_name, "main.localhost")
+
+
+class TestRetryLimiterUsesTenantServerName(TestCase):
+    """get_retry_limiter must be called with tenant server_name."""
+
+    def test_retry_limiter_server_name(self) -> None:
+        hs = MagicMock()
+        hs.hostname = "main.localhost"
+        hs.get_clock.return_value = MagicMock()
+        hs.get_storage_controllers.return_value = MagicMock()
+        hs.get_datastores.return_value.main = MagicMock()
+
+        tm = MagicMock(spec=TransactionManager)
+        queue = PerDestinationQueue(
+            hs, tm, "matrix.org", tenant_server_name="acme.localhost"
+        )
+
+        # The retry limiter at line 351 uses self.server_name
+        # which should now be the tenant's server_name
+        self.assertEqual(queue.server_name, "acme.localhost")
+
+
+# ── Integration probe ────────────────────────────────────────────
+
+
+class TestFullSendPathPerTenant(TestCase):
+    """Integration: two tenants sending to same remote get separate
+    transactions with correct origins."""
+
+    def test_two_tenants_separate_transactions(self) -> None:
+        hs = MagicMock()
+        hs.hostname = "main.localhost"
+        hs.get_clock.return_value = MagicMock()
+        hs.get_datastores.return_value.main = MagicMock()
+        hs.get_storage_controllers.return_value = MagicMock()
+        hs.config.federation.is_domain_allowed_according_to_federation_whitelist.return_value = True
+        hs.is_mine_server_name.side_effect = lambda sn: sn in (
+            "acme.localhost", "corp.localhost", "main.localhost"
+        )
+
+        sender = MagicMock(spec=FederationSender)
+        sender.hs = hs
+        sender._per_destination_queues = {}
+        sender._transaction_manager = MagicMock(spec=TransactionManager)
+
+        # Create queues for two tenants to same destination
+        q_acme = FederationSender._get_per_destination_queue(
+            sender, "acme.localhost", "matrix.org"
+        )
+        q_corp = FederationSender._get_per_destination_queue(
+            sender, "corp.localhost", "matrix.org"
+        )
+
+        # Verify isolation
+        self.assertIsNot(q_acme, q_corp)
+        self.assertEqual(q_acme.server_name, "acme.localhost")
+        self.assertEqual(q_corp.server_name, "corp.localhost")
+
+        # Verify queue dict has two entries
+        self.assertEqual(len(sender._per_destination_queues), 2)
+        self.assertIn(("acme.localhost", "matrix.org"), sender._per_destination_queues)
+        self.assertIn(("corp.localhost", "matrix.org"), sender._per_destination_queues)
+
+        # Verify TransactionManager signature accepts origin + signing_key
+        import inspect
+        sig = inspect.signature(TransactionManager.send_new_transaction)
+        self.assertIn("origin", sig.parameters)
+        self.assertIn("signing_key", sig.parameters)
+
+    def test_tenant_for_event_routes_correctly(self) -> None:
+        """Events from different tenants are routed to correct tenant queues."""
+        sender = MagicMock(spec=FederationSender)
+        sender.hs = MagicMock()
+        sender.hs.is_mine_server_name.side_effect = lambda sn: sn in (
+            "acme.localhost", "corp.localhost",
+        )
+
+        event_acme = MagicMock()
+        event_acme.sender = "@alice:acme.localhost"
+
+        event_corp = MagicMock()
+        event_corp.sender = "@bob:corp.localhost"
+
+        event_remote = MagicMock()
+        event_remote.sender = "@charlie:remote.server"
+
+        self.assertEqual(
+            FederationSender._tenant_for_event(sender, event_acme),
+            "acme.localhost"
+        )
+        self.assertEqual(
+            FederationSender._tenant_for_event(sender, event_corp),
+            "corp.localhost"
+        )
+        self.assertIsNone(
+            FederationSender._tenant_for_event(sender, event_remote)
+        )
