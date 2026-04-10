@@ -12,7 +12,7 @@
 # =============
 # 1. /etc/hosts entries so the tenant domains resolve to localhost:
 #
-#        127.0.0.1 matrix.tenant-a.com matrix.tenant-b.com
+#        127.0.0.1 matrix.tenant-a.com matrix.tenant-b.com matrix.tenant-c.com matrix.tenant-d.com
 #
 # 2. Nothing else listening on ports 80 / 443. The larger
 #    `docker-multitenant/` dev rig binds port 80 by default — stop its
@@ -27,16 +27,26 @@
 #     mkdir -p certs
 #     mkcert -cert-file certs/tenants.crt \
 #            -key-file  certs/tenants.key \
-#            matrix.tenant-a.com matrix.tenant-b.com
+#            matrix.tenant-a.com matrix.tenant-b.com matrix.tenant-c.com matrix.tenant-d.com
 #
 # Traefik's file provider (`traefik/dynamic.yml`) will pick the cert up
 # automatically on the next restart. Without it Traefik falls back to
 # its built-in self-signed cert and the browser will warn once.
 #
+# Build the image
+# ===============
+# From the repo root (uses the standard Synapse Dockerfile — our fork's
+# synapse/ directory already contains all multi-tenant patches):
+#
+#     DOCKER_BUILDKIT=1 docker build -t synapse:multi-tenant -f docker/Dockerfile .
+#
 # Bring up
 # ========
-#     docker compose up -d --build
+#     docker compose up -d
 #     docker compose logs -f synapse
+#
+# Run smoke tests (phases 1-6):
+#     docker compose run test
 #
 # Tear down (wipes all state — Postgres runs on tmpfs):
 #     docker compose down
@@ -89,8 +99,8 @@ services:
   keygen:
     build:
       context: ..
-      dockerfile: docker-multitenant/Dockerfile.real
-    image: synapse-multitenant:latest
+      dockerfile: docker/Dockerfile
+    image: synapse:multi-tenant
     container_name: synapse-demo-keygen
     user: root
     volumes:
@@ -98,13 +108,13 @@ services:
       - ./scripts:/scripts:ro
     environment:
       KEYS_DIR: "/keys"
-      TENANTS: "localhost,matrix.tenant-a.com,matrix.tenant-b.com"
+      TENANTS: "localhost,matrix.tenant-a.com,matrix.tenant-b.com,matrix.tenant-c.com,matrix.tenant-d.com"
     entrypoint: ["python3", "/scripts/generate_keys.py"]
     networks:
       - synapse-demo-net
 
   init-schemas:
-    image: synapse-multitenant:latest
+    image: synapse:multi-tenant
     container_name: synapse-demo-init-schemas
     depends_on:
       postgres:
@@ -119,14 +129,14 @@ services:
       POSTGRES_USER: synapse
       POSTGRES_PASSWORD: synapse_password
       POSTGRES_DB: synapse_demo
-      TENANTS: "matrix.tenant-a.com,matrix.tenant-b.com"
+      TENANTS: "matrix.tenant-a.com,matrix.tenant-b.com,matrix.tenant-c.com,matrix.tenant-d.com"
     entrypoint: ["python3", "/scripts/init_schemas.py"]
     networks:
       - synapse-demo-net
 
   # --- Synapse -------------------------------------------------------
   synapse:
-    image: synapse-multitenant:latest
+    image: synapse:multi-tenant
     container_name: synapse-demo-server
     depends_on:
       postgres:
@@ -139,46 +149,22 @@ services:
         condition: service_started
     environment:
       SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+      # Skip tenant schema isolation check on first boot — copy-schemas
+      # clones the tables after Synapse creates them in public.
+      SYNAPSE_SKIP_TENANT_ISOLATION_CHECK: "1"
     volumes:
       - ./config:/data:ro
       - ./data/keys:/keys:ro
       - ./data/media:/media
-      # Hot-overlay every multi-tenant Python file from the local
-      # source tree, so editing one of them + `docker compose restart
-      # synapse` is the full inner loop — no rebuild.
-      - ../synapse/tenant_context.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_context.py:ro
-      - ../synapse/tenant_registry.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_registry.py:ro
-      - ../synapse/tenant_background.py:/usr/local/lib/python3.13/site-packages/synapse/tenant_background.py:ro
-      - ../synapse/config/tenants.py:/usr/local/lib/python3.13/site-packages/synapse/config/tenants.py:ro
-      - ../synapse/config/homeserver.py:/usr/local/lib/python3.13/site-packages/synapse/config/homeserver.py:ro
-      - ../synapse/http/site.py:/usr/local/lib/python3.13/site-packages/synapse/http/site.py:ro
-      - ../synapse/storage/database.py:/usr/local/lib/python3.13/site-packages/synapse/storage/database.py:ro
-      - ../synapse/storage/databases/main/__init__.py:/usr/local/lib/python3.13/site-packages/synapse/storage/databases/main/__init__.py:ro
-      - ../synapse/server.py:/usr/local/lib/python3.13/site-packages/synapse/server.py:ro
-      - ../synapse/events/builder.py:/usr/local/lib/python3.13/site-packages/synapse/events/builder.py:ro
-      - ../synapse/media/multitenant_filepath.py:/usr/local/lib/python3.13/site-packages/synapse/media/multitenant_filepath.py:ro
-      - ../synapse/crypto/multitenant_keyring.py:/usr/local/lib/python3.13/site-packages/synapse/crypto/multitenant_keyring.py:ro
-      - ../synapse/rest/well_known.py:/usr/local/lib/python3.13/site-packages/synapse/rest/well_known.py:ro
-      - ../synapse/rest/client/login.py:/usr/local/lib/python3.13/site-packages/synapse/rest/client/login.py:ro
-      - ../synapse/handlers/auth.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/auth.py:ro
-      - ../synapse/handlers/register.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/register.py:ro
-      - ../synapse/handlers/room.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/room.py:ro
-      - ../synapse/handlers/user_directory.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/user_directory.py:ro
-      - ../synapse/handlers/stats.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/stats.py:ro
-      - ../synapse/handlers/pagination.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/pagination.py:ro
-      - ../synapse/handlers/account_validity.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/account_validity.py:ro
-      - ../synapse/handlers/deactivate_account.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/deactivate_account.py:ro
-      - ../synapse/handlers/device.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/device.py:ro
-      - ../synapse/handlers/message.py:/usr/local/lib/python3.13/site-packages/synapse/handlers/message.py:ro
     labels:
       - 'traefik.enable=true'
       # Both tenant hostnames route to the same Synapse container.
       # Synapse itself resolves the tenant from the Host header that
       # Traefik forwards.
       - 'traefik.docker.network=docker-demo_synapse-demo-net'
-      - 'traefik.http.routers.synapse.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`)'
+      - 'traefik.http.routers.synapse.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`) || Host(`matrix.tenant-c.com`) || Host(`matrix.tenant-d.com`)'
       - 'traefik.http.routers.synapse.entrypoints=web'
-      - 'traefik.http.routers.synapse-tls.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`)'
+      - 'traefik.http.routers.synapse-tls.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`) || Host(`matrix.tenant-c.com`) || Host(`matrix.tenant-d.com`)'
       - 'traefik.http.routers.synapse-tls.entrypoints=websecure'
       - 'traefik.http.routers.synapse-tls.tls=true'
       - 'traefik.http.services.synapse.loadbalancer.server.port=8008'
@@ -191,12 +177,81 @@ services:
       retries: 10
       start_period: 60s
 
+  # --- Control Plane (tenant lifecycle API) --------------------------
+  control-plane:
+    build: ./control-plane
+    container_name: synapse-demo-control-plane
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "3001"
+      DATABASE_URL: "postgresql://synapse:synapse_password@postgres:5432/synapse_demo"
+      API_TOKEN: "demo-control-plane-token"
+      TENANT_KEY_MASTER: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="   # 32 zero bytes — demo only!
+      SYNAPSE_URL: "http://synapse:8008"
+      SYNAPSE_RELOAD_SECRET: "demo-reload-secret"
+      MEDIA_BASE_DIR: "/media"
+    volumes:
+      - ./data/media:/media
+    ports:
+      - '3001:3001'
+    networks:
+      - synapse-demo-net
+
+  # --- Tenant Manager UI --------------------------------------------
+  manager:
+    build: ./manager
+    container_name: synapse-demo-manager
+    depends_on:
+      bootstrap-admin:
+        condition: service_completed_successfully
+      control-plane:
+        condition: service_started
+    environment:
+      CONFIG_PATH: /synapse-config/homeserver.yaml
+      KEYS_DIR: /keys
+      MEDIA_DIR: /media
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse_password
+      POSTGRES_DB: synapse_demo
+      SYNAPSE_CONTAINER: synapse-demo-server
+      CONTROL_PLANE_URL: "http://control-plane:3001"
+      CONTROL_PLANE_TOKEN: "demo-control-plane-token"
+    volumes:
+      - ./config:/synapse-config            # rw — manager appends tenants
+      - ./data/keys:/keys                   # rw — manager generates signing keys
+      - ./data/media:/media                 # rw — manager creates media dirs
+      - /var/run/docker.sock:/var/run/docker.sock  # for SIGHUP via Docker API
+    ports:
+      - '3000:3000'
+    networks:
+      - synapse-demo-net
+
+  # --- Smoke tests (phases 1-6) ------------------------------------
+  test:
+    image: synapse:multi-tenant
+    container_name: synapse-demo-test
+    profiles: ["test"]
+    depends_on:
+      synapse:
+        condition: service_healthy
+      copy-schemas:
+        condition: service_completed_successfully
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["python3", "/scripts/test_tenants.py", "--host", "traefik"]
+    networks:
+      - synapse-demo-net
+
   # --- Clone public schema into each tenant_* schema ----------------
   # Without this step the tenant schemas exist but are empty and
   # Postgres' search_path falls back to `public`, so both tenants
   # would silently share the same tables.
   copy-schemas:
-    image: synapse-multitenant:latest
+    image: synapse:multi-tenant
     container_name: synapse-demo-copy-schemas
     depends_on:
       synapse:
@@ -210,6 +265,25 @@ services:
       POSTGRES_PASSWORD: synapse_password
       POSTGRES_DB: synapse_demo
     entrypoint: ["python3", "/scripts/copy_tenant_tables.py"]
+    networks:
+      - synapse-demo-net
+
+  # --- Bootstrap admin user for the manager UI ----------------------
+  bootstrap-admin:
+    image: synapse:multi-tenant
+    container_name: synapse-demo-bootstrap-admin
+    depends_on:
+      copy-schemas:
+        condition: service_completed_successfully
+    volumes:
+      - ./scripts:/scripts:ro
+    environment:
+      SYNAPSE_HOST: "http://synapse:8008"
+      TENANT_HOST: "matrix.tenant-a.com"
+      ADMIN_USERNAME: "admin"
+      ADMIN_PASSWORD: "admin"
+      SHARED_SECRET: "demo_shared_secret_change_in_production"
+    entrypoint: ["python3", "/scripts/bootstrap_admin.py"]
     networks:
       - synapse-demo-net
 
