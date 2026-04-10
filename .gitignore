@@ -84,3 +84,13 @@ book/
 docker-demo/certs/
 docker-demo/data/
 docker-multitenant/data/logs/
+
+# Docker demo manager (Next.js) & control-plane build artifacts
+docker-demo/manager/.next/
+docker-demo/manager/node_modules/
+docker-demo/control-plane/node_modules/
+docker-demo/control-plane/dist/
+
+# PgBouncer credentials
+docker-demo/config/pgbouncer_userlist.txt
+
