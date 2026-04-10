@@ -36,5 +36,5 @@ class KeyResource(JsonResource):
 
     @staticmethod
     def register_servlets(http_server: HttpServer, hs: "HomeServer") -> None:
-        LocalKey(hs).register(http_server)
+        LocalKey(hs, multi_tenant_keyring=hs.get_multi_tenant_keyring()).register(http_server)
         RemoteKey(hs).register(http_server)

@@ -29,9 +29,11 @@ from unpaddedbase64 import encode_base64
 from twisted.web.server import Request
 
 from synapse.http.servlet import RestServlet
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict
 
 if TYPE_CHECKING:
+    from synapse.crypto.multitenant_keyring import MultiTenantKeyring
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
@@ -71,9 +73,15 @@ class LocalKey(RestServlet):
 
     PATTERNS = (re.compile("^/_matrix/key/v2/server(/(?P<key_id>[^/]*))?$"),)
 
-    def __init__(self, hs: "HomeServer"):
+    def __init__(
+        self,
+        hs: "HomeServer",
+        multi_tenant_keyring: "MultiTenantKeyring | None" = None,
+    ):
         self.config = hs.config
         self.clock = hs.get_clock()
+        self._multi_tenant_keyring = multi_tenant_keyring
+        self._tenant_responses: dict[str, tuple[int, JsonDict]] = {}
         self.update_response_body(self.clock.time_msec())
 
     def update_response_body(self, time_now_msec: int) -> None:
@@ -106,6 +114,35 @@ class LocalKey(RestServlet):
             json_object = sign_json(json_object, self.config.server.server_name, key)
         return json_object
 
+    def _build_tenant_response(
+        self, server_name: str, time_now_msec: int
+    ) -> JsonDict:
+        """Build a signed key response for a specific tenant."""
+        assert self._multi_tenant_keyring is not None
+        signing_keys = self._multi_tenant_keyring.get_all_signing_keys(server_name)
+
+        refresh_interval = self.config.key.key_refresh_interval
+        valid_until_ts = int(time_now_msec + refresh_interval)
+
+        verify_keys = {}
+        for sk in signing_keys:
+            verify_key_bytes = sk.verify_key.encode()
+            key_id = "%s:%s" % (sk.alg, sk.version)
+            verify_keys[key_id] = {"key": encode_base64(verify_key_bytes)}
+
+        json_object: JsonDict = {
+            "valid_until_ts": valid_until_ts,
+            "server_name": server_name,
+            "verify_keys": verify_keys,
+            "old_verify_keys": {},
+        }
+
+        for sk in signing_keys:
+            json_object = sign_json(json_object, server_name, sk)
+
+        self._tenant_responses[server_name] = (valid_until_ts, json_object)
+        return json_object
+
     def on_GET(
         self, request: Request, key_id: str | None = None
     ) -> tuple[int, JsonDict]:
@@ -119,6 +156,19 @@ class LocalKey(RestServlet):
             )
 
         time_now = self.clock.time_msec()
+
+        # Check for tenant context — return per-tenant keys if available.
+        tenant = get_current_tenant()
+        if tenant is not None and self._multi_tenant_keyring is not None:
+            cached = self._tenant_responses.get(tenant.server_name)
+            if cached is not None:
+                cached_valid_until, cached_body = cached
+                # Reuse cache if more than half the interval remains.
+                if time_now + self.config.key.key_refresh_interval / 2 <= cached_valid_until:
+                    return 200, cached_body
+            return 200, self._build_tenant_response(tenant.server_name, time_now)
+
+        # Global fallback: no tenant context.
         # Update the expiry time if less than half the interval remains.
         if time_now + self.config.key.key_refresh_interval / 2 > self.valid_until_ts:
             self.update_response_body(time_now)
