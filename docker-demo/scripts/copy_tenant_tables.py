@@ -100,47 +100,47 @@ def copy_sequences(conn, source_schema: str, target_schema: str) -> int:
     """Copy sequences from source to target schema. Returns count of sequences copied."""
     cursor = conn.cursor()
 
-    # Get all sequences in source schema
+    # Get all sequences and their properties from pg_sequences catalog view
     cursor.execute("""
-        SELECT sequencename FROM pg_sequences WHERE schemaname = %s ORDER BY sequencename
+        SELECT sequencename, start_value, increment_by, max_value, min_value,
+               cache_size, cycle, last_value
+        FROM pg_sequences
+        WHERE schemaname = %s
+        ORDER BY sequencename
     """, (source_schema,))
-    sequences = [row[0] for row in cursor.fetchall()]
+    sequences = cursor.fetchall()
 
     copied = 0
-    for seq in sequences:
+    for seq_name, start_val, inc_by, max_val, min_val, cache_size, cycle, last_val in sequences:
         # Check if sequence already exists
         cursor.execute("""
             SELECT 1 FROM pg_sequences WHERE schemaname = %s AND sequencename = %s
-        """, (target_schema, seq))
+        """, (target_schema, seq_name))
         if cursor.fetchone():
             continue
 
         try:
-            # Get sequence current value from source
+            cycle_str = "CYCLE" if cycle else "NO CYCLE"
             cursor.execute(f"""
-                SELECT last_value, start_value, increment_by, max_value, min_value, cache_size, cycle
-                FROM "{source_schema}"."{seq}"
+                CREATE SEQUENCE "{target_schema}"."{seq_name}"
+                START WITH {start_val}
+                INCREMENT BY {inc_by}
+                MINVALUE {min_val}
+                MAXVALUE {max_val}
+                CACHE {cache_size}
+                {cycle_str}
             """)
-            row = cursor.fetchone()
-            if row:
-                last_val, start_val, inc_by, max_val, min_val, cache_size, cycle = row
-
-                # Create sequence with same parameters
-                cycle_str = "CYCLE" if cycle else "NO CYCLE"
-                cursor.execute(f"""
-                    CREATE SEQUENCE "{target_schema}"."{seq}"
-                    START WITH {start_val}
-                    INCREMENT BY {inc_by}
-                    MINVALUE {min_val}
-                    MAXVALUE {max_val}
-                    CACHE {cache_size}
-                    {cycle_str}
-                """)
-                conn.commit()
-                copied += 1
+            # Advance to current value if it's been used
+            if last_val is not None and last_val != start_val:
+                cursor.execute(
+                    f"""SELECT setval('"{target_schema}"."{seq_name}"', %s, true)""",
+                    (last_val,)
+                )
+            conn.commit()
+            copied += 1
         except Exception as e:
             conn.rollback()
-            print(f"  Error copying sequence {seq}: {e}")
+            print(f"  Error copying sequence {seq_name}: {e}")
 
     cursor.close()
     return copied

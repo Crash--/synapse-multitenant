@@ -36,17 +36,27 @@ before bringing the demo up:
 docker stop synapse-mt-nginx
 ```
 
-## Bring it up
+## Build the image
 
-From this directory:
+From the **repository root** (not `docker-demo/`), build using the
+standard Synapse Dockerfile. Since this is a fork, the `synapse/`
+directory already contains all multi-tenant patches — no overlay
+step needed:
 
 ```bash
-docker compose up -d --build
-docker compose logs -f synapse
+DOCKER_BUILDKIT=1 docker build -t synapse:multi-tenant -f docker/Dockerfile .
 ```
 
-The first run builds the multi-tenant Synapse image (a minute or
-two). Subsequent runs reuse the cached image.
+Rebuild after pulling new changes.
+
+## Bring it up
+
+From the `docker-demo/` directory:
+
+```bash
+docker compose up -d
+docker compose logs -f synapse
+```
 
 When you see `Synapse now listening on TCP port 8008` *and* the
 `copy-schemas` one-shot has exited cleanly, you're ready.
@@ -114,6 +124,33 @@ and falls back to its self-signed cert. Plain `http://` always works.
       Processed request: ... POST /_matrix/client/v3/login ...
   ```
 
+## Smoke tests (phases 1–6)
+
+An automated test script exercises every multi-tenant feature from
+phases 1 through 6:
+
+```bash
+# From the host (after the stack is up and copy-schemas has finished):
+python3 scripts/test_tenants.py
+
+# Or from inside the Synapse container:
+docker compose exec synapse python3 /scripts/test_tenants.py
+```
+
+The script tests:
+
+| Phase | What's tested |
+|-------|---------------|
+| 1-2 | Tenant routing (`/_matrix/client/versions`), `.well-known/matrix/client`, user registration, cross-tenant isolation |
+| 4 | Per-tenant rate-limit config (tenant-a: generous, tenant-b: tight) |
+| 5 | Media upload on tenant-a, download, cross-tenant media isolation |
+| 4/6 | Admin API `/_synapse/admin/v1/tenants` listing |
+| 6 | SIGHUP reload — signal sent, both tenants verified healthy after |
+
+Phase 3 (SSO, email, push) code is overlaid via bind mounts but cannot
+be end-to-end tested without external services (SMTP, IdP). The code
+paths are exercised — they fall through to global/default config.
+
 ## Tear down
 
 ```bash
@@ -144,12 +181,13 @@ route every read **and** write back to `public`, breaking isolation.
 
 ## How it relates to the rest of the repo
 
-This demo reuses `docker-multitenant/Dockerfile.real` to build the
-Synapse image (so it picks up every multi-tenant patch from
-`../synapse/`). The Python source files are also bind-mounted into
-the running container, so editing anything under `../synapse/` and
-running `docker compose restart synapse` is enough — no rebuild.
+The `synapse:multi-tenant` image is built using the standard
+`docker/Dockerfile` (same as upstream Synapse). Since this is a fork,
+the `synapse/` directory already contains all multi-tenant code — the
+build produces a fully patched image with no overlay step. After
+editing code, rebuild with
+`DOCKER_BUILDKIT=1 docker build -t synapse:multi-tenant -f docker/Dockerfile .`
+from the repo root, then `docker compose restart synapse`.
 
-For the full development rig (Prometheus, three tenants, automated
-test suite, hot iteration on every patched module) see
-`../docker-multitenant/`.
+For the full development rig (Prometheus, three tenants, hot iteration
+via bind mounts on every patched module) see `../docker-multitenant/`.

@@ -95,6 +95,24 @@ services:
     networks:
       - synapse-demo-net
 
+  # --- Connection pooler ---------------------------------------------
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: synapse-demo-pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./config/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./config/pgbouncer_userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U synapse -d synapse_demo || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - synapse-demo-net
+
   # --- One-shot bootstrap: keys + schemas ---------------------------
   keygen:
     build:
