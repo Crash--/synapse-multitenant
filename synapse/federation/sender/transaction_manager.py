@@ -84,12 +84,16 @@ class TransactionManager:
         destination: str,
         pdus: list[EventBase],
         edus: list[Edu],
+        origin: str | None = None,
+        signing_key: object | None = None,
     ) -> None:
         """
         Args:
             destination: The destination to send to (e.g. 'example.org')
             pdus: In-order list of PDUs to send
             edus: List of EDUs to send
+            origin: Optional origin server name override (for multi-tenant use)
+            signing_key: Optional signing key override (for multi-tenant use)
         """
 
         if self._is_shutdown:
@@ -126,10 +130,12 @@ class TransactionManager:
                 len(edus),
             )
 
+            tx_origin = origin if origin is not None else self.server_name
+
             transaction = Transaction(
                 origin_server_ts=int(self.clock.time_msec()),
                 transaction_id=txn_id,
-                origin=self.server_name,
+                origin=tx_origin,
                 destination=destination,
                 pdus=serialize_and_filter_pdus(pdus),
                 edus=[edu.get_dict() for edu in edus],

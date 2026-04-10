@@ -394,7 +394,9 @@ class PerDestinationQueue:
                         )
 
                     await self._transaction_manager.send_new_transaction(
-                        self._destination, pending_pdus, pending_edus
+                        self._destination, pending_pdus, pending_edus,
+                        origin=self.server_name,
+                        signing_key=self._tenant_signing_key,
                     )
 
                     sent_transactions_counter.labels(
@@ -630,7 +632,9 @@ class PerDestinationQueue:
                 )
 
                 await self._transaction_manager.send_new_transaction(
-                    self._destination, room_catchup_pdus, []
+                    self._destination, room_catchup_pdus, [],
+                    origin=self.server_name,
+                    signing_key=self._tenant_signing_key,
                 )
 
                 sent_transactions_counter.labels(
