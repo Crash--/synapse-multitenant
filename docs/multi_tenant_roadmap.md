@@ -420,12 +420,14 @@ before adding the production-only pieces (S3, federation, workers).
    ceiling from ~10-15 to ~100-200 before tackling federation.
    Three sub-phases, each independently shippable:
 
-   **8a — `SET LOCAL` search_path.** Replace the current 3-round-trip
-   pattern (`SHOW search_path` → `SET search_path` → `SET` restore)
-   with `SET LOCAL search_path TO <schema>`, which scopes to the
-   transaction and auto-resets on commit/rollback. Eliminates
-   `_restore_search_path` entirely. ~10 lines in
-   `synapse/storage/database.py`. Impact: ~33% fewer DB round trips
+   **8a — Session-level `SET` search_path.** Replace the current
+   3-round-trip pattern (`SHOW search_path` → `SET search_path` →
+   `SET` restore) with a single session-level
+   `SET search_path TO <schema>`. Session-level SET was chosen over
+   `SET LOCAL` because Synapse has many `db_autocommit=True` code paths
+   where `SET LOCAL` would scope to just the SET statement itself.
+   Eliminates `_restore_search_path` entirely. ~10 lines in
+   `synapse/storage/database.py`. Impact: ~67% fewer DB round trips
    per transaction.
 
    **8b — Connection-level schema caching.** Track which schema each
