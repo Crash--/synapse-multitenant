@@ -656,37 +656,27 @@ class DatabasePool:
 
     def _set_tenant_schema(
         self, conn: Connection, tenant: "TenantConfig"
-    ) -> str | None:
+    ) -> None:
         """Set the PostgreSQL search_path to the tenant's schema.
 
-        This method sets the search_path for the connection to isolate
-        queries to the tenant's schema. It returns the original search_path
-        so it can be restored later.
+        Uses a session-level SET (not SET LOCAL) so it works in both
+        transactional and autocommit modes. The connection returns to the
+        pool with this schema still set — the next borrower will SET to
+        its own tenant.
 
         Args:
             conn: The database connection.
             tenant: The tenant configuration.
-
-        Returns:
-            The original search_path value, or None if not applicable.
         """
         if not isinstance(self.engine, PostgresEngine):
-            return None
+            return
+
+        schema = tenant.database_schema
+        if not schema.replace("_", "").isalnum():
+            raise ValueError(f"Invalid schema name: {schema}")
 
         cursor = conn.cursor()
         try:
-            # Get the current search_path
-            cursor.execute("SHOW search_path")
-            result = cursor.fetchone()
-            original_search_path = result[0] if result else "public"
-
-            # Set the search_path to the tenant's schema.
-            schema = tenant.database_schema
-            # Use parameterized query format - but schema names can't be parameters
-            # so we validate the schema name first
-            if not schema.replace("_", "").isalnum():
-                raise ValueError(f"Invalid schema name: {schema}")
-
             # Security-first policy: do NOT include `, public` as a fallback.
             # Any table missing from the tenant schema must fail loud, not
             # silently resolve in public. See
@@ -697,7 +687,6 @@ class DatabasePool:
                 schema,
                 tenant.server_name,
             )
-            return original_search_path
         finally:
             cursor.close()
 
@@ -755,22 +744,6 @@ class DatabasePool:
         finally:
             cursor.close()
 
-    def _restore_search_path(self, conn: Connection, search_path: str) -> None:
-        """Restore the PostgreSQL search_path to its original value.
-
-        Args:
-            conn: The database connection.
-            search_path: The original search_path value to restore.
-        """
-        if not isinstance(self.engine, PostgresEngine):
-            return
-
-        cursor = conn.cursor()
-        try:
-            cursor.execute(f"SET search_path TO {search_path}")
-            logger.debug("Restored search_path to '%s'", search_path)
-        finally:
-            cursor.close()
 
     async def _check_safe_to_upsert(self) -> None:
         """
@@ -1225,10 +1198,6 @@ class DatabasePool:
                         if self._txn_limit > 0:
                             self._txn_counters[tid] = 1
 
-                    # Multi-tenant support: use the captured tenant from the async context
-                    # (contextvars don't propagate to thread pool threads)
-                    original_search_path: str | None = None
-
                     try:
                         if db_autocommit:
                             self.engine.attempt_to_set_autocommit(conn, True)
@@ -1237,16 +1206,11 @@ class DatabasePool:
                                 conn, isolation_level
                             )
 
-                        # Set tenant schema if multi-tenant mode is active
+                        # Set tenant schema if multi-tenant mode is active.
+                        # Session-level SET persists across transactions on this
+                        # connection — no restore needed on exit.
                         if captured_tenant is not None and isinstance(self.engine, PostgresEngine):
-                            original_search_path = self._set_tenant_schema(
-                                conn, captured_tenant
-                            )
-                            logger.info(
-                                "Set database schema for tenant %s: %s",
-                                captured_tenant.server_name,
-                                captured_tenant.database_schema,
-                            )
+                            self._set_tenant_schema(conn, captured_tenant)
 
                         db_conn = LoggingDatabaseConnection(
                             conn=conn,
@@ -1256,12 +1220,6 @@ class DatabasePool:
                         )
                         return func(db_conn, *args, **kwargs)
                     finally:
-                        # Restore original search_path if we changed it
-                        if original_search_path is not None and isinstance(
-                            self.engine, PostgresEngine
-                        ):
-                            self._restore_search_path(conn, original_search_path)
-
                         if db_autocommit:
                             self.engine.attempt_to_set_autocommit(conn, False)
                         if isolation_level:
