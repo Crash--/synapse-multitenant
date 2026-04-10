@@ -27,6 +27,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 from synapse.api.errors import Codes, FederationDeniedError, SynapseError
+from synapse.tenant_context import get_current_tenant, set_current_tenant
 from synapse.api.urls import FEDERATION_V1_PREFIX
 from synapse.http.server import HttpServer, ServletCallback
 from synapse.http.servlet import parse_json_object_from_request
@@ -47,6 +48,7 @@ from synapse.util.stringutils import parse_and_validate_server_name
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from synapse.tenant_registry import TenantRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,12 @@ class NoAuthenticationError(AuthenticationError):
 
 
 class Authenticator:
-    def __init__(self, hs: "HomeServer"):
+    def __init__(
+        self,
+        hs: "HomeServer",
+        tenant_registry: "TenantRegistry | None" = None,
+    ):
+        self._hs = hs
         self._clock = hs.get_clock()
         self.keyring = hs.get_keyring()
         self.server_name = hs.hostname
@@ -70,10 +77,46 @@ class Authenticator:
             hs.config.federation.federation_domain_whitelist
         )
         self.notifier = hs.get_notifier()
+        self._tenant_registry = tenant_registry
 
         self.replication_client = None
         if hs.config.worker.worker_app:
             self.replication_client = hs.get_replication_command_handler()
+
+    def _resolve_federation_destination(
+        self, parsed_destination: str | None
+    ) -> str:
+        """Resolve the federation destination using three-tier fallback.
+
+        Tier 1: Use the destination from the X-Matrix header (parsed_destination).
+        Tier 2: Fall back to the current tenant context.
+        Tier 3: Fall back to the global server_name.
+
+        Raises AuthenticationError if parsed_destination is provided but does
+        not match any known tenant or the global hostname.
+        """
+        # Tier 1: explicit destination from X-Matrix header
+        if parsed_destination is not None:
+            if not self._is_mine_server_name(parsed_destination):
+                raise AuthenticationError(
+                    HTTPStatus.UNAUTHORIZED,
+                    f"Unknown destination in auth header: {parsed_destination!r}",
+                    Codes.UNAUTHORIZED,
+                )
+            # Set tenant context if this matches a tenant
+            if self._tenant_registry is not None:
+                tenant = self._tenant_registry.get_tenant(parsed_destination)
+                if tenant is not None:
+                    set_current_tenant(tenant)
+            return parsed_destination
+
+        # Tier 2: fall back to current tenant context
+        current_tenant = get_current_tenant()
+        if current_tenant is not None:
+            return current_tenant.server_name
+
+        # Tier 3: fall back to global server_name
+        return self.server_name
 
     # A method just so we can pass 'self' as the authenticator to the Servlets
     async def authenticate_request(
@@ -83,7 +126,6 @@ class Authenticator:
         json_request: JsonDict = {
             "method": request.method.decode("ascii"),
             "uri": request.uri.decode("ascii"),
-            "destination": self.server_name,
             "signatures": {},
         }
 
@@ -91,6 +133,7 @@ class Authenticator:
             json_request["content"] = content
 
         origin = None
+        last_destination: str | None = None
 
         auth_headers = request.requestHeaders.getRawHeaders(b"Authorization")
 
@@ -107,6 +150,9 @@ class Authenticator:
                 json_request["origin"] = origin
                 json_request["signatures"].setdefault(origin, {})[key] = sig
 
+                if destination is not None:
+                    last_destination = destination
+
                 # if the origin_server sent a destination along it needs to match our own server_name
                 if destination is not None and not self._is_mine_server_name(
                     destination
@@ -116,6 +162,11 @@ class Authenticator:
                         f"Destination mismatch in auth header, received: {destination!r}",
                         Codes.UNAUTHORIZED,
                     )
+
+        # Resolve the destination using multi-tenant three-tier fallback
+        json_request["destination"] = self._resolve_federation_destination(
+            last_destination
+        )
         if (
             self.federation_domain_whitelist is not None
             and origin not in self.federation_domain_whitelist
