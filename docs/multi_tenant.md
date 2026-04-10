@@ -453,3 +453,49 @@ To migrate an existing Synapse deployment to a multi-tenant setup:
 - Tenant-specific workers are not yet supported
 - Cross-tenant admin operations require server admin privileges
 - Backup/restore is at the database level, not per-tenant
+
+## Connection pool & capacity
+
+### Search path switching
+
+Each database operation sets the PostgreSQL `search_path` to the active
+tenant's schema. Phase 8 optimized this from 3 SQL commands per call
+(SHOW + SET + restore) to at most 1 (session-level SET), with a
+connection-level cache that skips the SET entirely when the same tenant
+reuses the connection.
+
+### Pool configuration
+
+The shared connection pool (`cp_max` in `homeserver.yaml`) is sized to
+serve all tenants concurrently. Recommended values:
+
+| Tenants | `cp_max` | Notes |
+|---------|----------|-------|
+| 1-10 | 10 | Default; direct Postgres connection is fine |
+| 10-50 | 50 | Add pgbouncer for connection multiplexing |
+| 50-200 | 50-100 | pgbouncer required; raise Postgres `max_connections` |
+
+### Capacity estimates
+
+| Configuration | Tenant ceiling | Limiting factor |
+|--------------|----------------|----------------|
+| Default (`cp_max=10`, no pgbouncer) | ~10-15 | Pool starvation |
+| Pool tuned (`cp_max=50`) | ~30-50 | GIL + SET overhead |
+| + schema caching | ~50-100 | GIL + rate limiter memory |
+| + pgbouncer (session mode) | ~100-200 | GIL (hard ceiling) |
+
+The GIL ceiling is addressed by worker support (phase 12).
+
+### pgbouncer
+
+The `docker-multitenant/` demo includes a pgbouncer sidecar in session
+mode. Session mode pins connections for the client session duration,
+which is required because Synapse uses session-level `SET search_path`.
+Transaction mode is **not compatible** — it would reset `search_path`
+between transactions.
+
+pgbouncer settings in the demo:
+- `POOL_MODE=session`
+- `DEFAULT_POOL_SIZE=50`
+- `MAX_CLIENT_CONN=200`
+- `MAX_DB_CONNECTIONS=100`
