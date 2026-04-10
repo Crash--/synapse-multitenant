@@ -38,6 +38,7 @@ from synapse.event_auth import (
 )
 from synapse.events import EventBase
 from synapse.events.builder import EventBuilder
+from synapse.tenant_context import get_current_tenant
 from synapse.types import StateMap, StrCollection
 
 if TYPE_CHECKING:
@@ -57,6 +58,12 @@ class EventAuthHandler:
         self._state_storage_controller = hs.get_storage_controllers().state
         self._server_name = hs.hostname
         self._is_mine_id = hs.is_mine_id
+
+    @property
+    def _effective_server_name(self) -> str:
+        """Return the current tenant's server_name, or the global default."""
+        tenant = get_current_tenant()
+        return tenant.server_name if tenant else self._server_name
 
     async def check_auth_rules_from_context(
         self,
@@ -274,7 +281,7 @@ class EventAuthHandler:
             # that we do not know about.
             if not self._is_mine_id(user_id):
                 for room_id in allowed_rooms:
-                    if not await self._store.is_host_joined(room_id, self._server_name):
+                    if not await self._store.is_host_joined(room_id, self._effective_server_name):
                         raise SynapseError(
                             400,
                             f"Unable to check if {user_id} is in allowed rooms.",
