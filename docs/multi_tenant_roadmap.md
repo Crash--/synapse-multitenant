@@ -411,20 +411,56 @@ before adding the production-only pieces (S3, federation, workers).
    the registry, DB pool, keyring, and media layout;
    `synapse_tenant backup` / `restore` commands wrapping
    schema-level `pg_dump` plus the per-tenant media tree.
-7. **Federation outbound.** Per-tenant `FederationSender` (or a
+7. **Dynamic tenant control plane.** Database-driven tenancy
+   replaces YAML tenant list. Standalone control plane service
+   handles full tenant lifecycle (create, suspend, activate,
+   delete). AES-256-GCM encrypted signing keys in DB. Synapse
+   boots with zero tenants and loads from `public.tenants` table.
+8. **Database tuning & connection optimization.** Raise the tenant
+   ceiling from ~10-15 to ~100-200 before tackling federation.
+   Three sub-phases, each independently shippable:
+
+   **8a — `SET LOCAL` search_path.** Replace the current 3-round-trip
+   pattern (`SHOW search_path` → `SET search_path` → `SET` restore)
+   with `SET LOCAL search_path TO <schema>`, which scopes to the
+   transaction and auto-resets on commit/rollback. Eliminates
+   `_restore_search_path` entirely. ~10 lines in
+   `synapse/storage/database.py`. Impact: ~33% fewer DB round trips
+   per transaction.
+
+   **8b — Connection-level schema caching.** Track which schema each
+   connection is currently set to (`dict[connection_id, schema_name]`).
+   Before issuing `SET LOCAL`, check if the connection already has the
+   right schema — if so, skip the SET. Most requests within a burst
+   hit the same tenant, so this eliminates SET overhead for consecutive
+   same-tenant requests. ~50 lines in `database.py`.
+
+   **8c — Connection pool tuning + pgbouncer.** Raise `cp_max`
+   guidance from 10 to 50-100 in docker-demo configs and document the
+   recommendation. Add a pgbouncer sidecar to
+   `docker-demo/docker-compose.yml` with `search_path` set at
+   session-assign time. Document the capacity curve in
+   `docs/multi_tenant.md`.
+
+   **Verification:** Stress test (`docker-demo/stress-test/`) before
+   and after each sub-phase, measuring requests/sec, p95 latency, and
+   pool utilization at 5, 10, and 20 tenant load. See
+   `challenges.md` for the full bottleneck analysis and capacity
+   estimates backing this phase.
+9. **Federation outbound.** Per-tenant `FederationSender` (or a
    tenant-keyed queue), transactions signed via
    `MultiTenantKeyring.get_signing_key(tenant.server_name)`,
    per-tenant retry/back-off state. Unblocks talking to the public
    Matrix network from more than one tenant.
-8. **Federation inbound.** Destination-header routing in
-   `TenantRouter` (federation traffic doesn't carry the right
-   `Host`), per-tenant `.well-known/matrix/server`, per-tenant
-   federation allow-lists, EDU routing.
-9. **E2EE audit pass.** Verify no device-key, cross-signing, or
-   key-backup cache crosses tenants; tenant-scope the federation
-   `/_matrix/key/v2/query` cache; build graceful signing-key
-   rotation tooling.
-10. **Workers.** Tenant-aware `federation_sender`,
+10. **Federation inbound.** Destination-header routing in
+    `TenantRouter` (federation traffic doesn't carry the right
+    `Host`), per-tenant `.well-known/matrix/server`, per-tenant
+    federation allow-lists, EDU routing.
+11. **E2EE audit pass.** Verify no device-key, cross-signing, or
+    key-backup cache crosses tenants; tenant-scope the federation
+    `/_matrix/key/v2/query` cache; build graceful signing-key
+    rotation tooling.
+12. **Workers.** Tenant-aware `federation_sender`,
     `media_repository`, and `pusher` workers — sticky routing or
     tenant-keyed instances. Only matters at scale, so it lands
     last.

@@ -134,31 +134,37 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 // MultiKeyring, Media root) so the additions are always shown
 // in the broader Synapse context.
 const NODES = {
-  client:    { x: 30,  y: 255, w: 95,  h: 56, label: "Client",       added: false },
-  nginx:     { x: 140, y: 255, w: 95,  h: 56, label: "Nginx",        added: false },
-  servlet:   { x: 280, y: 240, w: 110, h: 56, label: "Servlet",      added: false },
-  router:    { x: 405, y: 145, w: 140, h: 46, label: "TenantRouter", added: true  },
-  context:   { x: 405, y: 200, w: 140, h: 46, label: "ContextVar",   added: true  },
-  handlers:  { x: 405, y: 270, w: 140, h: 46, label: "Handlers",     added: false },
-  keyring:   { x: 560, y: 145, w: 140, h: 46, label: "MultiKeyring", added: true  },
-  media:     { x: 560, y: 200, w: 140, h: 46, label: "Media root",   added: true  },
-  datastore: { x: 560, y: 270, w: 140, h: 46, label: "DataStore",    added: false },
-  postgres:  { x: 755, y: 255, w: 110, h: 56, label: "Postgres",     added: false },
+  client:       { x: 30,  y: 255, w: 95,  h: 56, label: "Client",         added: false },
+  traefik:      { x: 140, y: 255, w: 95,  h: 56, label: "Traefik",        added: false },
+  servlet:      { x: 280, y: 240, w: 110, h: 56, label: "Servlet",        added: false },
+  router:       { x: 405, y: 120, w: 140, h: 40, label: "TenantRouter",   added: true  },
+  context:      { x: 405, y: 168, w: 140, h: 40, label: "ContextVar",     added: true  },
+  ratelimiter:  { x: 405, y: 216, w: 140, h: 40, label: "RateLimiter",    added: true  },
+  handlers:     { x: 405, y: 280, w: 140, h: 46, label: "Handlers",       added: false },
+  keyring:      { x: 560, y: 120, w: 140, h: 40, label: "MultiKeyring",   added: true  },
+  media:        { x: 560, y: 168, w: 140, h: 40, label: "Media root",     added: true  },
+  appservices:  { x: 560, y: 216, w: 140, h: 40, label: "AppServices",    added: true  },
+  datastore:    { x: 560, y: 280, w: 140, h: 46, label: "DataStore",      added: false },
+  postgres:     { x: 755, y: 255, w: 110, h: 56, label: "Postgres",       added: false },
+  controlplane: { x: 755, y: 140, w: 110, h: 56, label: "Control Plane",  added: true  },
 };
 
 const LINKS = [
-  ["client", "nginx"],
-  ["nginx", "servlet"],
+  ["client", "traefik"],
+  ["traefik", "servlet"],
   ["servlet", "router"],
   ["router", "context"],
-  ["context", "handlers"],
+  ["context", "ratelimiter"],
+  ["ratelimiter", "handlers"],
   ["handlers", "keyring"],
   ["handlers", "media"],
+  ["handlers", "appservices"],
   ["handlers", "datastore"],
   ["datastore", "postgres"],
+  ["controlplane", "postgres"],
 ];
 
-const FORK_WRAPPER = { x: 270, y: 120, w: 475, h: 220, label: "Synapse process" };
+const FORK_WRAPPER = { x: 270, y: 100, w: 445, h: 250, label: "Synapse process" };
 
 // Upstream (vanilla, single-tenant) Synapse layout. No TenantRouter,
 // no ContextVar — the HomeServer instance is created once at startup
@@ -194,7 +200,7 @@ function buildDiagramSvg(nodes = NODES, links = LINKS, wrapper = null) {
   // Tight viewBox cropped to actual content bounds (with a little
   // breathing room for the wrapper label), so the diagram fills
   // narrow containers (Scenes C and D) cleanly.
-  svg.setAttribute("viewBox", "15 95 870 260");
+  svg.setAttribute("viewBox", "15 75 870 290");
   svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
 
   // Draw the Synapse-process wrapper FIRST so it sits behind the
@@ -359,11 +365,13 @@ class SceneA {
 // ---------------------------------------------------------------------------
 
 const LAYERS = [
-  { id: "network",  label: "Network",        sub: "Client · Nginx",                  added: false },
-  { id: "routing",  label: "Routing",        sub: "TenantRouter · TenantConfig",     added: true  },
-  { id: "context",  label: "Tenant Context", sub: "contextvars.ContextVar",          added: true  },
-  { id: "storage",  label: "Storage",        sub: "Postgres · Keyring · Media",      added: true  },
-  { id: "response", label: "Response",       sub: "Tagged with tenant",              added: false },
+  { id: "network",       label: "Network",          sub: "Client · Traefik",                              added: false },
+  { id: "routing",       label: "Routing",          sub: "TenantRouter · TenantConfig",                   added: true  },
+  { id: "context",       label: "Tenant Context",   sub: "contextvars.ContextVar",                        added: true  },
+  { id: "storage",       label: "Storage",          sub: "Postgres · Keyring · Media",                    added: true  },
+  { id: "tenant_config", label: "Per-Tenant Config",sub: "SSO · Email · Push · RateLimits · AppServices", added: true  },
+  { id: "lifecycle",     label: "Lifecycle",         sub: "Control Plane · Reload · Backup/Restore",      added: true  },
+  { id: "response",      label: "Response",          sub: "Tagged with tenant",                           added: false },
 ];
 
 class SceneB {
@@ -739,8 +747,8 @@ parallelToggle.addEventListener("change", () => {
 timeline.play();
 
 // Self-checks
-console.assert(STAGES.length === 13, "expected 13 stages");
-console.assert(TOTAL_DURATION_MS === 21400, "expected 21400ms total");
+console.assert(STAGES.length === 24, "expected 24 stages, got " + STAGES.length);
+console.assert(TOTAL_DURATION_MS === 46000, "expected 46000ms total, got " + TOTAL_DURATION_MS);
 
 window.__timeline = timeline;
 window.__registry = registry;
