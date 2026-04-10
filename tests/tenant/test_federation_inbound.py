@@ -219,3 +219,75 @@ class TestLocalKeyTenantAware(TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(body["server_name"], "main.localhost")
+
+
+# ── 10c probes: FederationServer tenant-awareness ────────────────
+
+
+class TestFederationServerEffectiveServerName(TestCase):
+    """FederationServer._effective_server_name must resolve from tenant context."""
+
+    def _make_federation_server(
+        self, hostname: str = "main.localhost"
+    ) -> "FederationServer":
+        from synapse.federation.federation_server import FederationServer
+
+        hs = MagicMock()
+        hs.hostname = hostname
+        hs.get_clock.return_value = MagicMock()
+        hs.get_state_handler.return_value = MagicMock()
+        hs.get_storage_controllers.return_value = MagicMock()
+        hs.get_datastores.return_value = MagicMock()
+        hs.get_federation_handler.return_value = MagicMock()
+        hs.get_module_api_callbacks.return_value.spam_checker = MagicMock()
+        hs.get_federation_event_handler.return_value = MagicMock()
+        hs.config.federation.federation_metrics_domains = frozenset()
+        hs.signing_key = MagicMock()
+        hs.get_multi_tenant_keyring.return_value = MagicMock()
+        return FederationServer(hs)
+
+    def test_effective_server_name_with_tenant(self) -> None:
+        """_effective_server_name returns tenant's server_name when context is set."""
+        fs = self._make_federation_server()
+        acme = _make_tenant("acme")
+        with patch(
+            "synapse.federation.federation_server.get_current_tenant",
+            return_value=acme,
+        ):
+            self.assertEqual(fs._effective_server_name, "acme.localhost")
+
+    def test_effective_server_name_without_tenant(self) -> None:
+        """_effective_server_name falls back to self.server_name when no context."""
+        fs = self._make_federation_server()
+        with patch(
+            "synapse.federation.federation_server.get_current_tenant",
+            return_value=None,
+        ):
+            self.assertEqual(fs._effective_server_name, "main.localhost")
+
+    def test_effective_signing_key_with_tenant(self) -> None:
+        """_effective_signing_key returns tenant key from MultiTenantKeyring."""
+        fs = self._make_federation_server()
+        acme = _make_tenant("acme")
+        mock_key = MagicMock()
+        fs._multi_tenant_keyring = MagicMock()
+        fs._multi_tenant_keyring.get_signing_key.return_value = mock_key
+        with patch(
+            "synapse.federation.federation_server.get_current_tenant",
+            return_value=acme,
+        ):
+            self.assertIs(fs._effective_signing_key, mock_key)
+            fs._multi_tenant_keyring.get_signing_key.assert_called_with(
+                "acme.localhost"
+            )
+
+    def test_effective_signing_key_without_tenant(self) -> None:
+        """_effective_signing_key falls back to hs.signing_key when no context."""
+        fs = self._make_federation_server()
+        mock_key = MagicMock()
+        fs.hs.signing_key = mock_key
+        with patch(
+            "synapse.federation.federation_server.get_current_tenant",
+            return_value=None,
+        ):
+            self.assertIs(fs._effective_signing_key, mock_key)
