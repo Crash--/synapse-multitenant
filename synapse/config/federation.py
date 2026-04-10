@@ -18,9 +18,12 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from synapse.config._base import Config
+
+if TYPE_CHECKING:
+    from synapse.config.tenants import TenantFederationConfig
 from synapse.config._util import validate_config
 from synapse.types import JsonDict
 
@@ -94,17 +97,34 @@ class FederationConfig(Config):
             2**62,
         )
 
-    def is_domain_allowed_according_to_federation_whitelist(self, domain: str) -> bool:
+    def is_domain_allowed_according_to_federation_whitelist(
+        self,
+        domain: str,
+        tenant_federation_config: "TenantFederationConfig | None" = None,
+    ) -> bool:
         """
-        Returns whether a domain is allowed according to the federation whitelist. If a
-        federation whitelist is not set, all domains are allowed.
+        Returns whether a domain is allowed according to the federation whitelist.
+
+        Resolution order:
+        1. Tenant whitelist (if tenant_federation_config has a non-None whitelist)
+        2. Global whitelist (if set)
+        3. All domains allowed (both are None)
 
         Args:
             domain: The domain to test.
+            tenant_federation_config: Optional per-tenant federation config that
+                overrides the global whitelist when its whitelist is non-None.
 
         Returns:
-            True if the domain is allowed or if a whitelist is not set, False otherwise.
+            True if the domain is allowed, False otherwise.
         """
+        # Tier 1: tenant-specific whitelist
+        if tenant_federation_config is not None:
+            tenant_wl = tenant_federation_config.federation_domain_whitelist
+            if tenant_wl is not None:
+                return domain in tenant_wl
+
+        # Tier 2: global whitelist
         if self.federation_domain_whitelist is None:
             return True
 

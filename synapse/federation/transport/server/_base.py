@@ -157,9 +157,11 @@ class Authenticator:
         json_request["destination"] = self._resolve_federation_destination(
             last_destination
         )
-        if (
-            self.federation_domain_whitelist is not None
-            and origin not in self.federation_domain_whitelist
+        # Check federation domain whitelist (tenant-aware)
+        tenant = get_current_tenant()
+        tenant_fed_config = tenant.federation if tenant else None
+        if not self._hs.config.federation.is_domain_allowed_according_to_federation_whitelist(
+            origin, tenant_federation_config=tenant_fed_config
         ):
             raise FederationDeniedError(origin)
 

@@ -219,6 +219,26 @@ class TenantRatelimitConfig:
 
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)
+class TenantFederationConfig:
+    """Per-tenant federation configuration.
+
+    When present on a TenantConfig, overrides the global federation
+    domain whitelist for this tenant. When federation_domain_whitelist
+    is None, the tenant inherits the global whitelist.
+    """
+
+    federation_domain_whitelist: dict[str, bool] | None = None
+
+    @classmethod
+    def from_dict(cls, d: "JsonDict") -> "TenantFederationConfig":
+        whitelist_list = d.get("federation_domain_whitelist")
+        whitelist: dict[str, bool] | None = None
+        if whitelist_list is not None:
+            whitelist = {domain: True for domain in whitelist_list}
+        return cls(federation_domain_whitelist=whitelist)
+
+
+@attr.s(auto_attribs=True, slots=True, frozen=True)
 class TenantConfig:
     """Configuration for a single tenant in a multi-tenant deployment.
 
@@ -287,6 +307,10 @@ class TenantConfig:
     # AS registrations apply to this tenant. When None, no app services
     # are active for this tenant.
     app_service_config_files: list[str] | None = None
+    # Per-tenant federation configuration. When set, overrides the global
+    # federation domain whitelist. When None, the tenant inherits global
+    # federation settings.
+    federation: TenantFederationConfig | None = None
     # In-memory signing key data (for DB-sourced tenants). When set,
     # signing_key_path should be None. The keyring reads from this
     # instead of the filesystem.
@@ -383,6 +407,13 @@ class TenantConfig:
         )
         as_config_files = config.get("app_service_config_files")
 
+        federation_dict = config.get("federation")
+        federation_cfg = (
+            TenantFederationConfig.from_dict(federation_dict)
+            if federation_dict
+            else None
+        )
+
         return cls(
             server_name=server_name,
             database_schema=database_schema,
@@ -405,6 +436,7 @@ class TenantConfig:
             push=push_cfg,
             ratelimit=ratelimit_cfg,
             app_service_config_files=as_config_files,
+            federation=federation_cfg,
         )
 
     @classmethod
@@ -471,6 +503,13 @@ class TenantConfig:
             else None
         )
 
+        federation_raw = row.get("federation_config")
+        federation_cfg = (
+            TenantFederationConfig.from_dict(federation_raw)
+            if federation_raw
+            else None
+        )
+
         return cls(
             server_name=server_name,
             database_schema=database_schema,
@@ -493,6 +532,7 @@ class TenantConfig:
             push=push_cfg,
             ratelimit=ratelimit_cfg,
             app_service_config_files=row.get("app_service_config_files"),
+            federation=federation_cfg,
             signing_key_data=signing_key_data,
         )
 
