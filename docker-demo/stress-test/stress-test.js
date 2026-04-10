@@ -1,6 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { Trend, Rate } from "k6/metrics";
+import { Trend, Rate, Counter } from "k6/metrics";
 
 // ── Load test data ─────────────────────────────────────────────
 const testData = JSON.parse(open("./test-data.json"));
@@ -10,19 +10,26 @@ const tenantNames = Object.keys(testData.tenants);
 const messageSendDuration = new Trend("message_send_duration", true);
 const timelineReadDuration = new Trend("timeline_read_duration", true);
 const isolationCheckRate = new Rate("isolation_check_passed");
+const rateLimited = new Counter("rate_limited_responses");
 
 // ── Options ────────────────────────────────────────────────────
+// Ramp profile designed to find the connection pool saturation point
+// (cp_max=10 in homeserver.yaml — challenges.md predicts starvation
+// at moderate concurrency).
 export const options = {
   stages: [
-    { duration: "30s", target: 10 },  // warm-up
-    { duration: "1m", target: 40 },   // ramp to full load
-    { duration: "2m", target: 40 },   // sustained peak
-    { duration: "30s", target: 0 },   // cool-down
+    { duration: "20s", target: 20 },   // warm-up
+    { duration: "30s", target: 50 },   // moderate — within pool budget
+    { duration: "30s", target: 100 },  // push past cp_max=10
+    { duration: "2m", target: 100 },   // sustained — expose pool starvation
+    { duration: "30s", target: 200 },  // overload — find the breaking point
+    { duration: "1m", target: 200 },   // sustained overload
+    { duration: "20s", target: 0 },    // cool-down
   ],
   thresholds: {
-    http_req_duration: ["p(95)<2000"],
-    http_req_failed: ["rate<0.05"],
-    checks: ["rate>0.95"],
+    http_req_duration: ["p(95)<5000"],
+    http_req_failed: ["rate<0.10"],
+    checks: ["rate>0.90"],
   },
 };
 
@@ -34,7 +41,6 @@ let txnCounter = 0;
 
 // ── VU assignment ──────────────────────────────────────────────
 function getAssignment() {
-  // VU IDs are 1-based in k6
   const vuId = __VU - 1;
   const tenantIndex = vuId % tenantNames.length;
   const userIndex = Math.floor(vuId / tenantNames.length) % 10;
@@ -44,7 +50,7 @@ function getAssignment() {
   return { tenantName, tenant, user };
 }
 
-function headers(tenantName, token) {
+function hdrs(tenantName, token) {
   const h = {
     Host: tenantName,
     "Content-Type": "application/json",
@@ -66,12 +72,10 @@ function ensureLoggedIn(tenantName, user) {
       identifier: { type: "m.id.user", user: user.username },
       password: user.password,
     }),
-    { headers: headers(tenantName) }
+    { headers: hdrs(tenantName), tags: { name: "login", tenant: tenantName } }
   );
 
-  check(res, {
-    "login succeeded": (r) => r.status === 200,
-  });
+  check(res, { "login succeeded": (r) => r.status === 200 });
 
   if (res.status === 200) {
     cachedToken = res.json().access_token;
@@ -79,7 +83,49 @@ function ensureLoggedIn(tenantName, user) {
   return cachedToken;
 }
 
+// ── Send a single message ──────────────────────────────────────
+function sendMessage(tenantName, token, roomId, body) {
+  const txnId = `k6_${__VU}_${txnCounter++}`;
+  const res = http.put(
+    `${BASE_URL}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`,
+    JSON.stringify({ msgtype: "m.text", body: body }),
+    { headers: hdrs(tenantName, token), tags: { name: "send_message", tenant: tenantName } }
+  );
+
+  check(res, { "message sent (200)": (r) => r.status === 200 });
+  messageSendDuration.add(res.timings.duration, { tenant: tenantName });
+
+  if (res.status === 429) {
+    rateLimited.add(1, { tenant: tenantName });
+  }
+  return res;
+}
+
+// ── Read timeline ──────────────────────────────────────────────
+function readTimeline(tenantName, token, roomId) {
+  const res = http.get(
+    `${BASE_URL}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=10`,
+    { headers: hdrs(tenantName, token), tags: { name: "timeline", tenant: tenantName } }
+  );
+
+  check(res, { "timeline read (200)": (r) => r.status === 200 });
+  timelineReadDuration.add(res.timings.duration, { tenant: tenantName });
+
+  // Verify no cross-tenant leak in timeline
+  if (res.status === 200) {
+    const events = res.json().chunk || [];
+    const allOwnTenant = events.every((evt) => {
+      const sender = evt.sender || "";
+      return sender.endsWith(`:${tenantName}`);
+    });
+    check(null, { "no cross-tenant leak in timeline": () => allOwnTenant });
+  }
+  return res;
+}
+
 // ── Main test function ─────────────────────────────────────────
+// Realistic burst pattern from stress-test-suggestions.md:
+//   send 3 messages quickly → wait → sync → read timeline → repeat
 export default function () {
   const { tenantName, tenant, user } = getAssignment();
   const token = ensureLoggedIn(tenantName, user);
@@ -91,53 +137,24 @@ export default function () {
   }
 
   const roomId = tenant.room_id;
-  const txnId = `k6_${__VU}_${txnCounter++}`;
 
-  // ── Send message ───────────────────────────────────────────
-  const sendRes = http.put(
-    `${BASE_URL}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`,
-    JSON.stringify({
-      msgtype: "m.text",
-      body: `stress test msg from ${user.username}@${tenantName} iter=${__ITER}`,
-    }),
-    { headers: headers(tenantName, token) }
-  );
-
-  check(sendRes, {
-    "message sent (200)": (r) => r.status === 200,
-  });
-  messageSendDuration.add(sendRes.timings.duration, { tenant: tenantName });
-
-  // ── Read timeline ──────────────────────────────────────────
-  const timelineRes = http.get(
-    `${BASE_URL}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages?dir=b&limit=10`,
-    { headers: headers(tenantName, token) }
-  );
-
-  check(timelineRes, {
-    "timeline read (200)": (r) => r.status === 200,
-  });
-  timelineReadDuration.add(timelineRes.timings.duration, { tenant: tenantName });
-
-  // ── Verify no cross-tenant leak in timeline ────────────────
-  if (timelineRes.status === 200) {
-    const events = timelineRes.json().chunk || [];
-    const allOwnTenant = events.every((evt) => {
-      // sender format: @username:server_name
-      const sender = evt.sender || "";
-      return sender.endsWith(`:${tenantName}`);
-    });
-    check(null, {
-      "no cross-tenant leak in timeline": () => allOwnTenant,
-    });
+  // ── Burst: send 3 messages quickly ─────────────────────────
+  for (let i = 0; i < 3; i++) {
+    sendMessage(
+      tenantName, token, roomId,
+      `burst msg ${i} from ${user.username}@${tenantName} iter=${__ITER}`
+    );
   }
 
+  // ── Wait (simulates user reading/typing) ───────────────────
+  sleep(2 + Math.random() * 3); // 2-5s pause
+
+  // ── Read timeline ──────────────────────────────────────────
+  readTimeline(tenantName, token, roomId);
+
   // ── Isolation check (every 10th iteration) ─────────────────
-  // Tests actual schema isolation: use current user's token but send the
-  // request with a *different* tenant's Host header. If schema isolation
-  // is working, the token is invalid for the other tenant's key namespace
-  // and Synapse returns 401. If isolation is broken (search_path bleed),
-  // the token would authenticate against the wrong schema.
+  // Uses current user's token with a different tenant's Host header
+  // to test actual schema-level token isolation.
   if (__ITER % 10 === 9) {
     const otherIndex = (tenantNames.indexOf(tenantName) + 1) % tenantNames.length;
     const otherTenantName = tenantNames[otherIndex];
@@ -145,7 +162,7 @@ export default function () {
 
     const isolationRes = http.get(
       `${BASE_URL}/_matrix/client/v3/rooms/${encodeURIComponent(otherRoomId)}/messages?dir=b&limit=1`,
-      { headers: headers(otherTenantName, token) }
+      { headers: hdrs(otherTenantName, token), tags: { name: "isolation_check", tenant: tenantName } }
     );
 
     const isolated = isolationRes.status === 401 || isolationRes.status === 403 || isolationRes.status === 404;
@@ -156,5 +173,6 @@ export default function () {
     isolationCheckRate.add(isolated ? 1 : 0);
   }
 
-  sleep(0.5 + Math.random() * 0.5); // 0.5–1s think time
+  // ── Short pause before next burst ──────────────────────────
+  sleep(1 + Math.random() * 2); // 1-3s
 }

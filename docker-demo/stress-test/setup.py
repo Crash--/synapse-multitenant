@@ -24,11 +24,13 @@ except ImportError:
     )
     import requests
 
+GLOBAL_SHARED_SECRET = "demo_shared_secret_change_in_production"
+
 TENANTS = {
-    "matrix.tenant-a.com": "tenant_a_shared_secret_demo",
-    "matrix.tenant-b.com": "tenant_b_shared_secret_demo",
-    "matrix.tenant-c.com": "tenant_c_shared_secret_demo",
-    "matrix.tenant-d.com": "tenant_d_shared_secret_demo",
+    "matrix.tenant-a.com": GLOBAL_SHARED_SECRET,
+    "matrix.tenant-b.com": GLOBAL_SHARED_SECRET,
+    "matrix.tenant-c.com": GLOBAL_SHARED_SECRET,
+    "matrix.tenant-d.com": GLOBAL_SHARED_SECRET,
 }
 
 USERS_PER_TENANT = 10

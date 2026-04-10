@@ -1,0 +1,55 @@
+# Stress-test observability stack: InfluxDB + Grafana
+#
+# k6 sends metrics to InfluxDB, Grafana visualizes them in real-time.
+#
+# Usage:
+#   docker compose -f docker-compose.yml up -d
+#   # Run k6 with InfluxDB output (see run.sh)
+#   # Open Grafana at http://localhost:3030 (admin/admin)
+#   docker compose -f docker-compose.yml down -v
+
+services:
+  influxdb:
+    image: influxdb:1.8-alpine
+    container_name: stress-influxdb
+    environment:
+      INFLUXDB_DB: k6
+      INFLUXDB_HTTP_AUTH_ENABLED: "false"
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb
+    networks:
+      - stress-net
+      - synapse-net
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: stress-grafana
+    depends_on:
+      - influxdb
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3030:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - stress-net
+
+volumes:
+  influxdb-data:
+  grafana-data:
+
+networks:
+  stress-net:
+    driver: bridge
+  # Connect to the Synapse demo network so k6 container can reach both
+  # InfluxDB and Traefik
+  synapse-net:
+    external: true
+    name: docker-demo_synapse-demo-net
