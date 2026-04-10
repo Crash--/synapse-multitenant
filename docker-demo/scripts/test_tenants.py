@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """End-to-end smoke tests for the 2-tenant docker-demo.
 
-Exercises features from phases 1–6 of the multi-tenant roadmap:
+Exercises features from phases 1–6 and 10 of the multi-tenant roadmap:
 
   Phase 1-2: Registration, login, tenant routing, DB schema isolation
   Phase 3:   (SSO/email/push code overlaid — no external services needed)
   Phase 4:   Per-tenant rate-limit differentiation
   Phase 5:   Tenant-scoped media upload/download
   Phase 6:   SIGHUP reload (Synapse stays healthy after signal)
+  Phase 10:  Federation inbound (per-tenant key server, cross-tenant rooms)
 
 Usage:
     docker compose exec synapse python3 /scripts/test_tenants.py
@@ -376,6 +377,250 @@ def test_sighup_reload(base: str) -> None:
 
 
 # ------------------------------------------------------------------
+# Phase 9-10: Federation
+# ------------------------------------------------------------------
+
+def test_federation_key_server(base: str) -> None:
+    """Phase 10b: Each tenant's /_matrix/key/v2/server returns distinct keys."""
+    print("\n--- Phase 10b: Per-tenant federation key server ---")
+
+    keys_by_tenant: dict[str, dict] = {}
+
+    for tenant, expected_name in [
+        (TENANT_A, TENANT_A),
+        (TENANT_B, TENANT_B),
+    ]:
+        r = requests.get(
+            f"{base}/_matrix/key/v2/server",
+            headers=_headers(tenant),
+            timeout=10,
+        )
+        if not check(
+            f"{tenant} key server responds",
+            r.status_code == 200,
+            f"status={r.status_code}",
+        ):
+            continue
+
+        body = r.json()
+        keys_by_tenant[tenant] = body
+
+        # server_name in response must match the tenant
+        check(
+            f"{tenant} key server returns correct server_name",
+            body.get("server_name") == expected_name,
+            f"got {body.get('server_name')!r}, expected {expected_name!r}",
+        )
+
+        # Must have at least one verify key
+        verify_keys = body.get("verify_keys", {})
+        check(
+            f"{tenant} key server has verify_keys",
+            len(verify_keys) > 0,
+            f"got {len(verify_keys)} keys",
+        )
+
+        # Must have a valid_until_ts in the future
+        valid_until = body.get("valid_until_ts", 0)
+        check(
+            f"{tenant} key server has valid_until_ts",
+            valid_until > int(time.time() * 1000),
+            f"valid_until_ts={valid_until}",
+        )
+
+        # Response must be signed (signatures dict present)
+        sigs = body.get("signatures", {})
+        check(
+            f"{tenant} key response is signed",
+            expected_name in sigs and len(sigs[expected_name]) > 0,
+            f"signatures={list(sigs.keys())}",
+        )
+
+    # The two tenants must have DIFFERENT verify keys
+    if TENANT_A in keys_by_tenant and TENANT_B in keys_by_tenant:
+        vk_a = keys_by_tenant[TENANT_A].get("verify_keys", {})
+        vk_b = keys_by_tenant[TENANT_B].get("verify_keys", {})
+
+        # Compare actual key material — either different key IDs or different key values
+        keys_differ = vk_a != vk_b
+        check(
+            "tenant-a and tenant-b have different signing keys",
+            keys_differ,
+            f"a={list(vk_a.keys())}, b={list(vk_b.keys())}",
+        )
+
+
+def test_federation_version(base: str) -> None:
+    """Phase 10: Federation version endpoint responds per tenant."""
+    print("\n--- Phase 10: Federation version endpoint ---")
+    for tenant in (TENANT_A, TENANT_B):
+        r = requests.get(
+            f"{base}/_matrix/federation/v1/version",
+            headers=_headers(tenant),
+            timeout=10,
+        )
+        if check(
+            f"{tenant} federation version",
+            r.status_code == 200,
+            f"status={r.status_code}",
+        ):
+            body = r.json()
+            server_info = body.get("server", {})
+            check(
+                f"{tenant} federation version has server info",
+                "name" in server_info and "version" in server_info,
+                f"server={server_info}",
+            )
+
+
+def test_cross_tenant_room(base: str, tokens: dict[str, str]) -> None:
+    """Phase 10: Cross-tenant invite, join, and message delivery.
+
+    Even though inter-tenant communication on the same process goes
+    through the local path (not federation wire protocol), this test
+    validates that tenant context switching works correctly for
+    cross-tenant room operations.
+    """
+    print("\n--- Phase 10: Cross-tenant room operations ---")
+
+    if TENANT_A not in tokens or TENANT_B not in tokens:
+        print("  [SKIP] need tokens for both tenants")
+        return
+
+    token_a = tokens[TENANT_A]
+    token_b = tokens[TENANT_B]
+
+    # 1. Create a room on tenant-a
+    r = requests.post(
+        f"{base}/_matrix/client/v3/createRoom",
+        headers=_headers(TENANT_A, token_a),
+        json={"preset": "public_chat", "name": "cross-tenant-test"},
+        timeout=10,
+    )
+    if not check(
+        "create room on tenant-a",
+        r.status_code == 200,
+        f"status={r.status_code} body={r.text[:200]}",
+    ):
+        return
+    room_id = r.json()["room_id"]
+
+    # 2. Invite bob@tenant-b from tenant-a
+    bob_mxid = f"@bob:{TENANT_B}"
+    r = requests.post(
+        f"{base}/_matrix/client/v3/rooms/{room_id}/invite",
+        headers=_headers(TENANT_A, token_a),
+        json={"user_id": bob_mxid},
+        timeout=10,
+    )
+    invite_ok = r.status_code == 200
+    check(
+        f"invite {bob_mxid} to room",
+        invite_ok,
+        f"status={r.status_code} body={r.text[:200]}",
+    )
+
+    if not invite_ok:
+        # Cross-tenant invite may fail if Synapse doesn't support it
+        # in local mode — this is still useful diagnostic info
+        print(f"  NOTE: Cross-tenant invite failed. This may indicate that")
+        print(f"        inter-tenant operations require actual federation.")
+        return
+
+    # 3. Bob joins the room from tenant-b
+    r = requests.post(
+        f"{base}/_matrix/client/v3/join/{room_id}",
+        headers=_headers(TENANT_B, token_b),
+        json={},
+        timeout=10,
+    )
+    join_ok = r.status_code == 200
+    check(
+        f"bob joins room from tenant-b",
+        join_ok,
+        f"status={r.status_code} body={r.text[:200]}",
+    )
+
+    if not join_ok:
+        return
+
+    # 4. Alice sends a message
+    r = requests.put(
+        f"{base}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/fed-test-1",
+        headers=_headers(TENANT_A, token_a),
+        json={"msgtype": "m.text", "body": "hello from tenant-a"},
+        timeout=10,
+    )
+    check(
+        "alice sends message",
+        r.status_code == 200,
+        f"status={r.status_code}",
+    )
+
+    # 5. Bob syncs and should see the message
+    # Use /messages endpoint for simplicity (no sync token needed)
+    time.sleep(1)  # brief settle
+    r = requests.get(
+        f"{base}/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=5",
+        headers=_headers(TENANT_B, token_b),
+        timeout=10,
+    )
+    if check(
+        "bob can read room messages",
+        r.status_code == 200,
+        f"status={r.status_code}",
+    ):
+        messages = r.json().get("chunk", [])
+        bodies = [
+            m.get("content", {}).get("body", "")
+            for m in messages
+            if m.get("type") == "m.room.message"
+        ]
+        check(
+            "bob sees alice's message",
+            "hello from tenant-a" in bodies,
+            f"got bodies={bodies}",
+        )
+
+    # 6. Bob sends a reply
+    r = requests.put(
+        f"{base}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/fed-test-2",
+        headers=_headers(TENANT_B, token_b),
+        json={"msgtype": "m.text", "body": "hello from tenant-b"},
+        timeout=10,
+    )
+    check(
+        "bob sends reply",
+        r.status_code == 200,
+        f"status={r.status_code}",
+    )
+
+    # 7. Alice sees Bob's reply
+    time.sleep(1)
+    r = requests.get(
+        f"{base}/_matrix/client/v3/rooms/{room_id}/messages?dir=b&limit=5",
+        headers=_headers(TENANT_A, token_a),
+        timeout=10,
+    )
+    if check(
+        "alice can read room messages",
+        r.status_code == 200,
+        f"status={r.status_code}",
+    ):
+        messages = r.json().get("chunk", [])
+        bodies = [
+            m.get("content", {}).get("body", "")
+            for m in messages
+            if m.get("type") == "m.room.message"
+        ]
+        check(
+            "alice sees bob's reply",
+            "hello from tenant-b" in bodies,
+            f"got bodies={bodies}",
+        )
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -398,7 +643,7 @@ def main() -> None:
         base = f"http://{args.host}:{args.port}"
 
     print("=" * 60)
-    print("  Multi-Tenant Docker Demo — Smoke Tests (Phases 1-6)")
+    print("  Multi-Tenant Docker Demo — Smoke Tests (Phases 1-6, 10)")
     print(f"  Target: {base}")
     print("=" * 60)
 
@@ -428,6 +673,9 @@ def main() -> None:
     test_media(base, tokens)
     test_admin_tenants(base)
     test_sighup_reload(base)
+    test_federation_key_server(base)
+    test_federation_version(base)
+    test_cross_tenant_room(base, tokens)
 
     # Summary
     print("\n" + "=" * 60)
