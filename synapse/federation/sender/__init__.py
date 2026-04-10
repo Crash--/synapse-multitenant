@@ -267,6 +267,7 @@ class AbstractFederationSender(metaclass=abc.ABCMeta):
         edu_type: str,
         content: JsonDict,
         key: Hashable | None = None,
+        origin: str | None = None,
     ) -> None:
         """Construct an Edu object, and queue it for sending
 
@@ -275,12 +276,17 @@ class AbstractFederationSender(metaclass=abc.ABCMeta):
             edu_type: type of EDU to send
             content: content of EDU
             key: clobbering key for this edu
+            origin: tenant server_name to use as the EDU origin; defaults to
+                resolving from tenant context or global server_name
         """
         raise NotImplementedError()
 
     @abc.abstractmethod
     async def send_device_messages(
-        self, destinations: StrCollection, immediate: bool = True
+        self,
+        destinations: StrCollection,
+        immediate: bool = True,
+        tenant_server_name: str | None = None,
     ) -> None:
         """Tells the sender that a new device message is ready to be sent to the
         destinations. The `immediate` flag specifies whether the messages should
@@ -1092,8 +1098,16 @@ class FederationSender(AbstractFederationSender):
         ):
             return
 
+        # Resolve tenant origin: explicit param > context var > global default
+        if origin is None:
+            from synapse.tenant_context import get_current_tenant
+            tenant = get_current_tenant()
+            if tenant is not None:
+                origin = tenant.server_name
+        tenant_origin = origin if origin is not None else self.server_name
+
         edu = Edu(
-            origin=origin or self.server_name,
+            origin=tenant_origin,
             destination=destination,
             edu_type=edu_type,
             content=content,
@@ -1127,7 +1141,13 @@ class FederationSender(AbstractFederationSender):
         immediate: bool = True,
         tenant_server_name: str | None = None,
     ) -> None:
-        tenant = tenant_server_name or self.server_name
+        # Resolve tenant: explicit param > context var > global default
+        if tenant_server_name is None:
+            from synapse.tenant_context import get_current_tenant
+            tenant_cfg = get_current_tenant()
+            if tenant_cfg is not None:
+                tenant_server_name = tenant_cfg.server_name
+        tenant = tenant_server_name if tenant_server_name is not None else self.server_name
 
         destinations = await filter_destinations_by_retry_limiter(
             [
@@ -1174,7 +1194,13 @@ class FederationSender(AbstractFederationSender):
         ):
             return
 
-        tenant = tenant_server_name or self.server_name
+        # Resolve tenant: explicit param > context var > global default
+        if tenant_server_name is None:
+            from synapse.tenant_context import get_current_tenant
+            tenant_cfg = get_current_tenant()
+            if tenant_cfg is not None:
+                tenant_server_name = tenant_cfg.server_name
+        tenant = tenant_server_name if tenant_server_name is not None else self.server_name
         queue = self._get_per_destination_queue(tenant, destination)
         if queue is not None:
             queue.attempt_new_transaction()
@@ -1223,39 +1249,39 @@ class FederationSender(AbstractFederationSender):
         for tenant_sn, tenant_config in tenant_pairs:
             # Set tenant context so DB queries hit the right schema
             if tenant_config is not None:
-                set_current_tenant(tenant_config)
+                token = set_current_tenant(tenant_config)
 
-            last_processed: str | None = None
+            try:
+                last_processed: str | None = None
 
-            while not self._is_shutdown:
-                destinations_to_wake = (
-                    await self.store.get_catch_up_outstanding_destinations(last_processed)
-                )
+                while not self._is_shutdown:
+                    destinations_to_wake = (
+                        await self.store.get_catch_up_outstanding_destinations(last_processed)
+                    )
 
-                if not destinations_to_wake:
-                    # finished waking all destinations for this tenant!
-                    break
+                    if not destinations_to_wake:
+                        # finished waking all destinations for this tenant!
+                        break
 
-                last_processed = destinations_to_wake[-1]
+                    last_processed = destinations_to_wake[-1]
 
-                destinations_to_wake = [
-                    d
-                    for d in destinations_to_wake
-                    if self._federation_shard_config.should_handle(self._instance_name, d)
-                    and self.hs.config.federation.is_domain_allowed_according_to_federation_whitelist(
+                    destinations_to_wake = [
                         d
-                    )
-                ]
+                        for d in destinations_to_wake
+                        if self._federation_shard_config.should_handle(self._instance_name, d)
+                        and self.hs.config.federation.is_domain_allowed_according_to_federation_whitelist(
+                            d
+                        )
+                    ]
 
-                for destination in destinations_to_wake:
-                    logger.info(
-                        "Destination %s has outstanding catch-up for tenant %s, waking up.",
-                        destination,
-                        tenant_sn,
-                    )
-                    self.wake_destination(destination, tenant_server_name=tenant_sn)
-                    await self.clock.sleep(WAKEUP_INTERVAL_BETWEEN_DESTINATIONS)
-
-        # Clear tenant context
-        if tenants:
-            set_current_tenant(None)
+                    for destination in destinations_to_wake:
+                        logger.info(
+                            "Destination %s has outstanding catch-up for tenant %s, waking up.",
+                            destination,
+                            tenant_sn,
+                        )
+                        self.wake_destination(destination, tenant_server_name=tenant_sn)
+                        await self.clock.sleep(WAKEUP_INTERVAL_BETWEEN_DESTINATIONS)
+            finally:
+                if tenant_config is not None:
+                    set_current_tenant(None)
