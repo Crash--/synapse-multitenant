@@ -161,14 +161,19 @@ def set_current_tenant(tenant: TenantConfig) -> None:
     fileRef: "synapse/storage/database.py",
     code: `tenant = get_current_tenant()
 if tenant is not None:
-    txn.execute(
-        f'SET search_path TO {tenant.database_schema}, public'
-    )
+    # Phase 8: session-level SET + connection cache.
+    # Cache check — skip SET if conn already has this schema.
+    if self._connection_schemas.get(id(conn)) != schema:
+        cursor.execute(f'SET search_path TO {schema}')
+        self._connection_schemas[id(conn)] = schema
 # Each tenant's tables live in their own PG schema.
 # Sequences, indexes, and constraints are all cloned.
-# The 'public' schema holds shared tables (e.g. tenants).`,
+# No SHOW or restore needed — session SET persists.`,
     codeLang: "python",
-    logLines: ["db: SET search_path TO tenant_acme, public"],
+    logLines: [
+      "db: SET search_path TO tenant_acme (cached — skip if unchanged)",
+      "db: pgbouncer session mode, cp_max=50, max_connections=200",
+    ],
     upstream: "upostgres",
     upstreamFileRef: "synapse/storage/database.py",
     upstreamCode: `# One database, no schema switching.
@@ -815,19 +820,36 @@ CREATE TABLE public.tenants (
 # │ (proxy)  │  └─────────────────────────────┘  │ (files)  │
 # └──────────┘                                   └──────────┘
 #
-# Phases 1-7 complete. Federation (8-9) next.
+# Phases 1-10 landed. Phase 10' fix-up in progress.
 #
-# Possible bottlenecks to watch:
-#   • Connection pool under high tenant count
-#   • search_path SET per transaction (no caching)
+# Phase 9 resolved:
+#   ✅ Outbound federation: (tenant, dest) keyed queues
+#   ✅ Signing: per-tenant key via MultiTenantKeyring
+#   ✅ Event loop: per-event-batch tenant dispatch
+#   ✅ EDU origin: tenant server_name on all EDUs
+# Phase 10 resolved:
+#   ✅ Inbound federation: X-Matrix destination → tenant context
+#   ✅ FederationServer: _effective_server_name for EDUs/signing
+#   ✅ Per-tenant federation allow-lists (TenantFederationConfig)
+#   ✅ EventAuthHandler: tenant-aware is_host_joined
+# Phase 10' bugs (surfaced by e2e tests):
+#   🔴 Key server returns global keys (no tenant context on unauth endpoints)
+#   🔴 Cross-tenant room join fails (sibling tenants seen as remote)
+# Remaining bottlenecks:
+#   • Phase 10' fix-up (key server + cross-tenant join)
+#   • E2EE audit pass (phase 11)
 #   • Schema cloning time for 168+ tables
-#   • Single-process ceiling (no workers yet)`,
+#   • Single-process ceiling (no workers yet)
+#   • GIL hard ceiling at ~100-200 tenants`,
     codeLang: "python",
     logLines: [
-      "recap: 7 phases complete — request routing to control plane",
+      "recap: 10 phases landed — federation inbound + outbound",
       "recap: 1 process, N tenants, 0 shared state",
       "recap: DB-driven tenancy, zero-tenant boot, HTTP push reload",
-      "recap: watch: pool pressure, search_path overhead, clone time",
+      "recap: pool tuned: pgbouncer + schema caching → ~100-200 ceiling",
+      "recap: federation out: per-tenant queues, signing, EDU origin",
+      "recap: federation in: X-Matrix dest routing, allow-lists",
+      "recap: 10' fix-up needed: key server tenant ctx + cross-tenant join",
     ],
     upstream: "all",
     upstreamFileRef: null,

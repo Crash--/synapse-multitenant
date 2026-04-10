@@ -1,6 +1,6 @@
 # Multi-Tenant Synapse — Roadmap Progress Report
 
-**Date:** 2026-04-10 (DB tuning phase added — 9th reconciliation)
+**Date:** 2026-04-10 (Phase 10' added — 13th reconciliation)
 **Branch:** `feature/multi-tenant`
 **Companion to:** `docs/multi_tenant_roadmap.md` (the canonical roadmap),
 `docs/multi_tenant.md` (design), and the `multi-tenancy-workflow/`
@@ -24,9 +24,10 @@ remaining scope or sequencing needs adjustment.
 | **5. File storage providers** | ✅ Complete | `FileStorageProviderBackend._tenant_base` resolves `<base>/<server_name>/` for store/fetch. `MediaStorage._local_path` replaces 4 global join sites. `MediaRepository` wired to `MultiTenantMediaFilePaths` via factory. URL previewer + thumbnailer audited — no bypasses. 8 probes green. S3 provider deferred (future: single shared bucket, `server_name` key prefix). |
 | **6. Hot add/remove + backup/restore** | ✅ Complete | **6a**: SIGHUP-triggered hot reload — `TenantRegistry.reload()`, `MultiTenantKeyring.reload()`, `TenantAppServiceRegistry.reload()`, `TenantRatelimiterRegistry.reload()` with in-place mutable-registry pattern. Inactive tenants filtered from all query methods. **6b**: `synapse_tenant backup`/`restore`/`drop` CLI subcommands (pg_dump/psql + media tar). 16 probes green. |
 | **7. Dynamic tenant control plane** | ✅ Complete | Database-driven tenancy replaces YAML tenant list. Standalone TypeScript/Fastify control plane service handles full tenant lifecycle (create, suspend, activate, delete). AES-256-GCM encrypted signing keys in DB. Synapse boots with zero tenants and loads from `public.tenants` table. HTTP-push reload endpoint. See Phase 7 section below. |
-| **8. Database tuning & connection optimization** | ⏸ Not started | Three sub-phases: **8a** `SET LOCAL search_path` (eliminate SHOW + restore, ~10 lines), **8b** connection-level schema caching (skip SET if unchanged, ~50 lines), **8c** pool tuning + pgbouncer sidecar. Target: raise ceiling from ~10-15 to ~100-200 tenants. See `challenges.md` for capacity estimates. |
-| **9. Federation outbound** | ⏸ Not started | |
-| **10. Federation inbound** | ⏸ Not started | |
+| **8. Database tuning & connection optimization** | ✅ Complete | All sub-phases closed 2026-04-10. **8a**: Session-level `SET search_path` replaces 3-round-trip pattern (SHOW + SET + restore → single SET). `SET LOCAL` was rejected because `db_autocommit=True` paths break it. `_restore_search_path` deleted. **8b**: `_connection_schemas` dict on `DatabasePool` caches which schema each connection has SET; skips redundant SET for consecutive same-tenant requests. Cache cleared on `conn.reconnect()`. **8c**: pgbouncer sidecar (session mode) added to `docker-multitenant/`, `cp_max` raised 10→50, Postgres `max_connections` raised to 200. 7 unit probes green. Capacity curve documented in `docs/multi_tenant.md`. |
+| **9. Federation outbound** | ✅ Complete | All sub-phases closed 2026-04-10. **9a**: `_per_destination_queues` keyed by `(tenant_server_name, destination)` tuple. `PerDestinationQueue` stores tenant `server_name` + `signing_key`. `_tenant_for_event` helper extracts tenant from event sender. `TransactionManager.send_new_transaction` accepts `origin` param. **9b**: `build_auth_headers` in `MatrixFederationHttpClient` accepts optional `origin` + `signing_key` overrides, threaded through `_send_request` → `put_json` → transport layer `send_transaction`. **9c**: Event queue loop groups events by tenant origin before dispatch. `send_read_receipt`, `send_presence_to_destinations`, `build_and_send_edu`, `send_device_messages` resolve tenant from context var. Catchup loop iterates all tenant schemas. **9d**: EDU origin stamping verified — falls out of 9a queue constructor. External-facing methods use 3-tier resolution: explicit param → context var → global default. 15 probes green, 14 existing federation tests green (29 total). |
+| **10. Federation inbound** | 🟢 Majority complete | Sub-phases 10a–10e closed 2026-04-10. **10a**: Three-tier federation destination resolution in `Authenticator` (X-Matrix `destination` → tenant context → global default). **10b**: `LocalKey.on_GET` returns per-tenant keys via `MultiTenantKeyring` with per-tenant response cache. **10c**: `FederationServer._effective_server_name` / `_effective_signing_key` properties; EDU destination, event signing, transaction origin all tenant-aware. **10d**: `TenantFederationConfig` dataclass with per-tenant `federation_domain_whitelist`; three-tier whitelist resolution (tenant → global → allow all). **10e**: `EventAuthHandler._effective_server_name` for correct `is_host_joined` room membership checks. 20 unit probes green. **Two bugs surfaced by docker-demo e2e tests — see Phase 10' below.** |
+| **10'. Federation inbound fix-up** | 🟡 In progress | Two bugs surfaced by `docker-demo/scripts/test_tenants.py` e2e tests: **(10'-a)** `/_matrix/key/v2/server` returns global `localhost` keys instead of per-tenant keys — tenant context not set for unauthenticated endpoints (Host header → ContextVar path missing). **(10'-b)** Cross-tenant room join fails ("no servers in the room") — the join codepath treats sibling tenants as remote despite `is_mine_server_name` returning True. |
 | **11. E2EE audit pass** | ⏸ Not started | |
 | **12. Workers** | ⏸ Not started | |
 | **13. Optional hardening** | ⏸ Not started | Full per-tenant SAML `Saml2Client` SP construction, per-tenant email templates, storage-layer `_server_notices_mxid` cache. |
@@ -590,6 +591,63 @@ Total: **27/0** (27 pass, 0 fail).
 
 ---
 
+## Phase 10' — Federation inbound fix-up
+
+Roadmap reference: remediation pass on Phase 10, surfaced by
+`docker-demo/scripts/test_tenants.py` e2e federation tests added
+2026-04-10.
+
+### Bugs detected
+
+**10'-a: Key server endpoint returns global keys instead of per-tenant keys.**
+
+The `/_matrix/key/v2/server` endpoint is unauthenticated — it does not
+go through the federation `Authenticator` that calls
+`_resolve_federation_destination` and sets the tenant ContextVar. The
+`LocalKey.on_GET` handler therefore sees `get_current_tenant() == None`
+and falls through to the global response (server_name=`localhost`,
+global signing key).
+
+Root cause: the tenant context is only set in two places today:
+(1) the request-path `TenantRouter` middleware (matches by `Host` header
+for Client-Server API), and (2) the federation `Authenticator` (matches
+by X-Matrix `destination`). The key server endpoint is neither — it's
+an unauthenticated federation endpoint routed by `Host` header, but the
+federation `JsonResource` doesn't run the `TenantRouter` middleware.
+
+Fix direction: ensure unauthenticated federation endpoints that are
+routed by `Host` header get tenant context set before the handler runs.
+Options: (a) add a `Host` → tenant context middleware to the federation
+`TransportLayerServer`, or (b) set tenant context in
+`BaseFederationServlet._wrap` before the auth step.
+
+**10'-b: Cross-tenant room join fails.**
+
+When bob@tenant-b tries to join a room created on tenant-a, Synapse
+returns 404 with `"Can't join remote room because no servers that are in
+the room have been provided."` The invite succeeds (tenant-a → tenant-b),
+but the join from tenant-b's perspective fails.
+
+Root cause: `is_mine_server_name` returns True for all tenants on the
+same process, so the invite takes the local path correctly. However, the
+join codepath on the *joining* side (tenant-b) looks for servers in the
+room that it can federate with. Since all members are "local" (from
+`is_mine_server_name`'s perspective), no federation targets are found —
+but the joining tenant's own schema doesn't have the room state, so the
+local join path also fails.
+
+Fix direction: the join handler needs to recognize that a room owned by
+a sibling tenant should be joined via the local room-join path (internal
+federation or direct state injection), not by looking for external
+federation targets.
+
+### Gaps still owed
+
+- 10'-a: Tenant context for unauthenticated federation endpoints
+- 10'-b: Cross-tenant room join via local path
+
+---
+
 ## Cross-cutting items surfaced during this work
 
 These are issues or follow-ups that don't map cleanly to a single
@@ -706,19 +764,85 @@ Total: **16/0** (16 pass, 0 fail).
 
 ---
 
+## Phase 8 — Database tuning & connection optimization (✅ Complete)
+
+Closed 2026-04-10. Goal: raise tenant ceiling from ~10-15 to ~100-200.
+
+### 8a — Session-level SET search_path
+
+Replaced the 3-round-trip pattern in `synapse/storage/database.py`:
+
+| Before (3 SQL commands) | After (1 SQL command) |
+|---|---|
+| `SHOW search_path` (capture original) | *(removed)* |
+| `SET search_path TO <schema>` | `SET search_path TO <schema>` |
+| `SET search_path TO <original>` (restore) | *(removed)* |
+
+`_restore_search_path()` method deleted entirely. `_set_tenant_schema()`
+now returns `None` instead of the original search_path. `runWithConnection()`
+simplified — no `original_search_path` variable, no finally-block restore.
+
+**Design decision:** Session-level `SET` chosen over `SET LOCAL` because
+Synapse has many `db_autocommit=True` code paths (lines 1929, 1978, 2066,
+2096, 2174, 2386, 2467, 2508, 2564) where `SET LOCAL` would scope to just
+the SET statement itself and reset immediately.
+
+### 8b — Connection-level schema caching
+
+Added `_connection_schemas: dict[int, str]` on `DatabasePool` — maps
+`id(conn)` to the schema name currently SET on that connection. Before
+issuing SET, checks the cache; on hit, skips entirely. On miss, executes
+SET and updates cache. Cache cleared via `_clear_connection_schema_cache()`
+after each `conn.reconnect()` call (two sites in `runWithConnection`).
+
+### 8c — Pool tuning + pgbouncer
+
+- `cp_max` raised from 10 to 50 in `docker-multitenant/config/homeserver.yaml`
+- pgbouncer sidecar added to `docker-multitenant/docker-compose.yml`
+  (edoburu/pgbouncer:1.23.1, session mode, `DEFAULT_POOL_SIZE=50`,
+  `MAX_CLIENT_CONN=200`, `MAX_DB_CONNECTIONS=100`)
+- Synapse connects through pgbouncer (port 6432) instead of directly to Postgres
+- Postgres `max_connections` raised to 200
+- `init-schemas` service still connects directly to Postgres (DDL operations)
+
+### Probes
+
+| Probe | File | Result |
+|---|---|---|
+| `test_no_show_search_path` | `test_database_tuning` | PASS |
+| `test_no_restore_search_path` | `test_database_tuning` | PASS |
+| `test_returns_none` | `test_database_tuning` | PASS |
+| `test_single_set` | `test_database_tuning` | PASS |
+| `test_cache_hit_skips_set` | `test_database_tuning` | PASS |
+| `test_cache_miss_on_switch` | `test_database_tuning` | PASS |
+| `test_reconnect_clears_cache` | `test_database_tuning` | PASS |
+
+Total: **7/0** (7 pass, 0 fail).
+
+### Documentation
+
+Capacity curve and pool tuning guidance added to `docs/multi_tenant.md`.
+Roadmap phase 8a description updated to reflect session SET over SET LOCAL.
+
+---
+
 ## Suggested next steps (for management to weigh)
 
 Ordered by what's cheapest to ship and what unblocks the most
-downstream work. Phases 1–7 are complete.
+downstream work. Phases 1–10 are complete (10 has two known bugs).
 
-1. **Phase 8–9 — Federation outbound + inbound.** Per-tenant
-   `FederationSender`, federation key serving, `.well-known`
-   responses. Largest remaining chunk.
-2. **S3 storage provider (phase 5 follow-up).** Single shared bucket
+1. **Phase 10' — Federation inbound fix-up.** Two bugs surfaced by e2e
+   tests: (a) key server returns global keys for all tenants — tenant
+   context not set for unauthenticated endpoints, (b) cross-tenant room
+   join fails — sibling tenants treated as remote with no federation
+   target. Small scope, high impact — blocks federation demos.
+2. **Phase 11 — E2EE audit pass.** Verify no device-key, cross-signing,
+   or key-backup cache crosses tenants; tenant-scope the federation key
+   query cache; graceful signing-key rotation tooling.
+3. **S3 storage provider (phase 5 follow-up).** Single shared bucket
    with `server_name` key prefix. Unblocks k8s deployments where pods
    don't share disks.
-3. **Defer phases 10–12 as currently sequenced.** Nothing learned in
-   phases 1–7 suggests a re-order.
+4. **Phase 12 — Workers.** Nothing learned so far suggests a re-order.
 
 ---
 

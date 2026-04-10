@@ -36,9 +36,12 @@ except ImportError:
 
 TENANT_A = "matrix.tenant-a.com"
 TENANT_B = "matrix.tenant-b.com"
-SHARED_SECRET_A = "tenant_a_shared_secret_demo"
-SHARED_SECRET_B = "tenant_b_shared_secret_demo"
+SHARED_SECRET_A = "demo_shared_secret_change_in_production"
+SHARED_SECRET_B = "demo_shared_secret_change_in_production"
 ADMIN_SECRET = "demo_shared_secret_change_in_production"
+
+# Unique suffix per run so re-runs don't collide with existing users
+_RUN_ID = str(int(time.time()))[-6:]
 
 passed = 0
 failed = 0
@@ -119,6 +122,22 @@ def register_user(base: str, tenant: str, username: str, password: str, shared_s
     )
     if r.status_code in (200, 201):
         return r.json().get("access_token")
+
+    # User may already exist from a previous run — fall back to login
+    if r.status_code == 400:
+        lr = requests.post(
+            f"{base}/_matrix/client/v3/login",
+            headers=_headers(tenant),
+            json={
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": username},
+                "password": password,
+            },
+            timeout=10,
+        )
+        if lr.status_code == 200:
+            return lr.json().get("access_token")
+
     return None
 
 
@@ -216,8 +235,8 @@ def test_registration_and_isolation(base: str) -> dict[str, str]:
     tokens = {}
 
     for tenant, secret, user in [
-        (TENANT_A, SHARED_SECRET_A, "alice"),
-        (TENANT_B, SHARED_SECRET_B, "bob"),
+        (TENANT_A, SHARED_SECRET_A, f"alice_{_RUN_ID}"),
+        (TENANT_B, SHARED_SECRET_B, f"bob_{_RUN_ID}"),
     ]:
         token = register_user(base, tenant, user, "testpass123", secret)
         ok = token is not None
@@ -228,7 +247,7 @@ def test_registration_and_isolation(base: str) -> dict[str, str]:
     # Isolation: alice's profile should not be visible on tenant-b
     if TENANT_A in tokens and TENANT_B in tokens:
         r = requests.get(
-            f"{base}/_matrix/client/v3/profile/@alice:{TENANT_A}",
+            f"{base}/_matrix/client/v3/profile/@alice_{_RUN_ID}:{TENANT_A}",
             headers=_headers(TENANT_B, tokens[TENANT_B]),
             timeout=10,
         )
@@ -302,7 +321,7 @@ def test_admin_tenants(base: str) -> None:
     print("\n--- Phase 4/6: Admin tenant API ---")
 
     # Register an admin on tenant-a
-    admin_token = register_admin(base, TENANT_A, "demoadmin", "adminpass123")
+    admin_token = register_admin(base, TENANT_A, f"demoadmin_{_RUN_ID}", "adminpass123")
     if not admin_token:
         print("  [SKIP] could not register admin user")
         return
@@ -506,7 +525,7 @@ def test_cross_tenant_room(base: str, tokens: dict[str, str]) -> None:
     room_id = r.json()["room_id"]
 
     # 2. Invite bob@tenant-b from tenant-a
-    bob_mxid = f"@bob:{TENANT_B}"
+    bob_mxid = f"@bob_{_RUN_ID}:{TENANT_B}"
     r = requests.post(
         f"{base}/_matrix/client/v3/rooms/{room_id}/invite",
         headers=_headers(TENANT_A, token_a),
