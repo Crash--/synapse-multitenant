@@ -380,3 +380,39 @@ class TestTenantFederationConfig(TestCase):
                 fed_config, "unknown.com", tenant_federation_config=tenant_fed
             )
         )
+
+
+# ── 10e probes: EventAuthHandler tenant-awareness ────────────────
+
+
+class TestEventAuthHandlerEffectiveServerName(TestCase):
+    """EventAuthHandler._effective_server_name must resolve from tenant context."""
+
+    def _make_handler(self, hostname: str = "main.localhost"):
+        from synapse.handlers.event_auth import EventAuthHandler
+
+        hs = MagicMock()
+        hs.hostname = hostname
+        hs.get_clock.return_value = MagicMock()
+        hs.get_datastores.return_value.main = MagicMock()
+        hs.get_storage_controllers.return_value.state = MagicMock()
+        return EventAuthHandler(hs)
+
+    def test_effective_server_name_with_tenant(self) -> None:
+        """_effective_server_name returns tenant's server_name when context is set."""
+        handler = self._make_handler()
+        acme = _make_tenant("acme")
+        with patch(
+            "synapse.handlers.event_auth.get_current_tenant",
+            return_value=acme,
+        ):
+            self.assertEqual(handler._effective_server_name, "acme.localhost")
+
+    def test_effective_server_name_without_tenant(self) -> None:
+        """_effective_server_name falls back to self._server_name when no context."""
+        handler = self._make_handler()
+        with patch(
+            "synapse.handlers.event_auth.get_current_tenant",
+            return_value=None,
+        ):
+            self.assertEqual(handler._effective_server_name, "main.localhost")
