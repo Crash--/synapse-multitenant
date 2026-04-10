@@ -71,7 +71,7 @@ class TransportLayerServer(JsonResource):
 
         self.authenticator = Authenticator(
             hs,
-            tenant_registry=getattr(hs, 'get_tenant_registry', lambda: None)(),
+            tenant_registry=hs.get_tenant_registry(),
         )
         self.ratelimiter = hs.get_federation_ratelimiter()
 

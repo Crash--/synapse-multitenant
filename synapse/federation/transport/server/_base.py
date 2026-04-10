@@ -27,8 +27,8 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 from synapse.api.errors import Codes, FederationDeniedError, SynapseError
-from synapse.tenant_context import get_current_tenant, set_current_tenant
 from synapse.api.urls import FEDERATION_V1_PREFIX
+from synapse.tenant_context import get_current_tenant, set_current_tenant
 from synapse.http.server import HttpServer, ServletCallback
 from synapse.http.servlet import parse_json_object_from_request
 from synapse.http.site import SynapseRequest
@@ -67,7 +67,7 @@ class Authenticator:
         hs: "HomeServer",
         tenant_registry: "TenantRegistry | None" = None,
     ):
-        self._hs = hs
+        self._hs = hs  # used in 10d for tenant-aware federation whitelist
         self._clock = hs.get_clock()
         self.keyring = hs.get_keyring()
         self.server_name = hs.hostname
@@ -152,16 +152,6 @@ class Authenticator:
 
                 if destination is not None:
                     last_destination = destination
-
-                # if the origin_server sent a destination along it needs to match our own server_name
-                if destination is not None and not self._is_mine_server_name(
-                    destination
-                ):
-                    raise AuthenticationError(
-                        HTTPStatus.UNAUTHORIZED,
-                        f"Destination mismatch in auth header, received: {destination!r}",
-                        Codes.UNAUTHORIZED,
-                    )
 
         # Resolve the destination using multi-tenant three-tier fallback
         json_request["destination"] = self._resolve_federation_destination(
