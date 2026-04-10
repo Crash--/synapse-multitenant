@@ -588,6 +588,7 @@ class DatabasePool:
 
     _TXN_ID = 0
     engine: BaseDatabaseEngine
+    _connection_schemas: dict[int, str] = {}  # overridden per-instance in __init__
 
     def __init__(
         self,
@@ -622,6 +623,11 @@ class DatabasePool:
         self._txn_perf_counters = PerformanceCounters()
 
         self.engine = engine
+
+        # Phase 8b: per-connection schema cache.  Maps id(conn) → schema
+        # name currently SET on that connection.  Avoids redundant SET
+        # commands for consecutive same-tenant requests on the same conn.
+        self._connection_schemas: dict[int, str] = {}
 
         # A set of tables that are not safe to use native upserts in.
         self._unsafe_to_upsert_tables = set(UNIQUE_INDEX_BACKGROUND_UPDATES.keys())
@@ -664,6 +670,9 @@ class DatabasePool:
         pool with this schema still set — the next borrower will SET to
         its own tenant.
 
+        Includes connection-level caching: if this connection already has
+        the requested schema set, the SET is skipped entirely.
+
         Args:
             conn: The database connection.
             tenant: The tenant configuration.
@@ -675,20 +684,37 @@ class DatabasePool:
         if not schema.replace("_", "").isalnum():
             raise ValueError(f"Invalid schema name: {schema}")
 
+        # Cache check: skip SET if this connection already has the right schema
+        conn_id = id(conn)
+        if self._connection_schemas.get(conn_id) == schema:
+            logger.debug(
+                "search_path cache hit for '%s' on conn %d",
+                schema,
+                conn_id,
+            )
+            return
+
         cursor = conn.cursor()
         try:
             # Security-first policy: do NOT include `, public` as a fallback.
-            # Any table missing from the tenant schema must fail loud, not
-            # silently resolve in public. See
-            # docs/multi_tenant_isolation_model.md for the reasoning.
             cursor.execute(f"SET search_path TO {schema}")
+            self._connection_schemas[conn_id] = schema
             logger.debug(
-                "Set search_path to '%s' for tenant %s",
+                "Set search_path to '%s' for tenant %s (conn %d)",
                 schema,
                 tenant.server_name,
+                conn_id,
             )
         finally:
             cursor.close()
+
+    def _clear_connection_schema_cache(self, conn: Connection) -> None:
+        """Remove the cached schema for a connection.
+
+        Called after conn.reconnect() — the underlying DB connection is
+        fresh and its search_path is back to the default.
+        """
+        self._connection_schemas.pop(id(conn), None)
 
     def assert_tenant_schema_isolated(
         self,
@@ -1186,6 +1212,7 @@ class DatabasePool:
                                 "Reconnecting database connection over transaction limit"
                             )
                             conn.reconnect()
+                            self._clear_connection_schema_cache(conn)
                             opentracing.log_kv(
                                 {"message": "reconnected due to txn limit"}
                             )
@@ -1194,6 +1221,7 @@ class DatabasePool:
                     if self.engine.is_connection_closed(conn):
                         logger.debug("Reconnecting closed database connection")
                         conn.reconnect()
+                        self._clear_connection_schema_cache(conn)
                         opentracing.log_kv({"message": "reconnected"})
                         if self._txn_limit > 0:
                             self._txn_counters[tid] = 1
