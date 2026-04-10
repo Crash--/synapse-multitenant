@@ -28,6 +28,7 @@ The registry also handles:
 
 import logging
 import os
+from io import StringIO
 from typing import TYPE_CHECKING
 
 from signedjson.key import read_signing_keys
@@ -260,6 +261,10 @@ class TenantRegistry:
     def load_signing_key(self, server_name: str) -> list:
         """Load and cache the signing key for a tenant.
 
+        Supports two sources:
+        - Filesystem: when ``tenant.signing_key_path`` is set.
+        - In-memory: when ``tenant.signing_key_data`` is set (DB-sourced).
+
         Args:
             server_name: The tenant server name.
 
@@ -275,7 +280,21 @@ class TenantRegistry:
 
         tenant = self.get_tenant_or_raise(server_name)
 
+        if tenant.signing_key_data is not None:
+            # DB-sourced key: parse from in-memory string
+            keys = read_signing_keys(StringIO(tenant.signing_key_data))
+            self._signing_keys[server_name] = keys
+            logger.info(
+                "Loaded signing key for tenant %s from database",
+                server_name,
+            )
+            return keys
+
         key_path = tenant.signing_key_path
+        if key_path is None:
+            raise ValueError(
+                f"Tenant {server_name} has neither signing_key_path nor signing_key_data"
+            )
         if not os.path.exists(key_path):
             raise FileNotFoundError(
                 f"Signing key file not found for tenant {server_name}: {key_path}"
@@ -347,6 +366,67 @@ class TenantRegistry:
         """
         tenant = self.get_tenant_or_raise(server_name)
         return tenant.database_schema
+
+
+def load_tenants_from_database(
+    db_conn,
+    master_key: bytes | None = None,
+    default_schema: str = "public",
+) -> MultiTenantConfig:
+    """Load tenant configurations from the ``public.tenants`` table.
+
+    Args:
+        db_conn: A DB-API 2 connection (e.g. ``psycopg2.connection``).
+        master_key: AES-256-GCM master key for decrypting signing keys.
+            Required when tenants have encrypted keys in the database.
+        default_schema: The default schema name.
+
+    Returns:
+        A ``MultiTenantConfig`` with ``source="database"`` containing all
+        active tenants.
+    """
+    cursor = db_conn.cursor()
+    cursor.execute(
+        "SELECT * FROM public.tenants WHERE status = 'active'"
+    )
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    cursor.close()
+
+    tenants: dict[str, TenantConfig] = {}
+
+    for row_tuple in rows:
+        row = dict(zip(columns, row_tuple))
+
+        # Decrypt signing key if encrypted column is present
+        encrypted_key = row.get("signing_key_encrypted")
+        if encrypted_key is not None and master_key is not None:
+            from synapse.crypto.tenant_key_encryption import decrypt_signing_key
+            row["signing_key_data"] = decrypt_signing_key(
+                encrypted_key, master_key
+            )
+        elif row.get("signing_key_data") is None:
+            logger.warning(
+                "Tenant %s has no signing key data and no encrypted key",
+                row.get("server_name"),
+            )
+            continue
+
+        # Parse JSONB columns — psycopg2 returns them as dicts already
+        tenant = TenantConfig.from_db_row(row)
+        tenants[tenant.server_name] = tenant
+        logger.info(
+            "Loaded tenant %s (schema: %s) from database",
+            tenant.server_name,
+            tenant.database_schema,
+        )
+
+    return MultiTenantConfig(
+        enabled=True,
+        default_schema=default_schema,
+        source="database",
+        tenants=tenants,
+    )
 
 
 def create_tenant_registry(hs: "HomeServer") -> TenantRegistry:

@@ -39,6 +39,7 @@ from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
 from synapse.http.site import SynapseRequest
 from synapse.rest.admin._base import admin_patterns, assert_requester_is_admin
+from synapse.tenant_registry import load_tenants_from_database
 from synapse.types import JsonDict
 
 if TYPE_CHECKING:
@@ -81,12 +82,12 @@ class ListTenantsRestServlet(RestServlet):
             return HTTPStatus.OK, {"tenants": [], "total": 0, "multi_tenant_enabled": False}
 
         tenants = []
-        for tenant in self._tenants_config.multi_tenant.tenants:
+        for tenant in self._tenants_config.multi_tenant.tenants.values():
             tenants.append({
                 "server_name": tenant.server_name,
                 "database_schema": tenant.database_schema,
                 "registration_enabled": tenant.registration_enabled,
-                "federation_enabled": tenant.federation_enabled,
+                "federation_enabled": tenant.enable_federation,
                 "media_store_path": tenant.media_store_path,
             })
 
@@ -131,9 +132,9 @@ class TenantRestServlet(RestServlet):
                 Codes.FORBIDDEN,
             )
 
-        for tenant in self._tenants_config.multi_tenant.tenants:
-            if tenant.server_name == server_name:
-                return tenant
+        tenant = self._tenants_config.multi_tenant.tenants.get(server_name)
+        if tenant is not None:
+            return tenant
 
         raise NotFoundError(f"Tenant '{server_name}' not found")
 
@@ -150,9 +151,8 @@ class TenantRestServlet(RestServlet):
             "signing_key_path": tenant.signing_key_path,
             "media_store_path": tenant.media_store_path,
             "registration_enabled": tenant.registration_enabled,
-            "federation_enabled": tenant.federation_enabled,
-            "max_users": tenant.max_users,
-            "max_rooms": tenant.max_rooms,
+            "federation_enabled": tenant.enable_federation,
+            "max_mau_value": tenant.max_mau_value,
         }
 
     async def on_PUT(
@@ -175,7 +175,7 @@ class TenantRestServlet(RestServlet):
         # actual updates would require modifying the config file and restarting.
         # A future implementation could support hot-reloading certain settings.
 
-        updatable_fields = ["registration_enabled", "federation_enabled", "max_users", "max_rooms"]
+        updatable_fields = ["registration_enabled", "enable_federation", "max_mau_value"]
         updates = {}
         for field in updatable_fields:
             if field in body:
@@ -282,13 +282,12 @@ class CreateTenantRestServlet(RestServlet):
 
         # Check if tenant already exists
         if self._tenants_config and self._tenants_config.multi_tenant.enabled:
-            for tenant in self._tenants_config.multi_tenant.tenants:
-                if tenant.server_name == server_name:
-                    raise SynapseError(
-                        HTTPStatus.CONFLICT,
-                        f"Tenant '{server_name}' already exists",
-                        Codes.RESOURCE_LIMIT_EXCEEDED,
-                    )
+            if server_name in self._tenants_config.multi_tenant.tenants:
+                raise SynapseError(
+                    HTTPStatus.CONFLICT,
+                    f"Tenant '{server_name}' already exists",
+                    Codes.RESOURCE_LIMIT_EXCEEDED,
+                )
 
         # Generate default values for optional fields
         safe_name = server_name.replace(".", "_").replace("-", "_")
@@ -366,12 +365,7 @@ class ReloadTenantKeysRestServlet(RestServlet):
             )
 
         # Verify tenant exists
-        tenant = None
-        for t in self._tenants_config.multi_tenant.tenants:
-            if t.server_name == server_name:
-                tenant = t
-                break
-
+        tenant = self._tenants_config.multi_tenant.tenants.get(server_name)
         if tenant is None:
             raise NotFoundError(f"Tenant '{server_name}' not found")
 
@@ -446,12 +440,7 @@ class TenantStatusRestServlet(RestServlet):
             )
 
         # Verify tenant exists
-        tenant = None
-        for t in self._tenants_config.multi_tenant.tenants:
-            if t.server_name == server_name:
-                tenant = t
-                break
-
+        tenant = self._tenants_config.multi_tenant.tenants.get(server_name)
         if tenant is None:
             raise NotFoundError(f"Tenant '{server_name}' not found")
 
@@ -469,10 +458,129 @@ class TenantStatusRestServlet(RestServlet):
             "keys_loaded": keys_loaded,
             "database_schema": tenant.database_schema,
             "registration_enabled": tenant.registration_enabled,
-            "federation_enabled": tenant.federation_enabled,
+            "federation_enabled": tenant.enable_federation,
         }
 
         return HTTPStatus.OK, status_info
+
+
+class ReloadTenantsRestServlet(RestServlet):
+    """Reload tenant configuration from the database.
+
+    POST /_synapse/admin/v1/tenants/reload
+
+    Authenticated via bearer token (``multi_tenant.reload_secret`` from
+    homeserver.yaml), **not** Matrix admin auth.  This allows the control
+    plane service to trigger a reload without being a Matrix user.
+
+    When ``multi_tenant.source`` is ``"database"``, this endpoint:
+    1. Queries ``public.tenants WHERE status = 'active'``
+    2. Decrypts signing keys using the master key env var
+    3. Calls ``TenantRegistry.reload()`` + cascades to keyring /
+       ratelimiter / appservice registries
+
+    When ``source`` is ``"yaml"``, it re-reads the config file
+    (same as SIGHUP).
+
+    Returns:
+        {"added": [...], "removed": [...], "unchanged": [...]}
+    """
+
+    PATTERNS = admin_patterns("/tenants/reload$")
+
+    def __init__(self, hs: "HomeServer"):
+        self._hs = hs
+        self._tenants_config = getattr(hs.config, "tenants", None)
+
+    def _check_bearer_token(self, request: SynapseRequest) -> None:
+        """Validate the bearer token against reload_secret."""
+        mt_config = self._tenants_config
+        if mt_config is None or not mt_config.multi_tenant.enabled:
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST,
+                "Multi-tenant mode is not enabled",
+                Codes.FORBIDDEN,
+            )
+
+        reload_secret = mt_config.multi_tenant.reload_secret
+        if not reload_secret:
+            raise SynapseError(
+                HTTPStatus.FORBIDDEN,
+                "multi_tenant.reload_secret is not configured",
+                Codes.FORBIDDEN,
+            )
+
+        auth_header = request.getHeader("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise SynapseError(
+                HTTPStatus.UNAUTHORIZED,
+                "Missing or invalid Authorization header",
+                Codes.MISSING_TOKEN,
+            )
+
+        token = auth_header[len("Bearer "):]
+        if token != reload_secret:
+            raise SynapseError(
+                HTTPStatus.FORBIDDEN,
+                "Invalid reload token",
+                Codes.FORBIDDEN,
+            )
+
+    async def on_POST(self, request: SynapseRequest) -> tuple[int, JsonDict]:
+        self._check_bearer_token(request)
+
+        registry = self._hs.get_tenant_registry()
+        mt_config = self._tenants_config.multi_tenant
+
+        try:
+            if mt_config.source == "database":
+                # Load tenants from the database
+                from synapse.crypto.tenant_key_encryption import (
+                    get_master_key_from_env,
+                )
+
+                master_key = get_master_key_from_env()
+
+                # Get a raw DB connection for the query.
+                # runWithConnection passes a LoggingDatabaseConnection;
+                # unwrap to the raw DB-API connection for our query.
+                db_pool = self._hs.get_datastores().main.db_pool
+                new_config = await db_pool.runWithConnection(
+                    lambda conn: load_tenants_from_database(
+                        conn.conn, master_key, mt_config.default_schema
+                    )
+                )
+            else:
+                # YAML source: re-read the config file
+                self._hs.config.reload_config_section("tenants")
+                new_config = self._hs.config.tenants.multi_tenant
+
+            result = registry.reload(new_config)
+
+            # Cascade to dependent registries
+            keyring = self._hs.get_multi_tenant_keyring()
+            if keyring:
+                keyring.reload(registry)
+
+            self._hs.get_tenant_app_service_registry().reload(registry)
+            self._hs.get_tenant_ratelimiter_registry().reload(registry)
+
+            logger.info(
+                "Tenant reload via API: added=%s removed=%s unchanged=%d",
+                result["added"],
+                result["removed"],
+                len(result["unchanged"]),
+            )
+
+            return HTTPStatus.OK, result
+
+        except Exception as e:
+            logger.exception("Tenant reload via API failed")
+            raise SynapseError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"Reload failed: {e}",
+                Codes.UNKNOWN,
+            )
 
 
 def register_tenant_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
@@ -482,3 +590,4 @@ def register_tenant_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     CreateTenantRestServlet(hs).register(http_server)
     ReloadTenantKeysRestServlet(hs).register(http_server)
     TenantStatusRestServlet(hs).register(http_server)
+    ReloadTenantsRestServlet(hs).register(http_server)

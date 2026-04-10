@@ -38,7 +38,7 @@ class TestTenantRegistry(TestCase):
         return MultiTenantConfig(
             enabled=True,
             default_schema="public",
-            tenants=tenants,
+            tenants={t.server_name: t for t in tenants},
         )
 
     def _create_test_tenant(
@@ -124,8 +124,8 @@ class TestTenantRegistry(TestCase):
 
         self.assertIn("unknown.com", str(ctx.exception))
 
-    def test_get_tenant_from_host(self):
-        """Test getting tenant from Host header value."""
+    def test_get_tenant_by_server_name(self):
+        """Test getting tenant by direct server_name lookup."""
         tenants = [
             self._create_test_tenant("matrix.acme.com"),
             self._create_test_tenant("chat.corp.io"),
@@ -133,23 +133,17 @@ class TestTenantRegistry(TestCase):
         config = self._create_multi_tenant_config(tenants)
         registry = TenantRegistry(config)
 
-        # Simple host
-        tenant = registry.get_tenant_from_host("matrix.acme.com")
+        # Direct lookup
+        tenant = registry.get_tenant("matrix.acme.com")
         self.assertIsNotNone(tenant)
         self.assertEqual(tenant.server_name, "matrix.acme.com")
 
-        # Host with port
-        tenant = registry.get_tenant_from_host("matrix.acme.com:8448")
-        self.assertIsNotNone(tenant)
-        self.assertEqual(tenant.server_name, "matrix.acme.com")
-
-        # Host with port (federation port)
-        tenant = registry.get_tenant_from_host("chat.corp.io:443")
+        tenant = registry.get_tenant("chat.corp.io")
         self.assertIsNotNone(tenant)
         self.assertEqual(tenant.server_name, "chat.corp.io")
 
-        # Unknown host
-        tenant = registry.get_tenant_from_host("unknown.com")
+        # Unknown
+        tenant = registry.get_tenant("unknown.com")
         self.assertIsNone(tenant)
 
     def test_get_all_tenants(self):
@@ -197,30 +191,30 @@ class TestTenantRegistryWithAliases(TestCase):
         return TenantConfig(server_name=server_name, **defaults)
 
     def test_tenant_with_host_aliases(self):
-        """Test tenant lookup with host aliases."""
-        # Create tenant with aliases
-        tenant = self._create_test_tenant(
-            "matrix.acme.com",
-            host_aliases=["acme.com", "www.acme.com"],
-        )
+        """Test tenant lookup with host aliases via add_hostname_alias."""
+        tenant = self._create_test_tenant("matrix.acme.com")
         config = MultiTenantConfig(
             enabled=True,
             default_schema="public",
-            tenants=[tenant],
+            tenants={tenant.server_name: tenant},
         )
         registry = TenantRegistry(config)
 
+        # Register aliases
+        registry.add_hostname_alias("acme.com", "matrix.acme.com")
+        registry.add_hostname_alias("www.acme.com", "matrix.acme.com")
+
         # Primary name
-        result = registry.get_tenant_from_host("matrix.acme.com")
+        result = registry.get_tenant("matrix.acme.com")
         self.assertIsNotNone(result)
         self.assertEqual(result.server_name, "matrix.acme.com")
 
         # Aliases
-        result = registry.get_tenant_from_host("acme.com")
+        result = registry.get_tenant("acme.com")
         self.assertIsNotNone(result)
         self.assertEqual(result.server_name, "matrix.acme.com")
 
-        result = registry.get_tenant_from_host("www.acme.com")
+        result = registry.get_tenant("www.acme.com")
         self.assertIsNotNone(result)
         self.assertEqual(result.server_name, "matrix.acme.com")
 
@@ -249,7 +243,7 @@ class TestTenantRegistryIsolation(TestCase):
         config = MultiTenantConfig(
             enabled=True,
             default_schema="public",
-            tenants=tenants,
+            tenants={t.server_name: t for t in tenants},
         )
         registry = TenantRegistry(config)
 
@@ -269,7 +263,7 @@ class TestTenantRegistryIsolation(TestCase):
         config = MultiTenantConfig(
             enabled=True,
             default_schema="public",
-            tenants=tenants,
+            tenants={t.server_name: t for t in tenants},
         )
         registry = TenantRegistry(config)
 
@@ -289,7 +283,7 @@ class TestTenantRegistryIsolation(TestCase):
         config = MultiTenantConfig(
             enabled=True,
             default_schema="public",
-            tenants=tenants,
+            tenants={t.server_name: t for t in tenants},
         )
         registry = TenantRegistry(config)
 

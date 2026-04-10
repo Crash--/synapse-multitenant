@@ -46,8 +46,8 @@ class PusherFactory:
         logger.info("email enable notifs: %r", self._global_email_enable_notifs)
 
         self.mailers: dict[str, Mailer] = {}
-        self._notif_template_html = hs.config.email.email_notif_template_html
-        self._notif_template_text = hs.config.email.email_notif_template_text
+        self._notif_template_html = getattr(hs.config.email, "email_notif_template_html", None)
+        self._notif_template_text = getattr(hs.config.email, "email_notif_template_text", None)
 
         self.pusher_types["email"] = self._create_email_pusher
 

@@ -225,7 +225,7 @@ class TenantConfig:
     Attributes:
         server_name: The Matrix server name for this tenant (e.g., "acme.com")
         database_schema: The PostgreSQL schema to use for this tenant's data
-        signing_key_path: Path to the signing key file for this tenant
+        signing_key_path: Path to the signing key file for this tenant (None for DB-sourced keys)
         media_store_path: Path to the media storage directory for this tenant
         registration_enabled: Whether new user registration is enabled
         registration_shared_secret: Optional shared secret for registration
@@ -234,11 +234,13 @@ class TenantConfig:
         enable_federation: Whether federation is enabled for this tenant
         trusted_key_servers: List of trusted key servers for this tenant
         max_mau_value: Maximum monthly active users (0 for unlimited)
+        signing_key_data: In-memory signing key material (when loaded from DB
+            rather than filesystem). Mutually exclusive with signing_key_path.
     """
 
     server_name: str
     database_schema: str
-    signing_key_path: str
+    signing_key_path: str | None
     media_store_path: str
     registration_enabled: bool = False
     registration_shared_secret: str | None = None
@@ -285,6 +287,10 @@ class TenantConfig:
     # AS registrations apply to this tenant. When None, no app services
     # are active for this tenant.
     app_service_config_files: list[str] | None = None
+    # In-memory signing key data (for DB-sourced tenants). When set,
+    # signing_key_path should be None. The keyring reads from this
+    # instead of the filesystem.
+    signing_key_data: str | None = None
 
     @property
     def effective_public_baseurl(self) -> str:
@@ -401,6 +407,95 @@ class TenantConfig:
             app_service_config_files=as_config_files,
         )
 
+    @classmethod
+    def from_db_row(cls, row: JsonDict) -> "TenantConfig":
+        """Create a TenantConfig from a database row.
+
+        Similar to ``from_dict`` but expects columns from the
+        ``public.tenants`` table. Signing key material comes from the
+        ``signing_key_data`` field (already decrypted) rather than a
+        filesystem path.
+
+        Args:
+            row: Dictionary of column values from the tenants table.
+
+        Returns:
+            A TenantConfig instance with ``signing_key_path=None`` and
+            ``signing_key_data`` populated.
+
+        Raises:
+            ConfigError: If required columns are missing.
+        """
+        server_name = row.get("server_name")
+        if not server_name:
+            raise ConfigError("Tenant DB row missing 'server_name'")
+
+        database_schema = row.get("database_schema")
+        if not database_schema:
+            raise ConfigError(
+                f"Tenant '{server_name}' DB row missing 'database_schema'"
+            )
+
+        media_store_path = row.get("media_store_path")
+        if not media_store_path:
+            raise ConfigError(
+                f"Tenant '{server_name}' DB row missing 'media_store_path'"
+            )
+
+        signing_key_data = row.get("signing_key_data")
+        if not signing_key_data:
+            raise ConfigError(
+                f"Tenant '{server_name}' DB row missing 'signing_key_data'"
+            )
+
+        # Parse JSONB sub-config columns through existing from_dict() methods
+        email_raw = row.get("email_config")
+        email_cfg = TenantEmailConfig.from_dict(email_raw) if email_raw else None
+
+        oidc_raw = row.get("oidc_config")
+        oidc_cfg = TenantOidcConfig.from_list(oidc_raw) if oidc_raw else None
+
+        cas_raw = row.get("cas_config")
+        cas_cfg = TenantCasConfig.from_dict(cas_raw) if cas_raw else None
+
+        saml_raw = row.get("saml_config")
+        saml_cfg = TenantSamlConfig.from_dict(saml_raw) if saml_raw else None
+
+        push_raw = row.get("push_config")
+        push_cfg = TenantPushConfig.from_dict(push_raw) if push_raw else None
+
+        ratelimit_raw = row.get("ratelimit_config")
+        ratelimit_cfg = (
+            TenantRatelimitConfig.from_dict(ratelimit_raw)
+            if ratelimit_raw
+            else None
+        )
+
+        return cls(
+            server_name=server_name,
+            database_schema=database_schema,
+            signing_key_path=None,
+            media_store_path=media_store_path,
+            registration_enabled=row.get("registration_enabled", False),
+            registration_shared_secret=row.get("registration_shared_secret"),
+            macaroon_secret_key=row.get("macaroon_secret_key"),
+            form_secret=row.get("form_secret"),
+            enable_federation=row.get("enable_federation", True),
+            trusted_key_servers=row.get("trusted_key_servers", []),
+            max_mau_value=row.get("max_mau_value", 0),
+            public_baseurl=row.get("public_baseurl"),
+            identity_server=row.get("identity_server"),
+            server_notices_mxid=row.get("server_notices_mxid"),
+            email=email_cfg,
+            oidc=oidc_cfg,
+            cas=cas_cfg,
+            saml=saml_cfg,
+            push=push_cfg,
+            ratelimit=ratelimit_cfg,
+            app_service_config_files=row.get("app_service_config_files"),
+            signing_key_data=signing_key_data,
+        )
+
 
 @attr.s(auto_attribs=True, slots=True)
 class MultiTenantConfig:
@@ -409,11 +504,18 @@ class MultiTenantConfig:
     Attributes:
         enabled: Whether multi-tenant mode is enabled
         default_schema: Default database schema for shared data
+        source: Where tenant definitions come from — ``"yaml"`` (default,
+            parsed from ``homeserver.yaml``) or ``"database"`` (loaded from
+            the ``public.tenants`` table at startup and on reload).
+        reload_secret: Shared secret for authenticating reload requests
+            from the control plane (``POST /_synapse/admin/v1/tenants/reload``).
         tenants: Dictionary mapping server_name to TenantConfig
     """
 
     enabled: bool = False
     default_schema: str = "public"
+    source: str = "yaml"
+    reload_secret: str | None = None
     tenants: dict[str, TenantConfig] = attr.Factory(dict)
 
     def get_tenant(self, server_name: str) -> TenantConfig | None:
@@ -467,14 +569,22 @@ class TenantsConfig(Config):
 
         enabled = multi_tenant_config.get("enabled", False)
         default_schema = multi_tenant_config.get("default_schema", "public")
+        source = multi_tenant_config.get("source", "yaml")
+        reload_secret = multi_tenant_config.get("reload_secret")
+
+        if source not in ("yaml", "database"):
+            raise ConfigError(
+                f"multi_tenant.source must be 'yaml' or 'database', got '{source}'"
+            )
 
         tenants_dict: dict[str, TenantConfig] = {}
 
-        if enabled:
+        if enabled and source == "yaml":
+            # YAML-sourced tenants: parse from homeserver.yaml as before.
             tenants_list = config.get("tenants", [])
             if not tenants_list:
                 raise ConfigError(
-                    "Multi-tenant mode enabled but no tenants configured"
+                    "Multi-tenant mode enabled with source 'yaml' but no tenants configured"
                 )
 
             # Get base path for resolving relative paths
@@ -497,10 +607,20 @@ class TenantsConfig(Config):
                     raise ConfigError(
                         f"Error loading tenant configuration: {e}"
                     ) from e
+        elif enabled and source == "database":
+            # Database-sourced tenants: loaded at startup by the registry
+            # from public.tenants. Zero tenants is valid — the control
+            # plane will add them at runtime.
+            logger.info(
+                "Multi-tenant mode enabled with source 'database'; "
+                "tenants will be loaded from the public.tenants table"
+            )
 
         self.multi_tenant = MultiTenantConfig(
             enabled=enabled,
             default_schema=default_schema,
+            source=source,
+            reload_secret=reload_secret,
             tenants=tenants_dict,
         )
 

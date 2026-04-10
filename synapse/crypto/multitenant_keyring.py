@@ -22,6 +22,7 @@ ensures that events and requests are signed with the correct key.
 """
 
 import logging
+from io import StringIO
 from typing import TYPE_CHECKING
 
 from signedjson.key import get_verify_key, read_signing_keys
@@ -84,17 +85,27 @@ class MultiTenantKeyring:
     def _load_tenant_keys(self, tenant: "TenantConfig") -> None:
         """Load signing keys for a specific tenant.
 
+        Supports two sources:
+        - In-memory: when ``tenant.signing_key_data`` is set (DB-sourced).
+        - Filesystem: when ``tenant.signing_key_path`` is set.
+
         Args:
             tenant: The tenant configuration.
         """
-        key_path = tenant.signing_key_path
-
-        try:
-            with open(key_path, "r") as f:
-                keys = read_signing_keys(f)
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Signing key file not found for tenant {tenant.server_name}: {key_path}"
+        if tenant.signing_key_data is not None:
+            keys = read_signing_keys(StringIO(tenant.signing_key_data))
+        elif tenant.signing_key_path is not None:
+            key_path = tenant.signing_key_path
+            try:
+                with open(key_path, "r") as f:
+                    keys = read_signing_keys(f)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"Signing key file not found for tenant {tenant.server_name}: {key_path}"
+                )
+        else:
+            raise ValueError(
+                f"Tenant {tenant.server_name} has neither signing_key_path nor signing_key_data"
             )
 
         self._signing_keys[tenant.server_name] = keys
@@ -110,11 +121,12 @@ class MultiTenantKeyring:
             )
         self._verify_keys[tenant.server_name] = verify_keys
 
+        source = "database" if tenant.signing_key_data is not None else tenant.signing_key_path
         logger.info(
             "Loaded %d signing key(s) for tenant %s from %s",
             len(keys),
             tenant.server_name,
-            key_path,
+            source,
         )
 
     def get_signing_key(self, server_name: str) -> SigningKey:

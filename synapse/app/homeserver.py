@@ -459,42 +459,50 @@ async def start(
     # process never accepts HTTP traffic with a broken tenant schema.
     # See docs/multi_tenant_isolation_model.md for the rationale.
     if hs.config.tenants.multi_tenant.enabled:
-        main_db_pool = hs.get_datastores().main.db_pool
-        tenants = list(hs.config.tenants.multi_tenant.tenants.values())
+        skip_check = os.environ.get("SYNAPSE_SKIP_TENANT_ISOLATION_CHECK", "").lower() in ("1", "true", "yes")
+        if skip_check:
+            logger.warning(
+                "SYNAPSE_SKIP_TENANT_ISOLATION_CHECK is set — skipping "
+                "tenant schema isolation check. Only use this during "
+                "bootstrap when copy-schemas runs after Synapse starts."
+            )
+        else:
+            main_db_pool = hs.get_datastores().main.db_pool
+            tenants = list(hs.config.tenants.multi_tenant.tenants.values())
 
-        def _check_tenant_isolation(raw_conn: "LoggingDatabaseConnection") -> None:
-            # Derive the expected-tables list from `public` at startup
-            # time (single source of truth — matches whatever the
-            # bootstrap in scripts/create_tenant_schema.py cloned from
-            # the same public schema).
-            cursor = raw_conn.cursor()
-            try:
-                # information_schema queries are unaffected by search_path;
-                # we explicitly filter by table_schema instead.
-                cursor.execute(
-                    """
-                    SELECT table_name
-                      FROM information_schema.tables
-                     WHERE table_schema = 'public'
-                       AND table_type = 'BASE TABLE'
-                    """
-                )
-                expected_tables = [row[0] for row in cursor.fetchall()]
-            finally:
-                cursor.close()
+            def _check_tenant_isolation(raw_conn: "LoggingDatabaseConnection") -> None:
+                # Derive the expected-tables list from `public` at startup
+                # time (single source of truth — matches whatever the
+                # bootstrap in scripts/create_tenant_schema.py cloned from
+                # the same public schema).
+                cursor = raw_conn.cursor()
+                try:
+                    # information_schema queries are unaffected by search_path;
+                    # we explicitly filter by table_schema instead.
+                    cursor.execute(
+                        """
+                        SELECT table_name
+                          FROM information_schema.tables
+                         WHERE table_schema = 'public'
+                           AND table_type = 'BASE TABLE'
+                        """
+                    )
+                    expected_tables = [row[0] for row in cursor.fetchall()]
+                finally:
+                    cursor.close()
 
-            for tenant in tenants:
-                main_db_pool.assert_tenant_schema_isolated(
-                    raw_conn, tenant, expected_tables
-                )
-                logger.info(
-                    "Tenant %s schema %s isolation check passed (%d tables)",
-                    tenant.server_name,
-                    tenant.database_schema,
-                    len(expected_tables),
-                )
+                for tenant in tenants:
+                    main_db_pool.assert_tenant_schema_isolated(
+                        raw_conn, tenant, expected_tables
+                    )
+                    logger.info(
+                        "Tenant %s schema %s isolation check passed (%d tables)",
+                        tenant.server_name,
+                        tenant.database_schema,
+                        len(expected_tables),
+                    )
 
-        await main_db_pool.runWithConnection(_check_tenant_isolation)
+            await main_db_pool.runWithConnection(_check_tenant_isolation)
 
     await _base.start(hs, freeze=freeze)
 
