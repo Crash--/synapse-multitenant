@@ -85,6 +85,7 @@ from synapse.replication.http.federation import (
 from synapse.storage.databases.main.lock import Lock
 from synapse.storage.databases.main.roommember import extract_heroes_from_room_summary
 from synapse.storage.roommember import MemberSummary
+from synapse.tenant_context import get_current_tenant
 from synapse.types import JsonDict, StateMap, UserID, get_domain_from_id
 from synapse.util import unwrapFirstError
 from synapse.util.async_helpers import Linearizer, concurrently_execute, gather_results
@@ -137,6 +138,7 @@ class FederationServer(FederationBase):
     def __init__(self, hs: "HomeServer"):
         super().__init__(hs)
 
+        self._multi_tenant_keyring = hs.get_multi_tenant_keyring()
         self.server_name = hs.hostname
         self.handler = hs.get_federation_handler()
         self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker
@@ -196,6 +198,20 @@ class FederationServer(FederationBase):
 
         # Whether we have started handling old events in the staging area.
         self._started_handling_of_staged_events = False
+
+    @property
+    def _effective_server_name(self) -> str:
+        """Return the current tenant's server_name, or the global default."""
+        tenant = get_current_tenant()
+        return tenant.server_name if tenant else self.server_name
+
+    @property
+    def _effective_signing_key(self) -> "SigningKey":
+        """Return the current tenant's signing key, or the global default."""
+        tenant = get_current_tenant()
+        if tenant and self._multi_tenant_keyring is not None:
+            return self._multi_tenant_keyring.get_signing_key(tenant.server_name)
+        return self.hs.signing_key
 
     @wrap_as_background_process("_handle_old_staged_events")
     async def _handle_old_staged_events(self) -> None:
@@ -561,11 +577,11 @@ class FederationServer(FederationBase):
         """Process the EDUs in a received transaction."""
 
         async def _process_edu(edu_dict: JsonDict) -> None:
-            received_edus_counter.labels(**{SERVER_NAME_LABEL: self.server_name}).inc()
+            received_edus_counter.labels(**{SERVER_NAME_LABEL: self._effective_server_name}).inc()
 
             edu = Edu(
                 origin=origin,
-                destination=self.server_name,
+                destination=self._effective_server_name,
                 edu_type=edu_dict["edu_type"],
                 content=edu_dict["content"],
             )
@@ -1001,8 +1017,8 @@ class FederationServer(FederationBase):
                 compute_event_signature(
                     room_version,
                     event.get_pdu_json(),
-                    self.hs.hostname,
-                    self.hs.signing_key,
+                    self._effective_server_name,
+                    self._effective_signing_key,
                 )
             )
 
@@ -1138,7 +1154,7 @@ class FederationServer(FederationBase):
         return Transaction(
             # Just need a dummy transaction ID and destination since it won't be used.
             transaction_id="",
-            origin=self.server_name,
+            origin=self._effective_server_name,
             pdus=pdus,
             origin_server_ts=int(time_now),
             destination="",
