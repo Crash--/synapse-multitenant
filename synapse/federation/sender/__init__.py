@@ -1202,35 +1202,60 @@ class FederationSender(AbstractFederationSender):
         Wakes up destinations that need catch-up and are not currently being
         backed off from.
 
+        In multi-tenant mode, iterates all active tenant schemas.
         In order to reduce load spikes, adds a delay between each destination.
         """
+        from synapse.tenant_context import set_current_tenant
 
-        last_processed: str | None = None
+        # Get all active tenants (or just self.server_name for single-tenant)
+        tenant_registry = getattr(self.hs, 'get_tenant_registry', lambda: None)()
+        if tenant_registry is not None:
+            tenants = tenant_registry.get_all_tenants()
+        else:
+            tenants = []
 
-        while not self._is_shutdown:
-            destinations_to_wake = (
-                await self.store.get_catch_up_outstanding_destinations(last_processed)
-            )
+        # Build list of (tenant_server_name, tenant_config_or_none) pairs
+        if tenants:
+            tenant_pairs = [(t.server_name, t) for t in tenants]
+        else:
+            tenant_pairs = [(self.server_name, None)]
 
-            if not destinations_to_wake:
-                # finished waking all destinations!
-                break
+        for tenant_sn, tenant_config in tenant_pairs:
+            # Set tenant context so DB queries hit the right schema
+            if tenant_config is not None:
+                set_current_tenant(tenant_config)
 
-            last_processed = destinations_to_wake[-1]
+            last_processed: str | None = None
 
-            destinations_to_wake = [
-                d
-                for d in destinations_to_wake
-                if self._federation_shard_config.should_handle(self._instance_name, d)
-                and self.hs.config.federation.is_domain_allowed_according_to_federation_whitelist(
+            while not self._is_shutdown:
+                destinations_to_wake = (
+                    await self.store.get_catch_up_outstanding_destinations(last_processed)
+                )
+
+                if not destinations_to_wake:
+                    # finished waking all destinations for this tenant!
+                    break
+
+                last_processed = destinations_to_wake[-1]
+
+                destinations_to_wake = [
                     d
-                )
-            ]
+                    for d in destinations_to_wake
+                    if self._federation_shard_config.should_handle(self._instance_name, d)
+                    and self.hs.config.federation.is_domain_allowed_according_to_federation_whitelist(
+                        d
+                    )
+                ]
 
-            for destination in destinations_to_wake:
-                logger.info(
-                    "Destination %s has outstanding catch-up, waking up.",
-                    last_processed,
-                )
-                self.wake_destination(destination)
-                await self.clock.sleep(WAKEUP_INTERVAL_BETWEEN_DESTINATIONS)
+                for destination in destinations_to_wake:
+                    logger.info(
+                        "Destination %s has outstanding catch-up for tenant %s, waking up.",
+                        destination,
+                        tenant_sn,
+                    )
+                    self.wake_destination(destination, tenant_server_name=tenant_sn)
+                    await self.clock.sleep(WAKEUP_INTERVAL_BETWEEN_DESTINATIONS)
+
+        # Clear tenant context
+        if tenants:
+            set_current_tenant(None)
