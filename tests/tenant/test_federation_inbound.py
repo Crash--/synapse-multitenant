@@ -291,3 +291,92 @@ class TestFederationServerEffectiveServerName(TestCase):
             return_value=None,
         ):
             self.assertIs(fs._effective_signing_key, mock_key)
+
+
+# ── 10d probes: per-tenant federation allow-lists ────────────────
+
+
+class TestTenantFederationConfig(TestCase):
+    """TenantFederationConfig dataclass and integration with whitelist check."""
+
+    def test_tenant_federation_config_from_dict(self) -> None:
+        """TenantFederationConfig.from_dict parses a whitelist."""
+        from synapse.config.tenants import TenantFederationConfig
+
+        cfg = TenantFederationConfig.from_dict(
+            {"federation_domain_whitelist": ["partner.com", "ally.org"]}
+        )
+        self.assertIn("partner.com", cfg.federation_domain_whitelist)
+        self.assertIn("ally.org", cfg.federation_domain_whitelist)
+
+    def test_tenant_federation_config_none_whitelist(self) -> None:
+        """TenantFederationConfig with no whitelist means inherit global."""
+        from synapse.config.tenants import TenantFederationConfig
+
+        cfg = TenantFederationConfig.from_dict({})
+        self.assertIsNone(cfg.federation_domain_whitelist)
+
+    def test_tenant_config_has_federation_field(self) -> None:
+        """TenantConfig must accept a federation field."""
+        from synapse.config.tenants import TenantFederationConfig
+
+        fed_cfg = TenantFederationConfig(
+            federation_domain_whitelist={"partner.com": True}
+        )
+        tenant = TenantConfig(
+            server_name="acme.localhost",
+            database_schema="tenant_acme",
+            signing_key_path="/keys/acme.key",
+            media_store_path="/media/acme",
+            federation=fed_cfg,
+        )
+        self.assertIs(tenant.federation, fed_cfg)
+
+    def test_is_domain_allowed_tenant_override(self) -> None:
+        """When tenant has whitelist, domain check uses tenant list, not global."""
+        from synapse.config.tenants import TenantFederationConfig
+
+        fed_config = MagicMock()
+        fed_config.federation_domain_whitelist = {"global.com": True}
+
+        tenant_fed = TenantFederationConfig(
+            federation_domain_whitelist={"tenant-only.com": True}
+        )
+
+        # Use the real method from FederationConfig
+        from synapse.config.federation import FederationConfig
+
+        # tenant-only.com allowed by tenant, not by global
+        self.assertTrue(
+            FederationConfig.is_domain_allowed_according_to_federation_whitelist(
+                fed_config, "tenant-only.com", tenant_federation_config=tenant_fed
+            )
+        )
+        # global.com NOT allowed by tenant whitelist
+        self.assertFalse(
+            FederationConfig.is_domain_allowed_according_to_federation_whitelist(
+                fed_config, "global.com", tenant_federation_config=tenant_fed
+            )
+        )
+
+    def test_is_domain_allowed_falls_through_to_global(self) -> None:
+        """When tenant has no whitelist (None), falls through to global."""
+        from synapse.config.tenants import TenantFederationConfig
+
+        fed_config = MagicMock()
+        fed_config.federation_domain_whitelist = {"global.com": True}
+
+        tenant_fed = TenantFederationConfig(federation_domain_whitelist=None)
+
+        from synapse.config.federation import FederationConfig
+
+        self.assertTrue(
+            FederationConfig.is_domain_allowed_according_to_federation_whitelist(
+                fed_config, "global.com", tenant_federation_config=tenant_fed
+            )
+        )
+        self.assertFalse(
+            FederationConfig.is_domain_allowed_according_to_federation_whitelist(
+                fed_config, "unknown.com", tenant_federation_config=tenant_fed
+            )
+        )
