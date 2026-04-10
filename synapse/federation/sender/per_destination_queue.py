@@ -95,8 +95,11 @@ class PerDestinationQueue:
         hs: "synapse.server.HomeServer",
         transaction_manager: "synapse.federation.sender.TransactionManager",
         destination: str,
+        tenant_server_name: str | None = None,
+        tenant_signing_key: object | None = None,
     ):
-        self.server_name = hs.hostname
+        self.server_name = tenant_server_name if tenant_server_name is not None else hs.hostname
+        self._tenant_signing_key = tenant_signing_key
         self._hs = hs
         self._clock = hs.get_clock()
         self._storage_controllers = hs.get_storage_controllers()
