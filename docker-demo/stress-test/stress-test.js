@@ -133,20 +133,25 @@ export default function () {
   }
 
   // ── Isolation check (every 10th iteration) ─────────────────
+  // Tests actual schema isolation: use current user's token but send the
+  // request with a *different* tenant's Host header. If schema isolation
+  // is working, the token is invalid for the other tenant's key namespace
+  // and Synapse returns 401. If isolation is broken (search_path bleed),
+  // the token would authenticate against the wrong schema.
   if (__ITER % 10 === 9) {
-    // Pick a different tenant's room and try to read it
     const otherIndex = (tenantNames.indexOf(tenantName) + 1) % tenantNames.length;
     const otherTenantName = tenantNames[otherIndex];
     const otherRoomId = testData.tenants[otherTenantName].room_id;
 
     const isolationRes = http.get(
       `${BASE_URL}/_matrix/client/v3/rooms/${encodeURIComponent(otherRoomId)}/messages?dir=b&limit=1`,
-      { headers: headers(tenantName, token) }
+      { headers: headers(otherTenantName, token) }
     );
 
-    const isolated = isolationRes.status === 403 || isolationRes.status === 404;
+    const isolated = isolationRes.status === 401 || isolationRes.status === 403 || isolationRes.status === 404;
     check(isolationRes, {
-      "cross-tenant room blocked (403/404)": (r) => r.status === 403 || r.status === 404,
+      "cross-tenant token rejected (401/403/404)": (r) =>
+        r.status === 401 || r.status === 403 || r.status === 404,
     });
     isolationCheckRate.add(isolated ? 1 : 0);
   }

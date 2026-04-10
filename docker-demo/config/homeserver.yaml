@@ -36,11 +36,11 @@ tenants:
     enable_federation: false
     ratelimit:
       rc_message:
-        per_second: 2
-        burst_count: 5
+        per_second: 10
+        burst_count: 50
       rc_login:
-        per_second: 2
-        burst_count: 5
+        per_second: 10
+        burst_count: 30
   - server_name: matrix.tenant-c.com
     database_schema: tenant_matrix_tenant_c_com
     signing_key_path: /keys/matrix_tenant-c_com.signing.key
