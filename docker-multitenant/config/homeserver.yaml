@@ -63,10 +63,10 @@ database:
     user: synapse
     password: synapse_password
     database: synapse_multitenant
-    host: postgres
-    port: 5432
+    host: pgbouncer
+    port: 6432
     cp_min: 5
-    cp_max: 10
+    cp_max: 50
 
 ## Logging ##
 log_config: "/data/log.config"
