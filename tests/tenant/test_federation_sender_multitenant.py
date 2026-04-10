@@ -163,3 +163,61 @@ class TestTransactionManagerOriginParam(TestCase):
             sig.parameters,
             "send_new_transaction is missing the 'origin' parameter",
         )
+
+
+# ── 9b probes: tenant-aware signing ──────────────────────────────
+
+from signedjson import key as signing_key_mod
+
+
+class TestBuildAuthHeadersTenantOverride(TestCase):
+    """build_auth_headers must use tenant origin + signing_key when provided."""
+
+    def test_auth_header_uses_tenant_origin(self) -> None:
+        from synapse.http.matrixfederationclient import MatrixFederationHttpClient
+
+        client = MagicMock(spec=MatrixFederationHttpClient)
+
+        # Generate a real signing key for acme tenant
+        tenant_key = signing_key_mod.generate_signing_key("acme0")
+        client.server_name = "main.localhost"
+        client.signing_key = signing_key_mod.generate_signing_key("main0")
+
+        # Call the real build_auth_headers with tenant overrides
+        headers = MatrixFederationHttpClient.build_auth_headers(
+            client,
+            destination=b"matrix.org",
+            method=b"PUT",
+            url_bytes=b"/_matrix/federation/v1/send/123",
+            content={"pdus": [], "edus": []},
+            origin="acme.localhost",
+            signing_key=tenant_key,
+        )
+
+        self.assertTrue(len(headers) > 0)
+        header_str = headers[0].decode("ascii") if isinstance(headers[0], bytes) else headers[0]
+        self.assertIn('origin="acme.localhost"', header_str)
+        self.assertNotIn('origin="main.localhost"', header_str)
+
+
+class TestBuildAuthHeadersFallback(TestCase):
+    """build_auth_headers without overrides must use self.server_name."""
+
+    def test_auth_header_fallback(self) -> None:
+        from synapse.http.matrixfederationclient import MatrixFederationHttpClient
+
+        client = MagicMock(spec=MatrixFederationHttpClient)
+        client.server_name = "main.localhost"
+        client.signing_key = signing_key_mod.generate_signing_key("main0")
+
+        headers = MatrixFederationHttpClient.build_auth_headers(
+            client,
+            destination=b"matrix.org",
+            method=b"PUT",
+            url_bytes=b"/_matrix/federation/v1/send/123",
+            content={"pdus": [], "edus": []},
+        )
+
+        self.assertTrue(len(headers) > 0)
+        header_str = headers[0].decode("ascii") if isinstance(headers[0], bytes) else headers[0]
+        self.assertIn('origin="main.localhost"', header_str)
