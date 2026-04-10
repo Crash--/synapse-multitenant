@@ -134,3 +134,98 @@ class TestAuthenticatorDestinationResolution(TestCase):
                 parsed_destination="acme.localhost"
             )
             mock_set.assert_called_once_with(acme)
+
+
+# ── 10b probes: per-tenant key server ────────────────────────────
+
+
+class TestLocalKeyTenantAware(TestCase):
+    """LocalKey.on_GET must return per-tenant keys when tenant context is set."""
+
+    def _make_keyring(self, tenants: list[TenantConfig]) -> MagicMock:
+        """Build a mock MultiTenantKeyring with signing + verify keys per tenant."""
+        from signedjson import key as key_mod
+
+        keyring = MagicMock()
+        signing_keys: dict[str, list] = {}
+        verify_keys: dict[str, dict] = {}
+
+        for t in tenants:
+            sk = key_mod.generate_signing_key("0")
+            signing_keys[t.server_name] = [sk]
+            vk = key_mod.get_verify_key(sk)
+            key_id = f"{vk.alg}:{vk.version}"
+            verify_keys[t.server_name] = {key_id: vk}
+
+        keyring.get_all_signing_keys = MagicMock(
+            side_effect=lambda sn: signing_keys[sn]
+        )
+        keyring.get_verify_keys = MagicMock(
+            side_effect=lambda sn: verify_keys[sn]
+        )
+        return keyring
+
+    def test_local_key_accepts_keyring(self) -> None:
+        """LocalKey.__init__ must accept an optional multi_tenant_keyring parameter."""
+        from synapse.rest.key.v2.local_key_resource import LocalKey
+
+        hs = MagicMock()
+        hs.config.key.signing_key = [MagicMock()]
+        hs.config.key.old_signing_keys = {}
+        hs.config.key.key_refresh_interval = 86400000
+        hs.config.server.server_name = "main.localhost"
+        hs.get_clock.return_value = MagicMock(time_msec=MagicMock(return_value=1000))
+
+        keyring = self._make_keyring([_make_tenant("acme")])
+        local_key = LocalKey(hs, multi_tenant_keyring=keyring)
+        self.assertIs(local_key._multi_tenant_keyring, keyring)
+
+    def test_local_key_returns_tenant_server_name(self) -> None:
+        """When tenant context is set, on_GET response must have tenant's server_name."""
+        from synapse.rest.key.v2.local_key_resource import LocalKey
+
+        hs = MagicMock()
+        hs.config.key.signing_key = [MagicMock()]
+        hs.config.key.old_signing_keys = {}
+        hs.config.key.key_refresh_interval = 86400000
+        hs.config.server.server_name = "main.localhost"
+        hs.get_clock.return_value = MagicMock(time_msec=MagicMock(return_value=1000))
+
+        acme = _make_tenant("acme")
+        keyring = self._make_keyring([acme])
+        local_key = LocalKey(hs, multi_tenant_keyring=keyring)
+
+        with patch(
+            "synapse.rest.key.v2.local_key_resource.get_current_tenant",
+            return_value=acme,
+        ):
+            status, body = local_key.on_GET(MagicMock(), key_id=None)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["server_name"], "acme.localhost")
+
+    def test_local_key_returns_global_when_no_tenant(self) -> None:
+        """When no tenant context is set, on_GET returns the global key response."""
+        from signedjson import key as key_mod
+        from synapse.rest.key.v2.local_key_resource import LocalKey
+
+        # Need a real signing key so response_json_object() works
+        sk = key_mod.generate_signing_key("0")
+
+        hs = MagicMock()
+        hs.config.key.signing_key = [sk]
+        hs.config.key.old_signing_keys = {}
+        hs.config.key.key_refresh_interval = 86400000
+        hs.config.server.server_name = "main.localhost"
+        hs.get_clock.return_value = MagicMock(time_msec=MagicMock(return_value=1000))
+
+        local_key = LocalKey(hs)
+
+        with patch(
+            "synapse.rest.key.v2.local_key_resource.get_current_tenant",
+            return_value=None,
+        ):
+            status, body = local_key.on_GET(MagicMock(), key_id=None)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["server_name"], "main.localhost")
