@@ -585,6 +585,21 @@ class FederationSender(AbstractFederationSender):
                         logger.debug("Not sending remote-origin event %s", event)
                         return
 
+                    # Determine which tenant this event belongs to
+                    tenant_server_name = self._tenant_for_event(event)
+                    if tenant_server_name is None and send_on_behalf_of is not None:
+                        # For send_on_behalf_of, use the send_on_behalf_of server
+                        if self.hs.is_mine_server_name(send_on_behalf_of):
+                            tenant_server_name = send_on_behalf_of
+                        else:
+                            tenant_server_name = self.server_name
+                    if tenant_server_name is None:
+                        logger.warning(
+                            "Could not determine tenant for event %s from sender %s",
+                            event.event_id, event.sender,
+                        )
+                        return
+
                     # We also want to not send out-of-band membership events.
                     #
                     # OOB memberships are used in three (and a half) situations:
@@ -737,7 +752,8 @@ class FederationSender(AbstractFederationSender):
                     logger.debug("Sending %s to %r", event, sharded_destinations)
 
                     if sharded_destinations:
-                        await self._send_pdu(event, sharded_destinations)
+                        await self._send_pdu(event, sharded_destinations,
+                                            tenant_server_name=tenant_server_name)
 
                         now = self.clock.time_msec()
                         ts = event_to_received_ts[event.event_id]
@@ -817,23 +833,25 @@ class FederationSender(AbstractFederationSender):
         finally:
             self._is_processing = False
 
-    async def _send_pdu(self, pdu: EventBase, destinations: Iterable[str]) -> None:
+    async def _send_pdu(self, pdu: EventBase, destinations: Iterable[str],
+                        tenant_server_name: str | None = None) -> None:
         # We loop through all destinations to see whether we already have
         # a transaction in progress. If we do, stick it in the pending_pdus
         # table and we'll get back to it later.
 
+        tenant = tenant_server_name if tenant_server_name is not None else self.server_name
         destinations = set(destinations)
-        destinations.discard(self.server_name)
+        destinations.discard(tenant)
         logger.debug("Sending to: %s", str(destinations))
 
         if not destinations:
             return
 
         sent_pdus_destination_dist_total.labels(
-            **{SERVER_NAME_LABEL: self.server_name}
+            **{SERVER_NAME_LABEL: tenant}
         ).inc(len(destinations))
         sent_pdus_destination_dist_count.labels(
-            **{SERVER_NAME_LABEL: self.server_name}
+            **{SERVER_NAME_LABEL: tenant}
         ).inc()
 
         assert pdu.internal_metadata.stream_ordering
@@ -865,7 +883,7 @@ class FederationSender(AbstractFederationSender):
         )
 
         for destination in destinations:
-            queue = self._get_per_destination_queue(self.server_name, destination)
+            queue = self._get_per_destination_queue(tenant, destination)
             # We expect `queue` to not be None as we already filtered out
             # non-whitelisted destinations above.
             assert queue is not None
@@ -923,6 +941,14 @@ class FederationSender(AbstractFederationSender):
         # Local read receipts always have 1 event ID.
         event_id = receipt.event_ids[0]
 
+        # Determine tenant from receipt sender
+        try:
+            tenant = get_domain_from_id(receipt.user_id)
+        except Exception:
+            tenant = self.server_name
+        if not self.hs.is_mine_server_name(tenant):
+            tenant = self.server_name
+
         # Work out which remote servers should be poked and poke them.
         domains_set = await self._storage_controllers.state.get_current_hosts_in_room_or_partial_state_approximation(
             room_id
@@ -978,7 +1004,7 @@ class FederationSender(AbstractFederationSender):
 
         for domain in immediate_domains:
             # Add to destination queue and wake the destination up
-            queue = self._get_per_destination_queue(self.server_name, domain)
+            queue = self._get_per_destination_queue(tenant, domain)
             if queue is None:
                 continue
             queue.queue_read_receipt(receipt)
@@ -986,13 +1012,13 @@ class FederationSender(AbstractFederationSender):
 
         for domain in delay_domains:
             # Add to destination queue...
-            queue = self._get_per_destination_queue(self.server_name, domain)
+            queue = self._get_per_destination_queue(tenant, domain)
             if queue is None:
                 continue
             queue.queue_read_receipt(receipt)
 
             # ... and schedule the destination to be woken up.
-            self._destination_wakeup_queue.add_to_queue(self.server_name, domain)
+            self._destination_wakeup_queue.add_to_queue(tenant, domain)
 
     async def send_presence_to_destinations(
         self, states: Iterable[UserPresenceState], destinations: Iterable[str]
@@ -1005,9 +1031,17 @@ class FederationSender(AbstractFederationSender):
             # No-op if presence is disabled.
             return
 
+        states_list = list(states)
+
         # Ensure we only send out presence states for local users.
-        for state in states:
+        for state in states_list:
             assert self.is_mine_id(state.user_id)
+
+        # Determine tenant from the first presence state
+        if states_list:
+            tenant = get_domain_from_id(states_list[0].user_id)
+        else:
+            tenant = self.server_name
 
         destinations = await filter_destinations_by_retry_limiter(
             [
@@ -1024,12 +1058,12 @@ class FederationSender(AbstractFederationSender):
             if self.is_mine_server_name(destination):
                 continue
 
-            queue = self._get_per_destination_queue(self.server_name, destination)
+            queue = self._get_per_destination_queue(tenant, destination)
             if queue is None:
                 continue
-            queue.send_presence(states, start_loop=False)
+            queue.send_presence(states_list, start_loop=False)
 
-            self._destination_wakeup_queue.add_to_queue(self.server_name, destination)
+            self._destination_wakeup_queue.add_to_queue(tenant, destination)
 
     def build_and_send_edu(
         self,
