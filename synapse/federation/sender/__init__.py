@@ -335,13 +335,13 @@ class _DestinationWakeupQueue:
     clock: Clock = attr.ib()
     max_delay_s: int = attr.ib()
 
-    queue: "OrderedDict[str, Literal[None]]" = attr.ib(factory=OrderedDict)
+    queue: "OrderedDict[tuple[str, str], Literal[None]]" = attr.ib(factory=OrderedDict)
     processing: bool = attr.ib(default=False)
 
-    def add_to_queue(self, destination: str) -> None:
-        """Add a destination to the queue to be woken up."""
+    def add_to_queue(self, tenant_server_name: str, destination: str) -> None:
+        """Add a (tenant, destination) pair to the queue to be woken up."""
 
-        self.queue[destination] = None
+        self.queue[(tenant_server_name, destination)] = None
 
         if not self.processing:
             self._handle()
@@ -368,9 +368,9 @@ class _DestinationWakeupQueue:
             )
 
             while self.queue:
-                destination, _ = self.queue.popitem(last=False)
+                (tenant_server_name, destination), _ = self.queue.popitem(last=False)
 
-                queue = self.sender._get_per_destination_queue(destination)
+                queue = self.sender._get_per_destination_queue(tenant_server_name, destination)
                 if queue is None:
                     continue
 
@@ -416,8 +416,8 @@ class FederationSender(AbstractFederationSender):
         self._instance_name = hs.get_instance_name()
         self._federation_shard_config = hs.config.worker.federation_shard_config
 
-        # map from destination to PerDestinationQueue
-        self._per_destination_queues: dict[str, PerDestinationQueue] = {}
+        # map from (tenant_server_name, destination) to PerDestinationQueue
+        self._per_destination_queues: dict[tuple[str, str], PerDestinationQueue] = {}
 
         transaction_queue_pending_destinations_gauge.register_hook(
             homeserver_instance_id=hs.get_instance_id(),
@@ -480,27 +480,53 @@ class FederationSender(AbstractFederationSender):
             queue.shutdown()
 
     def _get_per_destination_queue(
-        self, destination: str
+        self, tenant_server_name: str, destination: str
     ) -> PerDestinationQueue | None:
-        """Get or create a PerDestinationQueue for the given destination
+        """Get or create a PerDestinationQueue for the given tenant and destination.
 
         Args:
+            tenant_server_name: the server_name of the sending tenant
             destination: server_name of remote server
 
         Returns:
             None if the destination is not allowed by the federation whitelist.
-            Otherwise a PerDestinationQueue for this destination.
+            Otherwise a PerDestinationQueue for this tenant+destination pair.
         """
         if not self.hs.config.federation.is_domain_allowed_according_to_federation_whitelist(
             destination
         ):
             return None
 
-        queue = self._per_destination_queues.get(destination)
+        key = (tenant_server_name, destination)
+        queue = self._per_destination_queues.get(key)
         if not queue:
-            queue = PerDestinationQueue(self.hs, self._transaction_manager, destination)
-            self._per_destination_queues[destination] = queue
+            signing_key = None
+            try:
+                mt_keyring = self.hs.get_multi_tenant_keyring()
+                if mt_keyring is not None:
+                    signing_key = mt_keyring.get_signing_key(tenant_server_name)
+            except (AttributeError, KeyError):
+                pass
+            queue = PerDestinationQueue(
+                self.hs,
+                self._transaction_manager,
+                destination,
+                tenant_server_name=tenant_server_name,
+                tenant_signing_key=signing_key,
+            )
+            self._per_destination_queues[key] = queue
         return queue
+
+    def _tenant_for_event(self, event: EventBase) -> str | None:
+        """Extract the tenant server_name from the event sender's domain.
+
+        Returns:
+            The server_name if it belongs to this homeserver, else None.
+        """
+        server_name = get_domain_from_id(event.sender)
+        if self.hs.is_mine_server_name(server_name):
+            return server_name
+        return None
 
     def notify_new_events(self, max_token: RoomStreamToken) -> None:
         """This gets called when we have some new events we might want to
@@ -839,7 +865,7 @@ class FederationSender(AbstractFederationSender):
         )
 
         for destination in destinations:
-            queue = self._get_per_destination_queue(destination)
+            queue = self._get_per_destination_queue(self.server_name, destination)
             # We expect `queue` to not be None as we already filtered out
             # non-whitelisted destinations above.
             assert queue is not None
@@ -952,7 +978,7 @@ class FederationSender(AbstractFederationSender):
 
         for domain in immediate_domains:
             # Add to destination queue and wake the destination up
-            queue = self._get_per_destination_queue(domain)
+            queue = self._get_per_destination_queue(self.server_name, domain)
             if queue is None:
                 continue
             queue.queue_read_receipt(receipt)
@@ -960,13 +986,13 @@ class FederationSender(AbstractFederationSender):
 
         for domain in delay_domains:
             # Add to destination queue...
-            queue = self._get_per_destination_queue(domain)
+            queue = self._get_per_destination_queue(self.server_name, domain)
             if queue is None:
                 continue
             queue.queue_read_receipt(receipt)
 
             # ... and schedule the destination to be woken up.
-            self._destination_wakeup_queue.add_to_queue(domain)
+            self._destination_wakeup_queue.add_to_queue(self.server_name, domain)
 
     async def send_presence_to_destinations(
         self, states: Iterable[UserPresenceState], destinations: Iterable[str]
@@ -998,12 +1024,12 @@ class FederationSender(AbstractFederationSender):
             if self.is_mine_server_name(destination):
                 continue
 
-            queue = self._get_per_destination_queue(destination)
+            queue = self._get_per_destination_queue(self.server_name, destination)
             if queue is None:
                 continue
             queue.send_presence(states, start_loop=False)
 
-            self._destination_wakeup_queue.add_to_queue(destination)
+            self._destination_wakeup_queue.add_to_queue(self.server_name, destination)
 
     def build_and_send_edu(
         self,
@@ -1011,6 +1037,7 @@ class FederationSender(AbstractFederationSender):
         edu_type: str,
         content: JsonDict,
         key: Hashable | None = None,
+        origin: str | None = None,
     ) -> None:
         """Construct an Edu object, and queue it for sending
 
@@ -1019,6 +1046,8 @@ class FederationSender(AbstractFederationSender):
             edu_type: type of EDU to send
             content: content of EDU
             key: clobbering key for this edu
+            origin: tenant server_name to use as the EDU origin; defaults to
+                self.server_name for backwards compatibility
         """
         if self.is_mine_server_name(destination):
             logger.info("Not sending EDU to ourselves")
@@ -1030,7 +1059,7 @@ class FederationSender(AbstractFederationSender):
             return
 
         edu = Edu(
-            origin=self.server_name,
+            origin=origin or self.server_name,
             destination=destination,
             edu_type=edu_type,
             content=content,
@@ -1050,7 +1079,7 @@ class FederationSender(AbstractFederationSender):
         ):
             return
 
-        queue = self._get_per_destination_queue(edu.destination)
+        queue = self._get_per_destination_queue(edu.origin, edu.destination)
         if queue is None:
             return
         if key:
@@ -1059,8 +1088,13 @@ class FederationSender(AbstractFederationSender):
             queue.send_edu(edu)
 
     async def send_device_messages(
-        self, destinations: StrCollection, immediate: bool = True
+        self,
+        destinations: StrCollection,
+        immediate: bool = True,
+        tenant_server_name: str | None = None,
     ) -> None:
+        tenant = tenant_server_name or self.server_name
+
         destinations = await filter_destinations_by_retry_limiter(
             [
                 destination
@@ -1077,18 +1111,20 @@ class FederationSender(AbstractFederationSender):
 
         for destination in destinations:
             if immediate:
-                queue = self._get_per_destination_queue(destination)
+                queue = self._get_per_destination_queue(tenant, destination)
                 if queue is None:
                     continue
                 queue.attempt_new_transaction()
             else:
-                queue = self._get_per_destination_queue(destination)
+                queue = self._get_per_destination_queue(tenant, destination)
                 if queue is None:
                     continue
                 queue.mark_new_data()
-                self._destination_wakeup_queue.add_to_queue(destination)
+                self._destination_wakeup_queue.add_to_queue(tenant, destination)
 
-    def wake_destination(self, destination: str) -> None:
+    def wake_destination(
+        self, destination: str, *, tenant_server_name: str | None = None
+    ) -> None:
         """Called when we want to retry sending transactions to a remote.
 
         This is mainly useful if the remote server has been down and we think it
@@ -1104,7 +1140,8 @@ class FederationSender(AbstractFederationSender):
         ):
             return
 
-        queue = self._get_per_destination_queue(destination)
+        tenant = tenant_server_name or self.server_name
+        queue = self._get_per_destination_queue(tenant, destination)
         if queue is not None:
             queue.attempt_new_transaction()
 

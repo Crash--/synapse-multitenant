@@ -104,6 +104,9 @@ class TestSeparateQueuesPerTenant(TestCase):
         # (tenant_server_name, destination) — two positional args.
         # It will fail until the FederationSender is updated.
         sender = MagicMock(spec=FederationSender)
+        sender.hs = hs
+        sender._per_destination_queues = {}
+        sender._transaction_manager = MagicMock()
 
         # If the method signature only takes destination, this call will
         # raise TypeError — which is the expected red probe failure.
@@ -131,7 +134,10 @@ class TestTenantForEvent(TestCase):
     def test_extracts_tenant_from_sender(self) -> None:
         from synapse.federation.sender import FederationSender
 
+        hs = _mock_hs("main.localhost")
+        hs.is_mine_server_name.return_value = True
         sender = MagicMock(spec=FederationSender)
+        sender.hs = hs
         event = MagicMock()
         event.sender = "@alice:acme.localhost"
 
