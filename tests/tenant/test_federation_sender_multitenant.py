@@ -221,3 +221,26 @@ class TestBuildAuthHeadersFallback(TestCase):
         self.assertTrue(len(headers) > 0)
         header_str = headers[0].decode("ascii") if isinstance(headers[0], bytes) else headers[0]
         self.assertIn('origin="main.localhost"', header_str)
+
+
+# ── 9c probes: event loop tenant dispatch ────────────────────────
+
+
+class TestSendPduAcceptsTenant(TestCase):
+    """_send_pdu must accept a tenant_server_name parameter."""
+
+    def test_send_pdu_has_tenant_param(self) -> None:
+        import inspect
+        from synapse.federation.sender import FederationSender
+        sig = inspect.signature(FederationSender._send_pdu)
+        self.assertIn("tenant_server_name", sig.parameters)
+
+
+class TestWakeDestinationAcceptsTenant(TestCase):
+    """wake_destination must accept a tenant_server_name parameter."""
+
+    def test_wake_destination_has_tenant_param(self) -> None:
+        import inspect
+        from synapse.federation.sender import FederationSender
+        sig = inspect.signature(FederationSender.wake_destination)
+        self.assertIn("tenant_server_name", sig.parameters)
