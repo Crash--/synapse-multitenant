@@ -120,3 +120,85 @@ class TestSetTenantSchemaIssuesSingleSet(TestCase):
             f"Expected exactly 1 SET statement, got {len(set_stmts)}: {set_stmts}",
         )
         self.assertIn("tenant_acme", set_stmts[0])
+
+
+# ── 8b probes ──────────────────────────────────────────────────────
+
+class TestCacheHitSkipsSet(TestCase):
+    """Calling _set_tenant_schema twice with the same tenant on the same
+    connection should issue SET only once."""
+
+    def test_cache_hit_skips_set(self) -> None:
+        pool = MagicMock(spec=DatabasePool)
+        pool.engine = MagicMock(spec=PostgresEngine)
+        pool._connection_schemas = {}
+
+        conn = MockConnection()
+        tenant = _make_tenant("acme")
+
+        # First call — should SET
+        DatabasePool._set_tenant_schema(pool, conn, tenant)
+        # Second call — should skip (cache hit)
+        DatabasePool._set_tenant_schema(pool, conn, tenant)
+
+        statements = conn._cursor.executed
+        set_stmts = [s for s in statements if s.upper().startswith("SET")]
+        self.assertEqual(
+            len(set_stmts),
+            1,
+            f"Expected 1 SET (second call cached), got {len(set_stmts)}: {set_stmts}",
+        )
+
+
+class TestCacheMissOnTenantSwitch(TestCase):
+    """Switching tenants on the same connection should issue SET twice."""
+
+    def test_cache_miss_on_switch(self) -> None:
+        pool = MagicMock(spec=DatabasePool)
+        pool.engine = MagicMock(spec=PostgresEngine)
+        pool._connection_schemas = {}
+
+        conn = MockConnection()
+        tenant_a = _make_tenant("acme")
+        tenant_b = _make_tenant("corp")
+
+        DatabasePool._set_tenant_schema(pool, conn, tenant_a)
+        DatabasePool._set_tenant_schema(pool, conn, tenant_b)
+
+        statements = conn._cursor.executed
+        set_stmts = [s for s in statements if s.upper().startswith("SET")]
+        self.assertEqual(
+            len(set_stmts),
+            2,
+            f"Expected 2 SETs (different tenants), got {len(set_stmts)}: {set_stmts}",
+        )
+        self.assertIn("tenant_acme", set_stmts[0])
+        self.assertIn("tenant_corp", set_stmts[1])
+
+
+class TestCacheInvalidationOnReconnect(TestCase):
+    """After conn.reconnect(), the cache entry must be cleared so the
+    next _set_tenant_schema issues a fresh SET."""
+
+    def test_reconnect_clears_cache(self) -> None:
+        pool = MagicMock(spec=DatabasePool)
+        pool.engine = MagicMock(spec=PostgresEngine)
+        pool._connection_schemas = {}
+
+        conn = MockConnection()
+        tenant = _make_tenant("acme")
+
+        # First call sets cache
+        DatabasePool._set_tenant_schema(pool, conn, tenant)
+        self.assertIn(id(conn), pool._connection_schemas)
+
+        # Simulate what runWithConnection does after reconnect:
+        # it should clear the cache entry
+        DatabasePool._clear_connection_schema_cache(pool, conn)
+        self.assertNotIn(id(conn), pool._connection_schemas)
+
+        # Next SET should execute (cache miss)
+        conn._cursor.executed.clear()
+        DatabasePool._set_tenant_schema(pool, conn, tenant)
+        set_stmts = [s for s in conn._cursor.executed if s.upper().startswith("SET")]
+        self.assertEqual(len(set_stmts), 1, "SET should fire after cache clear")
