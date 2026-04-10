@@ -909,6 +909,8 @@ class MatrixFederationHttpClient:
         url_bytes: bytes,
         content: JsonDict | None = None,
         destination_is: bytes | None = None,
+        origin: str | None = None,
+        signing_key: object | None = None,
     ) -> list[bytes]:
         """
         Builds the Authorization headers for a federation request
@@ -931,10 +933,13 @@ class MatrixFederationHttpClient:
                 "must be a nonempty bytestring."
             )
 
+        effective_origin = origin if origin is not None else self.server_name
+        effective_key = signing_key if signing_key is not None else self.signing_key
+
         request: JsonDict = {
             "method": method.decode("ascii"),
             "uri": url_bytes.decode("ascii"),
-            "origin": self.server_name,
+            "origin": effective_origin,
         }
 
         if destination is not None:
@@ -946,16 +951,16 @@ class MatrixFederationHttpClient:
         if content is not None:
             request["content"] = content
 
-        request = sign_json(request, self.server_name, self.signing_key)
+        request = sign_json(request, effective_origin, effective_key)
 
         auth_headers = []
 
-        for key, sig in request["signatures"][self.server_name].items():
+        for key, sig in request["signatures"][effective_origin].items():
             auth_headers.append(
                 (
                     'X-Matrix origin="%s",key="%s",sig="%s",destination="%s"'
                     % (
-                        self.server_name,
+                        effective_origin,
                         key,
                         sig,
                         request.get("destination") or request["destination_is"],
