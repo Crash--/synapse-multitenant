@@ -555,6 +555,8 @@ class MatrixFederationHttpClient:
         backoff_on_404: bool = False,
         backoff_on_all_error_codes: bool = False,
         follow_redirects: bool = False,
+        origin: str | None = None,
+        signing_key: object | None = None,
     ) -> IResponse:
         """
         Sends a request to the given server.
@@ -689,7 +691,8 @@ class MatrixFederationHttpClient:
                     if json:
                         headers_dict[b"Content-Type"] = [b"application/json"]
                         auth_headers = self.build_auth_headers(
-                            destination_bytes, method_bytes, url_to_sign_bytes, json
+                            destination_bytes, method_bytes, url_to_sign_bytes, json,
+                            origin=origin, signing_key=signing_key,
                         )
                         data = encode_canonical_json(json)
                         producer: Optional[IBodyProducer] = QuieterFileBodyProducer(
@@ -698,7 +701,8 @@ class MatrixFederationHttpClient:
                     else:
                         producer = None
                         auth_headers = self.build_auth_headers(
-                            destination_bytes, method_bytes, url_to_sign_bytes
+                            destination_bytes, method_bytes, url_to_sign_bytes,
+                            origin=origin, signing_key=signing_key,
                         )
 
                     headers_dict[b"Authorization"] = auth_headers
@@ -984,6 +988,8 @@ class MatrixFederationHttpClient:
         try_trailing_slash_on_400: bool = False,
         parser: Literal[None] = None,
         backoff_on_all_error_codes: bool = False,
+        origin: str | None = None,
+        signing_key: object | None = None,
     ) -> JsonDict: ...
 
     @overload
@@ -1001,6 +1007,8 @@ class MatrixFederationHttpClient:
         try_trailing_slash_on_400: bool = False,
         parser: ByteParser[T] | None = None,
         backoff_on_all_error_codes: bool = False,
+        origin: str | None = None,
+        signing_key: object | None = None,
     ) -> T: ...
 
     async def put_json(
@@ -1017,6 +1025,8 @@ class MatrixFederationHttpClient:
         try_trailing_slash_on_400: bool = False,
         parser: ByteParser[T] | None = None,
         backoff_on_all_error_codes: bool = False,
+        origin: str | None = None,
+        signing_key: object | None = None,
     ) -> JsonDict | T:
         """Sends the specified json data using PUT
 
@@ -1087,6 +1097,8 @@ class MatrixFederationHttpClient:
             long_retries=long_retries,
             timeout=timeout,
             backoff_on_all_error_codes=backoff_on_all_error_codes,
+            origin=origin,
+            signing_key=signing_key,
         )
 
         if timeout is not None:

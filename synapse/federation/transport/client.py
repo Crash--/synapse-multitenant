@@ -269,6 +269,8 @@ class TransportLayerClient:
         self,
         transaction: Transaction,
         json_data_callback: Callable[[], JsonDict] | None = None,
+        origin: str | None = None,
+        signing_key: object | None = None,
     ) -> JsonDict:
         """Sends the given Transaction to its destination
 
@@ -313,6 +315,8 @@ class TransportLayerClient:
             # Sending a transaction should always succeed, if it doesn't
             # then something is wrong and we should backoff.
             backoff_on_all_error_codes=True,
+            origin=origin,
+            signing_key=signing_key,
         )
 
     async def make_query(

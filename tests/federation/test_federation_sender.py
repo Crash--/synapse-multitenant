@@ -510,7 +510,8 @@ class FederationSenderDevicesTestCases(HomeserverTestCase):
         )
 
     async def record_transaction(
-        self, txn: Transaction, json_cb: Callable[[], JsonDict] | None = None
+        self, txn: Transaction, json_cb: Callable[[], JsonDict] | None = None,
+        **kwargs: object,
     ) -> JsonDict:
         assert json_cb is not None
         data = json_cb()
