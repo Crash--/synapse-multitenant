@@ -239,3 +239,70 @@ class TestOidcProviderTenantScopedSkipsAutoRegister(TestCase):
                 tenant_public_baseurl="https://acme.localhost/",
             )
         sso.register_identity_provider.assert_not_called()
+
+
+class TestLoginAdvertisesTenantSso(TestCase):
+    """LoginRestServlet.on_GET must advertise m.login.sso for a tenant
+    whose OIDC config has providers, even when the global OIDC is off."""
+
+    def _make_login_servlet(self, *, global_oidc_enabled: bool,
+                            tenant_providers: dict):
+        from synapse.rest.client.login import LoginRestServlet
+
+        hs = MagicMock()
+        hs.config.jwt.jwt_enabled = False
+        hs.config.cas.cas_enabled = False
+        hs.config.saml2.saml2_enabled = False
+        hs.config.oidc.oidc_enabled = global_oidc_enabled
+        hs.config.registration.refreshable_access_token_lifetime = None
+        hs.config.experimental.msc3866.enabled = False
+        hs.config.experimental.msc3866.require_approval_for_new_accounts = False
+        hs.config.auth.login_via_existing_enabled = False
+        hs.get_datastores.return_value.main = MagicMock()
+        hs.get_auth.return_value = MagicMock()
+        hs.get_clock.return_value = MagicMock()
+        hs.get_auth_handler.return_value = MagicMock()
+        hs.get_registration_handler.return_value = MagicMock()
+
+        sso = MagicMock()
+        sso.get_identity_providers.return_value = tenant_providers
+        hs.get_sso_handler.return_value = sso
+
+        oidc_handler = MagicMock()
+        oidc_handler._get_providers.return_value = tenant_providers
+        hs.get_oidc_handler.return_value = oidc_handler
+
+        hs.get_module_api_callbacks.return_value = MagicMock()
+        hs.get_account_validity_handler.return_value = MagicMock()
+        hs.get_tenant_ratelimiter_registry.return_value = MagicMock()
+
+        return LoginRestServlet(hs)
+
+    def test_tenant_with_oidc_gets_sso_flow(self) -> None:
+        idp = MagicMock()
+        idp.idp_id = "lemonldap"
+        idp.idp_name = "LemonLDAP SSO"
+        idp.idp_icon = None
+        idp.idp_brand = None
+        servlet = self._make_login_servlet(
+            global_oidc_enabled=False,
+            tenant_providers={"lemonldap": idp},
+        )
+        request = MagicMock()
+        _, body = servlet.on_GET(request)
+        flows = body["flows"]
+        sso_flows = [f for f in flows if f.get("type") == "m.login.sso"]
+        self.assertEqual(len(sso_flows), 1)
+        ids = [p["id"] for p in sso_flows[0]["identity_providers"]]
+        self.assertIn("lemonldap", ids)
+
+    def test_no_sso_when_neither_global_nor_tenant_configured(self) -> None:
+        servlet = self._make_login_servlet(
+            global_oidc_enabled=False,
+            tenant_providers={},
+        )
+        request = MagicMock()
+        _, body = servlet.on_GET(request)
+        flows = body["flows"]
+        sso_flows = [f for f in flows if f.get("type") == "m.login.sso"]
+        self.assertEqual(sso_flows, [])

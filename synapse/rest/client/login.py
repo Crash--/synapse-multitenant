@@ -95,7 +95,10 @@ class LoginRestServlet(RestServlet):
         # SSO configuration.
         self.saml2_enabled = hs.config.saml2.saml2_enabled
         self.cas_enabled = hs.config.cas.cas_enabled
-        self.oidc_enabled = hs.config.oidc.oidc_enabled
+        self._global_oidc_enabled = hs.config.oidc.oidc_enabled
+        # OidcHandler may be absent when no OIDC (global or tenant) is
+        # ever configured; tolerate None on access.
+        self._hs = hs
         self._refresh_tokens_enabled = (
             hs.config.registration.refreshable_access_token_lifetime is not None
         )
@@ -128,6 +131,24 @@ class LoginRestServlet(RestServlet):
         # counters are initialised for the auth_provider_ids.
         _load_sso_handlers(hs)
 
+    def _tenant_has_oidc(self) -> bool:
+        """True if the current request's tenant (or the global config) has
+        at least one OIDC provider.
+
+        The global flag covers yaml-configured single-tenant deployments;
+        the tenant-context branch covers DB-driven mode where global
+        OIDC may be off but a specific tenant has providers.
+        """
+        if self._global_oidc_enabled:
+            return True
+        try:
+            oidc = self._hs.get_oidc_handler()
+        except Exception:
+            return False
+        if oidc is None:
+            return False
+        return bool(oidc._get_providers())
+
     def on_GET(self, request: SynapseRequest) -> tuple[int, JsonDict]:
         flows: list[JsonDict] = []
         if self.jwt_enabled:
@@ -141,7 +162,7 @@ class LoginRestServlet(RestServlet):
         # The login token flow requires m.login.token to be advertised.
         support_login_token_flow = self._get_login_token_enabled
 
-        if self.cas_enabled or self.saml2_enabled or self.oidc_enabled:
+        if self.cas_enabled or self.saml2_enabled or self._tenant_has_oidc():
             flows.append(
                 {
                     "type": LoginRestServlet.SSO_TYPE,
