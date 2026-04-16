@@ -78,17 +78,28 @@ export async function provisionTenantSchema(
     }
   }
 
-  // Step 4: Copy singleton seed rows
+  // Step 4: Copy singleton seed rows.
+  // This list must stay in sync with scripts/create_tenant_schema.py::
+  // SINGLETON_SEED_TABLES. Drift here causes bg-process crashes and
+  // register/send failures (critical-e2e-bugs.md B-1).
   const singletonTables = [
+    // --- Canonical list from SINGLETON_SEED_TABLES (Python bootstrap) ---
+    "appservice_stream_position",
+    "event_push_summary_last_receipt_stream_id",
+    "event_push_summary_stream_ordering",
+    "federation_stream_position",
+    "stats_incremental_position",
+    "user_directory_stream_pos",
+    "room_forgetter_stream_pos",
+    "delayed_events_stream_pos",
+    "device_lists_changes_converted_stream_position",
+    // --- Additional tables the control-plane has historically seeded;
+    //     kept for safety. Harmless if empty in public. ---
     "schema_version",
     "applied_schema_deltas",
-    "room_forgetter_stream_pos",
     "un_partial_stated_room_stream",
-    "device_lists_changes_converted_stream_position",
     "receipts_linearized_last_processed_stream_id",
-    "user_directory_stream_pos",
     "current_state_delta_stream",
-    "delayed_events_stream_pos",
   ];
 
   for (const table of singletonTables) {

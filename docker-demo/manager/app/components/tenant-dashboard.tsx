@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { CreateTenantDialog } from "./create-tenant-dialog";
+import { FederationTestPanel } from "./federation-test-panel";
 
 interface Tenant {
   id: string;
@@ -174,6 +175,21 @@ export function TenantDashboard() {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {tenants.length > 1 && (
+        <div className="mt-6 space-y-4">
+          <h3 className="text-lg font-semibold">Federation tests</h3>
+          {tenants.map((tenant) => (
+            <FederationTestPanel
+              key={`fed-${tenant.server_name}`}
+              source={{ server_name: tenant.server_name }}
+              others={tenants
+                .filter((t) => t.server_name !== tenant.server_name)
+                .map((t) => ({ server_name: t.server_name }))}
+            />
+          ))}
         </div>
       )}
 

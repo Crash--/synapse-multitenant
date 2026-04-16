@@ -3,6 +3,7 @@ import { loadConfig } from "./config.js";
 import { getDb, getPool, ensureSchema } from "./db/connection.js";
 import { createAuthHook } from "./middleware/auth.js";
 import { tenantRoutes } from "./routes/tenants.js";
+import { federationTestRoutes } from "./routes/federation-test.js";
 
 async function main() {
   const config = loadConfig();
@@ -26,6 +27,7 @@ async function main() {
 
   // Register tenant routes
   await app.register(tenantRoutes, { db, config, pool });
+  await app.register(federationTestRoutes, { config });
 
   // Start server
   await app.listen({ port: config.PORT, host: "0.0.0.0" });

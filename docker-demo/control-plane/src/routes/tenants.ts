@@ -12,6 +12,98 @@ import {
 import { reloadSynapseTenants } from "../services/synapse-client.js";
 import { provisionTenantSchema } from "../services/provisioning.js";
 
+const RESERVED_NAMES = new Set([
+  "localhost",
+  "manager.localhost",
+  "control-plane.localhost",
+  "traefik.localhost",
+]);
+
+type ProvisionArgs = {
+  db: any;
+  config: any;
+  pool: any;
+  masterKey: Buffer;
+  serverName: string;
+  body: any;
+  emit: (event: string, data: unknown) => void;
+};
+
+async function provisionTenant(args: ProvisionArgs): Promise<any> {
+  const { db, config, pool, masterKey, serverName, body, emit } = args;
+  const safeName = serverName.replace(/[^a-zA-Z0-9]/g, "_");
+  const databaseSchema = `tenant_${safeName}`;
+  const mediaStorePath = `${config.MEDIA_BASE_DIR}/${serverName}`;
+
+  emit("step", { step: "keygen", status: "running" });
+  const { keyText, keyId } = generateSigningKey(serverName);
+  const signingKeyEncrypted = encryptSigningKey(keyText, masterKey);
+  emit("step", { step: "keygen", status: "ok", detail: { keyId } });
+
+  const macaroonSecretKey = randomBytes(32).toString("hex");
+  const formSecret = randomBytes(32).toString("hex");
+
+  emit("step", { step: "db_row", status: "running" });
+  const [inserted] = await db
+    .insert(tenants)
+    .values({
+      serverName,
+      databaseSchema,
+      status: "provisioning",
+      signingKeyEncrypted,
+      signingKeyId: keyId,
+      macaroonSecretKey,
+      formSecret,
+      mediaStorePath,
+      registrationEnabled: body.registration_enabled ?? false,
+      enableFederation: body.enable_federation ?? true,
+      maxMauValue: body.max_mau_value ?? 0,
+      publicBaseurl: body.public_baseurl ?? `https://${serverName}/`,
+    })
+    .returning();
+  emit("step", { step: "db_row", status: "ok" });
+
+  emit("step", { step: "schema_clone", status: "running" });
+  try {
+    await provisionTenantSchema(pool, databaseSchema);
+    emit("step", { step: "schema_clone", status: "ok" });
+  } catch (err: any) {
+    emit("step", { step: "schema_clone", status: "error", detail: err.message });
+    throw err;
+  }
+
+  emit("step", { step: "media_dir", status: "running" });
+  try {
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(mediaStorePath, { recursive: true });
+    emit("step", { step: "media_dir", status: "ok" });
+  } catch (err: any) {
+    emit("step", { step: "media_dir", status: "ok", detail: "non-fatal: " + err.message });
+  }
+
+  emit("step", { step: "activate", status: "running" });
+  await db
+    .update(tenants)
+    .set({ status: "active", updatedAt: new Date() })
+    .where(eq(tenants.id, inserted.id));
+  emit("step", { step: "activate", status: "ok" });
+
+  emit("step", { step: "synapse_reload", status: "running" });
+  try {
+    await reloadSynapseTenants(config.SYNAPSE_URL, config.SYNAPSE_RELOAD_SECRET);
+    emit("step", { step: "synapse_reload", status: "ok" });
+  } catch (err: any) {
+    emit("step", { step: "synapse_reload", status: "ok", detail: "non-fatal: " + err.message });
+  }
+
+  return {
+    id: inserted.id,
+    server_name: serverName,
+    database_schema: databaseSchema,
+    status: "active",
+  };
+}
+
 export async function tenantRoutes(
   app: FastifyInstance,
   opts: { db: Database; config: Config; pool: import("pg").Pool }
@@ -89,119 +181,52 @@ export async function tenantRoutes(
       return reply.status(400).send({ error: "Missing required field: server_name" });
     }
 
-    // Check for duplicates
+    if (RESERVED_NAMES.has(serverName)) {
+      return reply.status(400).send({ error: `'${serverName}' is a reserved name; pick another` });
+    }
+
     const [existing] = await db
       .select()
       .from(tenants)
       .where(eq(tenants.serverName, serverName));
-
     if (existing) {
-      return reply
-        .status(409)
-        .send({ error: `Tenant '${serverName}' already exists` });
+      return reply.status(409).send({ error: `Tenant '${serverName}' already exists` });
     }
 
-    const safeName = serverName.replace(/[^a-zA-Z0-9]/g, "_");
-    const databaseSchema = `tenant_${safeName}`;
-    const mediaStorePath = `${config.MEDIA_BASE_DIR}/${serverName}`;
+    const wantsSSE = (request.headers.accept ?? "").includes("text/event-stream");
 
-    // Step 1: Generate signing key
-    const { keyText, keyId } = generateSigningKey(serverName);
-    const signingKeyEncrypted = encryptSigningKey(keyText, masterKey);
+    if (wantsSSE) {
+      reply.raw.setHeader("Content-Type", "text/event-stream");
+      reply.raw.setHeader("Cache-Control", "no-cache");
+      reply.raw.setHeader("Connection", "keep-alive");
+      reply.raw.flushHeaders();
 
-    // Step 2: Generate secrets
-    const macaroonSecretKey = randomBytes(32).toString("hex");
-    const formSecret = randomBytes(32).toString("hex");
+      const emit = (event: string, data: unknown) => {
+        reply.raw.write(`event: ${event}\n`);
+        reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
 
-    // Step 3: Insert with status=provisioning
-    const [inserted] = await db
-      .insert(tenants)
-      .values({
-        serverName,
-        databaseSchema,
-        status: "provisioning",
-        signingKeyEncrypted,
-        signingKeyId: keyId,
-        macaroonSecretKey,
-        formSecret,
-        mediaStorePath,
-        registrationEnabled: body.registration_enabled ?? false,
-        enableFederation: body.enable_federation ?? true,
-        maxMauValue: body.max_mau_value ?? 0,
-        publicBaseurl: body.public_baseurl ?? `http://${serverName}/`,
-      })
-      .returning();
+      try {
+        const result = await provisionTenant({ db, config, pool, masterKey, serverName, body, emit });
+        emit("complete", { tenant: result });
+      } catch (err: any) {
+        emit("error", { message: err.message });
+      } finally {
+        reply.raw.end();
+      }
+      return reply;
+    }
 
-    const steps: Array<{ step: string; status: string; detail?: string }> = [];
-    steps.push({ step: "insert_tenant_row", status: "done" });
-
-    // Step 4: Clone DB schema from public
+    // JSON path
     try {
-      await provisionTenantSchema(pool, databaseSchema);
-      steps.push({ step: "clone_schema", status: "done" });
+      const result = await provisionTenant({
+        db, config, pool, masterKey, serverName, body,
+        emit: () => {},
+      });
+      return reply.status(201).send({ tenant: result, steps: [] });
     } catch (err: any) {
-      steps.push({
-        step: "clone_schema",
-        status: "failed",
-        detail: err.message,
-      });
-      return reply.status(500).send({
-        error: "Schema provisioning failed",
-        tenant: { server_name: serverName, status: "provisioning" },
-        steps,
-      });
+      return reply.status(500).send({ error: err.message });
     }
-
-    // Step 5: Create media directory
-    try {
-      const { mkdir } = await import("node:fs/promises");
-      await mkdir(mediaStorePath, { recursive: true });
-      steps.push({ step: "create_media_dir", status: "done" });
-    } catch (err: any) {
-      steps.push({
-        step: "create_media_dir",
-        status: "failed",
-        detail: err.message,
-      });
-      // Non-fatal — Synapse will create it on first upload
-    }
-
-    // Step 6: Activate
-    await db
-      .update(tenants)
-      .set({ status: "active", updatedAt: new Date() })
-      .where(eq(tenants.id, inserted.id));
-    steps.push({ step: "activate", status: "done" });
-
-    // Step 7: Push reload to Synapse
-    try {
-      const reloadResult = await reloadSynapseTenants(
-        config.SYNAPSE_URL,
-        config.SYNAPSE_RELOAD_SECRET
-      );
-      steps.push({
-        step: "synapse_reload",
-        status: "done",
-        detail: `added=${reloadResult.added.length}`,
-      });
-    } catch (err: any) {
-      steps.push({
-        step: "synapse_reload",
-        status: "failed",
-        detail: err.message,
-      });
-      // Non-fatal — Synapse will pick up on next restart
-    }
-
-    return reply.status(201).send({
-      tenant: {
-        id: inserted.id,
-        server_name: serverName,
-        database_schema: databaseSchema,
-        status: "active",
-      },
-      steps,
-    });
   });
 
   // PATCH /api/v1/tenants/:serverName — update tenant config
