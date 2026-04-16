@@ -199,6 +199,16 @@ class OidcHandler:
             return self._tenant_providers[tenant.server_name]
         return self._global_providers
 
+    def has_providers(self) -> bool:
+        """Public: True if the current tenant (or global config) has any
+        OIDC providers available.
+
+        Thin wrapper over :meth:`_get_providers` so external callers —
+        e.g. :class:`LoginRestServlet` — don't reach through the
+        underscore-prefixed internal.
+        """
+        return bool(self._get_providers())
+
     async def load_metadata(self) -> None:
         """Validate the config and load the metadata from the remote endpoint.
 

@@ -96,9 +96,6 @@ class LoginRestServlet(RestServlet):
         self.saml2_enabled = hs.config.saml2.saml2_enabled
         self.cas_enabled = hs.config.cas.cas_enabled
         self._global_oidc_enabled = hs.config.oidc.oidc_enabled
-        # OidcHandler may be absent when no OIDC (global or tenant) is
-        # ever configured; tolerate None on access.
-        self._hs = hs
         self._refresh_tokens_enabled = (
             hs.config.registration.refreshable_access_token_lifetime is not None
         )
@@ -142,12 +139,14 @@ class LoginRestServlet(RestServlet):
         if self._global_oidc_enabled:
             return True
         try:
-            oidc = self._hs.get_oidc_handler()
-        except Exception:
+            oidc = self.hs.get_oidc_handler()
+        except AssertionError:
+            # OidcHandler.__init__ asserts that at least one global provider
+            # is configured.  When OIDC is fully absent from the YAML and no
+            # tenant override is present the assertion fires; treat that as
+            # "no providers".
             return False
-        if oidc is None:
-            return False
-        return bool(oidc._get_providers())
+        return oidc.has_providers()
 
     def on_GET(self, request: SynapseRequest) -> tuple[int, JsonDict]:
         flows: list[JsonDict] = []

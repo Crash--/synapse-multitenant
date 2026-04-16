@@ -270,6 +270,7 @@ class TestLoginAdvertisesTenantSso(TestCase):
 
         oidc_handler = MagicMock()
         oidc_handler._get_providers.return_value = tenant_providers
+        oidc_handler.has_providers.return_value = bool(tenant_providers)
         hs.get_oidc_handler.return_value = oidc_handler
 
         hs.get_module_api_callbacks.return_value = MagicMock()
