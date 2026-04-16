@@ -74,6 +74,7 @@ from synapse.util.templates import _localpart_from_email_filter
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
+    from synapse.tenant_registry import TenantRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,79 @@ class OidcHandler:
         underscore-prefixed internal.
         """
         return bool(self._get_providers())
+
+    def reload(self, registry: "TenantRegistry") -> None:
+        """Rebuild per-tenant OIDC providers against the live registry.
+
+        Called from :class:`ReloadTenantsRestServlet` when the control
+        plane pushes a tenant-config change. Diffs the new tenant set
+        against the cached ``_tenant_providers`` and updates the
+        :class:`SsoHandler` registrations in place.
+
+        Best-effort: individual per-tenant parse / register failures are
+        logged but don't abort the whole reload.
+        """
+        old: dict[str, dict[str, OidcProvider]] = self._tenant_providers
+        new: dict[str, dict[str, OidcProvider]] = {}
+
+        for tenant in registry.get_all_tenants():
+            if tenant.oidc is None or not tenant.oidc.providers:
+                continue
+            synthetic = {"oidc_providers": list(tenant.oidc.providers)}
+            try:
+                parsed = tuple(_parse_oidc_provider_configs(synthetic))
+            except Exception:
+                logger.exception(
+                    "Reload: failed to parse OIDC for tenant %s; skipping",
+                    tenant.server_name,
+                )
+                continue
+            new[tenant.server_name] = {
+                p.idp_id: OidcProvider(
+                    self._hs,
+                    self._macaroon_generator,
+                    p,
+                    tenant_server_name=tenant.server_name,
+                    tenant_public_baseurl=tenant.effective_public_baseurl,
+                )
+                for p in parsed
+            }
+
+        # De-register removed tenant IdPs (anything in old but not in new).
+        for server_name, providers in old.items():
+            new_for_tenant = new.get(server_name, {})
+            for idp_id in providers:
+                if idp_id not in new_for_tenant:
+                    try:
+                        self._sso_handler.deregister_tenant_identity_provider(
+                            server_name, idp_id
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Reload: deregister failed for %s::%s",
+                            server_name, idp_id,
+                        )
+
+        # Register new tenant IdPs (anything in new but not in old).
+        for server_name, providers in new.items():
+            old_for_tenant = old.get(server_name, {})
+            for idp_id, provider in providers.items():
+                if idp_id not in old_for_tenant:
+                    try:
+                        self._sso_handler.register_tenant_identity_provider(
+                            provider, server_name
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Reload: register failed for %s::%s",
+                            server_name, idp_id,
+                        )
+
+        self._tenant_providers = new
+        logger.info(
+            "OidcHandler.reload: %d tenants with providers (was %d)",
+            len(new), len(old),
+        )
 
     async def load_metadata(self) -> None:
         """Validate the config and load the metadata from the remote endpoint.

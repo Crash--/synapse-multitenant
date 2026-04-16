@@ -307,3 +307,79 @@ class TestLoginAdvertisesTenantSso(TestCase):
         flows = body["flows"]
         sso_flows = [f for f in flows if f.get("type") == "m.login.sso"]
         self.assertEqual(sso_flows, [])
+
+
+class TestOidcHandlerReload(TestCase):
+    """OidcHandler.reload diffs _tenant_providers against the live registry
+    and updates SsoHandler registrations accordingly."""
+
+    _PROVIDER = {
+        "idp_id": "lemonldap",
+        "idp_name": "LemonLDAP SSO",
+        "issuer": "https://lemonldap.localhost/",
+        "client_id": "synapse-demo",
+        "client_secret": "demo-secret-change-in-prod",
+        "scopes": ["openid"],
+        "discover": False,
+        "authorization_endpoint": "https://lemonldap.localhost/oauth2/authorize",
+        "token_endpoint": "https://lemonldap.localhost/oauth2/token",
+        "userinfo_endpoint": "https://lemonldap.localhost/oauth2/userinfo",
+        "jwks_uri": "https://lemonldap.localhost/oauth2/jwks",
+    }
+
+    def _make_handler(self, tenants_at_start):
+        from synapse.handlers.oidc import OidcHandler
+        import synapse.handlers.oidc as oidc_mod
+
+        hs = MagicMock()
+        hs.config.multi_tenant = MagicMock(enabled=True, tenants={})
+        registry = MagicMock()
+        registry.get_all_tenants.return_value = tenants_at_start
+        hs.get_tenant_registry.return_value = registry
+        hs.config.oidc.oidc_providers = [MagicMock(idp_id="global")]
+        hs.get_sso_handler.return_value = MagicMock()
+        hs.get_macaroon_generator.return_value = MagicMock()
+
+        with patch.object(oidc_mod, "OidcProvider"), \
+             patch.object(oidc_mod, "_parse_oidc_provider_configs",
+                          return_value=[MagicMock(idp_id="lemonldap")]):
+            handler = OidcHandler(hs)
+        return handler, hs
+
+    def test_reload_adds_new_tenant(self) -> None:
+        handler, hs = self._make_handler(tenants_at_start=[])
+        acme = _make_tenant_with_oidc("acme.localhost", self._PROVIDER)
+        registry = hs.get_tenant_registry()
+        registry.get_all_tenants.return_value = [acme]
+
+        import synapse.handlers.oidc as oidc_mod
+        with patch.object(oidc_mod, "OidcProvider"), \
+             patch.object(oidc_mod, "_parse_oidc_provider_configs",
+                          return_value=[MagicMock(idp_id="lemonldap")]):
+            handler.reload(registry)
+
+        self.assertIn("acme.localhost", handler._tenant_providers)
+        sso = hs.get_sso_handler()
+        # Assert that register_tenant_identity_provider was called for acme.
+        call_args_list = sso.register_tenant_identity_provider.call_args_list
+        servers_called = [c.args[1] for c in call_args_list if len(c.args) >= 2]
+        self.assertIn("acme.localhost", servers_called)
+
+    def test_reload_removes_deleted_tenant(self) -> None:
+        acme = _make_tenant_with_oidc("acme.localhost", self._PROVIDER)
+        handler, hs = self._make_handler(tenants_at_start=[acme])
+        self.assertIn("acme.localhost", handler._tenant_providers)
+        registry = hs.get_tenant_registry()
+        registry.get_all_tenants.return_value = []
+
+        import synapse.handlers.oidc as oidc_mod
+        with patch.object(oidc_mod, "OidcProvider"), \
+             patch.object(oidc_mod, "_parse_oidc_provider_configs",
+                          return_value=[MagicMock(idp_id="lemonldap")]):
+            handler.reload(registry)
+
+        self.assertNotIn("acme.localhost", handler._tenant_providers)
+        sso = hs.get_sso_handler()
+        sso.deregister_tenant_identity_provider.assert_any_call(
+            "acme.localhost", "lemonldap"
+        )
