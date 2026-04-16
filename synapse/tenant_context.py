@@ -92,6 +92,28 @@ def set_current_tenant(tenant: "TenantConfig | None") -> contextvars.Token["Tena
     return _current_tenant.set(tenant)
 
 
+def get_effective_server_name(fallback: str) -> str:
+    """Get the effective server_name for the current context.
+
+    Returns the current tenant's server_name if a tenant context is set,
+    otherwise the fallback (typically ``hs.hostname``).
+
+    Distinct from ``hs.is_mine_server_name``, which returns True for ANY
+    local tenant. Use this helper when the question is "is this the
+    *current* tenant?" — e.g. deciding whether a destination is literally
+    self-traffic (reject) versus sibling-tenant traffic (valid federation
+    even though it's same-process).
+
+    Args:
+        fallback: The value to return when no tenant context is set.
+
+    Returns:
+        The current tenant's ``server_name`` if set, else ``fallback``.
+    """
+    tenant = _current_tenant.get()
+    return tenant.server_name if tenant is not None else fallback
+
+
 def reset_current_tenant(token: contextvars.Token["TenantConfig | None"]) -> None:
     """Reset the current tenant to its previous value using a token.
 

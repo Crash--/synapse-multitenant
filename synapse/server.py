@@ -818,14 +818,31 @@ class HomeServer(metaclass=abc.ABCMeta):
     def _is_local_server_name(self, server_name: str) -> bool:
         """Check if server_name belongs to a local tenant.
 
-        This method checks both the current tenant context and all configured tenants.
+        Consults (in order):
+          1. Current tenant ContextVar (fast path).
+          2. The HS-level TenantRegistry — the live, reloadable source of
+             truth. Required for DB-driven tenancy where the YAML dict is
+             empty but tenants exist in the registry.
+          3. The YAML ``config.tenants.multi_tenant.tenants`` dict as a
+             fallback for single-tenant-yaml deployments where the registry
+             accessor may not be available (e.g. very early startup).
         """
-        # Check current tenant context first
+        # 1. Current tenant context first (fast path).
         tenant = get_current_tenant()
         if tenant is not None and tenant.server_name == server_name:
             return True
 
-        # Check if it's any of our configured tenants
+        # 2. Shared HS-level registry — survives control-plane reloads and
+        # is the canonical source in DB-driven mode.
+        try:
+            registry = self.get_tenant_registry()
+            if registry.get_tenant(server_name) is not None:
+                return True
+        except Exception:
+            # Accessor may be unavailable very early in startup; fall through.
+            pass
+
+        # 3. YAML fallback for yaml-sourced deployments.
         tenants_config = getattr(self.config, "tenants", None)
         if tenants_config is not None and hasattr(tenants_config, "multi_tenant"):
             if tenants_config.multi_tenant.enabled:

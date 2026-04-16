@@ -65,7 +65,11 @@ from synapse.types import (
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import Linearizer
 from synapse.util.distributor import user_left_room
-from synapse.tenant_context import get_current_tenant, get_effective_server_notices_mxid
+from synapse.tenant_context import (
+    get_current_tenant,
+    get_effective_server_name,
+    get_effective_server_notices_mxid,
+)
 from synapse.util.duration import Duration
 
 if TYPE_CHECKING:
@@ -1051,7 +1055,12 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
                     )
 
                 inviter = await self._get_inviter(target.to_string(), room_id)
-                if inviter and not self.hs.is_mine(inviter):
+                # Bug 10'-b: compare against the CURRENT tenant, not any local
+                # tenant. A sibling tenant's domain must be added to
+                # remote_room_hosts because the room state lives in that
+                # sibling's schema — we reach it via (in-process) federation.
+                current_self = get_effective_server_name(self.hs.hostname)
+                if inviter and inviter.domain != current_self:
                     remote_room_hosts.append(inviter.domain)
 
                 content["membership"] = Membership.JOIN
@@ -1817,8 +1826,18 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             # We can only get here if we're in the process of creating the room
             return True
 
+        # Bug 10'-b: only count members of the CURRENT tenant. Sibling-tenant
+        # members exist in the process but their state lives in a separate
+        # schema — we cannot serve joins on their behalf, so they don't
+        # count as "host in room" from this tenant's perspective.
+        current_self = get_effective_server_name(self.hs.hostname)
+
         for etype, state_key in partial_current_state_ids:
-            if etype != EventTypes.Member or not self.hs.is_mine_id(state_key):
+            if etype != EventTypes.Member:
+                continue
+            # state_key is a user_id like "@alice:server.name"; extract server
+            _, _, state_server = state_key.partition(":")
+            if state_server != current_self:
                 continue
 
             event_id = partial_current_state_ids[(etype, state_key)]
@@ -1885,8 +1904,12 @@ class RoomMemberMasterHandler(RoomMemberHandler):
         # filter ourselves out of remote_room_hosts: do_invite_join ignores it
         # and if it is the only entry we'd like to return a 404 rather than a
         # 500.
+        # Bug 10'-b: only exclude the CURRENT tenant, not any local tenant —
+        # sibling tenants are valid federation destinations (their room state
+        # lives in a separate schema).
+        current_self = get_effective_server_name(self.hs.hostname)
         remote_room_hosts = [
-            host for host in remote_room_hosts if host != self.hs.hostname
+            host for host in remote_room_hosts if host != current_self
         ]
 
         if len(remote_room_hosts) == 0:

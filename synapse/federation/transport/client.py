@@ -49,6 +49,7 @@ from synapse.events import EventBase, make_event_from_dict
 from synapse.federation.units import Transaction
 from synapse.http.matrixfederationclient import ByteParser, LegacyJsonSendParser
 from synapse.http.types import QueryParams
+from synapse.tenant_context import get_effective_server_name
 from synapse.types import JsonDict, UserID
 from synapse.util import ExceptionBundle
 
@@ -64,6 +65,7 @@ class TransportLayerClient:
     def __init__(self, hs: "HomeServer"):
         self.client = hs.get_federation_http_client()
         self._is_mine_server_name = hs.is_mine_server_name
+        self._hostname = hs.hostname
 
     def shutdown(self) -> None:
         self.client.shutdown()
@@ -296,7 +298,12 @@ class TransportLayerClient:
             transaction.transaction_id,
         )
 
-        if self._is_mine_server_name(transaction.destination):
+        # Bug 10'-b: only reject if the destination is literally the CURRENT
+        # tenant (true self-send). Sibling tenants are valid federation
+        # destinations — they happen to live in the same process but have
+        # separate schemas, keys, and queues.
+        current_self = get_effective_server_name(self._hostname)
+        if transaction.destination == current_self:
             raise RuntimeError("Transport layer cannot send to itself!")
 
         # FIXME: This is only used by the tests. The actual json sent is

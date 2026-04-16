@@ -584,10 +584,18 @@ class ReloadTenantsRestServlet(RestServlet):
 
 
 def register_tenant_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
-    """Register all tenant admin servlets."""
+    """Register all tenant admin servlets.
+
+    Registration order matters: specific-path servlets (``/tenants/reload``)
+    must register BEFORE the generic ``/tenants/{server_name}`` pattern,
+    otherwise the generic pattern greedily matches ``/tenants/reload``
+    (treating ``reload`` as a server_name) and returns 405.
+    """
+    # Specific paths first, so they beat the catch-all ``/tenants/{name}``.
+    ReloadTenantsRestServlet(hs).register(http_server)
+    # Catch-alls and parameterised paths.
     ListTenantsRestServlet(hs).register(http_server)
-    TenantRestServlet(hs).register(http_server)
     CreateTenantRestServlet(hs).register(http_server)
     ReloadTenantKeysRestServlet(hs).register(http_server)
     TenantStatusRestServlet(hs).register(http_server)
-    ReloadTenantsRestServlet(hs).register(http_server)
+    TenantRestServlet(hs).register(http_server)

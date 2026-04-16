@@ -410,12 +410,28 @@ def check_database_before_upgrade(
     if user_domain == config.server.server_name:
         return
 
-    # Multi-tenant support: check if the user belongs to a configured tenant
+    # Multi-tenant support: check if the user belongs to a configured tenant.
+    # In DB-driven mode (source=database) the YAML dict is empty — we must
+    # query public.tenants directly since we don't have a HomeServer instance
+    # here (this runs during pre-upgrade checks before HS is built).
     tenants_config = getattr(config, "tenants", None)
     if tenants_config is not None and hasattr(tenants_config, "multi_tenant"):
         if tenants_config.multi_tenant.enabled:
-            # Get all configured tenant server_names
-            tenant_server_names = set(tenants_config.multi_tenant.tenants.keys())
+            tenant_server_names: set[str] = set(
+                tenants_config.multi_tenant.tenants.keys()
+            )
+            if getattr(tenants_config.multi_tenant, "source", "yaml") == "database":
+                try:
+                    cur.execute(
+                        "SELECT server_name FROM public.tenants WHERE status = 'active'"
+                    )
+                    tenant_server_names.update(r[0] for r in cur.fetchall())
+                except Exception as e:
+                    logger.warning(
+                        "Could not query public.tenants during pre-upgrade "
+                        "check (DB-driven mode): %s",
+                        e,
+                    )
             if user_domain in tenant_server_names:
                 logger.info(
                     "User domain %s belongs to configured tenant, allowing",

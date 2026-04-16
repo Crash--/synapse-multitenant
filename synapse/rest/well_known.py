@@ -126,24 +126,14 @@ class ClientWellKnownResource(DirectServeJsonResource):
 
 
 class ServerWellKnownResource(Resource):
-    """Resource for .well-known/matrix/server, redirecting to port 443"""
+    """Resource for .well-known/matrix/server, returning tenant-aware m.server."""
 
     isLeaf = 1
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
         self._serve_server_wellknown = hs.config.server.serve_server_wellknown
-
-        host, port = parse_server_name(hs.config.server.server_name)
-
-        # If we've got this far, then https://<server_name>/ must route to us, so
-        # we just redirect the traffic to port 443 instead of 8448.
-        if port is None:
-            port = 443
-
-        self._response = json_encoder.encode({"m.server": f"{host}:{port}"}).encode(
-            "utf-8"
-        )
+        self._global_server_name = hs.config.server.server_name
 
     def render_GET(self, request: Request) -> bytes:
         if not self._serve_server_wellknown:
@@ -151,8 +141,17 @@ class ServerWellKnownResource(Resource):
             request.setHeader(b"Content-Type", b"text/plain")
             return b"404. Is anything ever truly *well* known?\n"
 
+        # Tenant-aware: use the current tenant's server_name when set.
+        tenant = get_current_tenant()
+        server_name = tenant.server_name if tenant is not None else self._global_server_name
+
+        host, port = parse_server_name(server_name)
+        if port is None:
+            port = 443
+
+        response = json_encoder.encode({"m.server": f"{host}:{port}"}).encode("utf-8")
         request.setHeader(b"Content-Type", b"application/json")
-        return self._response
+        return response
 
 
 def well_known_resource(hs: "HomeServer") -> Resource:

@@ -468,7 +468,9 @@ async def start(
             )
         else:
             main_db_pool = hs.get_datastores().main.db_pool
-            tenants = list(hs.config.tenants.multi_tenant.tenants.values())
+            # Use the live registry (populated from DB in source=database mode)
+            # rather than the YAML dict which is empty in DB-driven deployments.
+            tenants = list(hs.get_tenant_registry().get_all_tenants())
 
             def _check_tenant_isolation(raw_conn: "LoggingDatabaseConnection") -> None:
                 # Derive the expected-tables list from `public` at startup

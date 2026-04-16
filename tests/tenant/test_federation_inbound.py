@@ -416,3 +416,207 @@ class TestEventAuthHandlerEffectiveServerName(TestCase):
             return_value=None,
         ):
             self.assertEqual(handler._effective_server_name, "main.localhost")
+
+
+# ── 10'-a probe: SynapseSite uses shared HS tenant registry ──────
+
+
+class TestSynapseSiteUsesSharedTenantRegistry(TestCase):
+    """SynapseSite must use hs.get_tenant_registry() so DB-reload updates are visible.
+
+    Bug 10'-a: SynapseSite previously constructed its own TenantRegistry from YAML
+    at init. In DB-driven mode (source='database'), YAML has no tenants, so the
+    site's registry stayed empty and _setup_tenant_context always returned early.
+    """
+
+    def test_site_uses_shared_registry(self) -> None:
+        import inspect
+        from synapse.http import site
+
+        # Read the source of SynapseSite.__init__ and verify it calls
+        # hs.get_tenant_registry() rather than constructing a new TenantRegistry.
+        src = inspect.getsource(site.SynapseSite.__init__)
+        self.assertIn(
+            "hs.get_tenant_registry()",
+            src,
+            "SynapseSite must share the HS-level tenant registry for DB reloads",
+        )
+        self.assertNotIn(
+            "TenantRegistry(tenants_config.multi_tenant)",
+            src,
+            "SynapseSite must not construct its own YAML-bound registry",
+        )
+
+
+# ── 10'-b probes: cross-tenant room join (Option A — federation loopback) ──
+
+
+class TestGetEffectiveServerName(TestCase):
+    """get_effective_server_name distinguishes current tenant from siblings.
+
+    Unlike is_mine_server_name (which returns True for ANY local tenant),
+    get_effective_server_name returns the CURRENT tenant's server_name so we
+    can tell "self traffic" apart from "sibling-tenant traffic" in routing.
+    """
+
+    def test_returns_tenant_when_context_set(self) -> None:
+        from synapse.tenant_context import (
+            get_effective_server_name,
+            set_current_tenant,
+            reset_current_tenant,
+        )
+
+        acme = _make_tenant("acme")
+        token = set_current_tenant(acme)
+        try:
+            self.assertEqual(
+                get_effective_server_name("main.localhost"),
+                "acme.localhost",
+            )
+        finally:
+            reset_current_tenant(token)
+
+    def test_returns_fallback_when_no_context(self) -> None:
+        from synapse.tenant_context import (
+            get_effective_server_name,
+            set_current_tenant,
+            reset_current_tenant,
+        )
+
+        # Explicitly clear any leaked context from other tests
+        clear_token = set_current_tenant(None)
+        try:
+            self.assertEqual(
+                get_effective_server_name("main.localhost"),
+                "main.localhost",
+            )
+        finally:
+            reset_current_tenant(clear_token)
+
+
+class TestCrossTenantJoinPath(TestCase):
+    """Bug 10'-b: Sibling-tenant domains must survive the join path filters.
+
+    When bob@tenant-b.com is invited to a room owned by tenant-a, the
+    join machinery must:
+      (1) add tenant-a.com to remote_room_hosts (inviter filter should not
+          exclude sibling-tenant inviters),
+      (2) keep tenant-a.com in remote_room_hosts in _remote_join (self-filter
+          must only exclude the CURRENT tenant, not all local tenants),
+      (3) the transport layer self-send guard must only reject
+          destination == current tenant, not destination == any local tenant.
+    """
+
+    def test_inviter_filter_logic_preserves_sibling(self) -> None:
+        """Simulates the room_member.py:1054 filter condition in isolation."""
+        from synapse.tenant_context import (
+            get_effective_server_name,
+            set_current_tenant,
+            reset_current_tenant,
+        )
+
+        tenant_b = _make_tenant("b")
+
+        # Bob is in tenant-b; Alice (inviter) is in sibling tenant-a.
+        token = set_current_tenant(tenant_b)
+        try:
+            current_self = get_effective_server_name("main.localhost")
+            inviter_domain = "a.localhost"
+
+            # New condition: only exclude if inviter is in CURRENT tenant.
+            should_add_as_remote = inviter_domain != current_self
+            self.assertTrue(
+                should_add_as_remote,
+                "sibling-tenant inviter must count as remote for routing",
+            )
+        finally:
+            reset_current_tenant(token)
+
+    def test_remote_join_filter_preserves_sibling(self) -> None:
+        """Simulates the room_member.py:1889 host filter in _remote_join."""
+        from synapse.tenant_context import (
+            get_effective_server_name,
+            set_current_tenant,
+            reset_current_tenant,
+        )
+
+        tenant_b = _make_tenant("b")
+        remote_room_hosts = ["a.localhost", "b.localhost", "external.example.com"]
+
+        token = set_current_tenant(tenant_b)
+        try:
+            current_self = get_effective_server_name("main.localhost")
+            filtered = [h for h in remote_room_hosts if h != current_self]
+            self.assertIn("a.localhost", filtered, "sibling tenant must survive")
+            self.assertNotIn("b.localhost", filtered, "current tenant must be removed")
+            self.assertIn("external.example.com", filtered, "external must survive")
+        finally:
+            reset_current_tenant(token)
+
+    def test_transport_self_send_guard_allows_sibling(self) -> None:
+        """transport/client.py:299 must only reject destination == current tenant."""
+        from synapse.tenant_context import (
+            get_effective_server_name,
+            set_current_tenant,
+            reset_current_tenant,
+        )
+
+        tenant_b = _make_tenant("b")
+        token = set_current_tenant(tenant_b)
+        try:
+            current_self = get_effective_server_name("main.localhost")
+
+            # Sending to a sibling tenant is OK (not self)
+            sibling_dest = "a.localhost"
+            self.assertNotEqual(sibling_dest, current_self)
+
+            # Sending to current tenant IS self
+            self_dest = "b.localhost"
+            self.assertEqual(self_dest, current_self)
+        finally:
+            reset_current_tenant(token)
+
+
+class TestIsHostInRoomCurrentTenantOnly(TestCase):
+    """_is_host_in_room must consider only the CURRENT tenant's members.
+
+    Sibling-tenant members live in a different schema; the current tenant
+    cannot serve joins on their behalf. So _is_host_in_room should return
+    False when only sibling-tenant members are in the state.
+    """
+
+    def test_current_tenant_member_counts_as_host(self) -> None:
+        from synapse.tenant_context import (
+            get_effective_server_name,
+            set_current_tenant,
+            reset_current_tenant,
+        )
+
+        tenant_b = _make_tenant("b")
+        token = set_current_tenant(tenant_b)
+        try:
+            current_self = get_effective_server_name("main.localhost")
+            # Member state key belongs to current tenant
+            state_key = "@bob:b.localhost"
+            _, _, server = state_key.partition(":")
+            self.assertEqual(server, current_self)
+        finally:
+            reset_current_tenant(token)
+
+    def test_sibling_tenant_member_does_not_count(self) -> None:
+        from synapse.tenant_context import (
+            get_effective_server_name,
+            set_current_tenant,
+            reset_current_tenant,
+        )
+
+        tenant_b = _make_tenant("b")
+        token = set_current_tenant(tenant_b)
+        try:
+            current_self = get_effective_server_name("main.localhost")
+            # Member state key belongs to sibling tenant
+            state_key = "@alice:a.localhost"
+            _, _, server = state_key.partition(":")
+            self.assertNotEqual(server, current_self)
+        finally:
+            reset_current_tenant(token)

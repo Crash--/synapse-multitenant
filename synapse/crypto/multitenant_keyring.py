@@ -299,7 +299,8 @@ def create_multi_tenant_keyring(hs: "HomeServer") -> MultiTenantKeyring | None:
     if tenants_config is None or not tenants_config.multi_tenant.enabled:
         return None
 
-    from synapse.tenant_registry import TenantRegistry
-
-    registry = TenantRegistry(tenants_config.multi_tenant)
+    # Use the shared HS-level registry so control-plane reloads cascade
+    # into this keyring. Constructing a new TenantRegistry here would
+    # snapshot the YAML dict at startup (empty in DB-driven mode).
+    registry = hs.get_tenant_registry()
     return MultiTenantKeyring(hs, registry)

@@ -999,21 +999,22 @@ class SynapseSite(ProxySite):
         self.server_version_string = server_version_string.encode("ascii")
         self.connections: list[Protocol] = []
 
-        # Multi-tenant support: store the tenant registry for tenant lookups
+        # Multi-tenant support: use the shared HomeServer-level registry so
+        # DB-driven reloads (control plane) are visible here. Creating a new
+        # registry from YAML here would make it stale in DB-driven mode
+        # (bug 10'-a: YAML has no tenants when source="database").
         self._tenant_registry: "TenantRegistry | None" = None
         self._multi_tenant_enabled: bool = False
 
-        # Check if multi-tenant mode is enabled in config
         tenants_config = getattr(hs.config, "tenants", None)
         if tenants_config is not None and tenants_config.multi_tenant.enabled:
-            from synapse.tenant_registry import TenantRegistry
-
             self._multi_tenant_enabled = True
-            self._tenant_registry = TenantRegistry(tenants_config.multi_tenant)
+            self._tenant_registry = hs.get_tenant_registry()
             logger.info(
-                "Multi-tenant mode enabled for site %s with %d tenants",
+                "Multi-tenant mode enabled for site %s with %d tenants (source=%s)",
                 site_tag,
                 len(self._tenant_registry.get_all_tenants()),
+                tenants_config.multi_tenant.source,
             )
 
     @property
