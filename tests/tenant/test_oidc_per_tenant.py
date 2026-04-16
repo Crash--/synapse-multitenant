@@ -7,6 +7,7 @@ from unittest import TestCase
 from unittest.mock import ANY, MagicMock, patch
 
 from synapse.config.tenants import TenantConfig, TenantOidcConfig
+from synapse.tenant_context import set_current_tenant, reset_current_tenant
 
 
 class TestTenantOidcConfigFromDbValue(TestCase):
@@ -113,3 +114,128 @@ class TestBuildTenantProvidersReadsRegistry(TestCase):
                 tenant_server_name="acme.localhost",
                 tenant_public_baseurl=ANY,
             )
+
+
+class TestSsoHandlerTenantAware(TestCase):
+    """SsoHandler must accept per-tenant IdP registrations and filter
+    get_identity_providers() by the current tenant ContextVar."""
+
+    def _make_sso_handler(self):
+        from synapse.handlers.sso import SsoHandler
+
+        hs = MagicMock()
+        hs.config.server.server_name = "main.localhost"
+        hs.config.consent.user_consent_at_registration = False
+        hs.get_clock.return_value = MagicMock()
+        hs.get_auth_handler.return_value = MagicMock()
+        hs.get_registration_handler.return_value = MagicMock()
+        hs.get_datastores.return_value = MagicMock()
+        hs.get_server_notices_manager.return_value = MagicMock()
+        hs.get_replication_command_handler.return_value = MagicMock()
+        return SsoHandler(hs)
+
+    def _make_idp(self, idp_id: str):
+        idp = MagicMock()
+        idp.idp_id = idp_id
+        return idp
+
+    def test_two_tenants_same_idp_id_no_collision(self) -> None:
+        sso = self._make_sso_handler()
+        idp_a = self._make_idp("lemonldap")
+        idp_b = self._make_idp("lemonldap")
+        sso.register_tenant_identity_provider(idp_a, "acme.localhost")
+        sso.register_tenant_identity_provider(idp_b, "corp.localhost")
+        # Nothing raised = pass.
+
+    def test_get_identity_providers_filters_by_tenant(self) -> None:
+        sso = self._make_sso_handler()
+        idp_a = self._make_idp("lemonldap")
+        idp_b = self._make_idp("lemonldap")
+        sso.register_tenant_identity_provider(idp_a, "acme.localhost")
+        sso.register_tenant_identity_provider(idp_b, "corp.localhost")
+
+        acme = _make_tenant_with_oidc("acme.localhost", {"idp_id": "lemonldap"})
+        token = set_current_tenant(acme)
+        try:
+            providers = sso.get_identity_providers()
+            self.assertIn("lemonldap", providers)
+            self.assertIs(providers["lemonldap"], idp_a)
+        finally:
+            reset_current_tenant(token)
+
+    def test_global_providers_visible_when_no_tenant_context(self) -> None:
+        sso = self._make_sso_handler()
+        idp_global = self._make_idp("saml-global")
+        sso.register_identity_provider(idp_global)
+        providers = sso.get_identity_providers()
+        self.assertIn("saml-global", providers)
+
+    def test_deregister_tenant_identity_provider(self) -> None:
+        sso = self._make_sso_handler()
+        idp = self._make_idp("lemonldap")
+        sso.register_tenant_identity_provider(idp, "acme.localhost")
+        sso.deregister_tenant_identity_provider("acme.localhost", "lemonldap")
+        acme = _make_tenant_with_oidc("acme.localhost", {"idp_id": "lemonldap"})
+        token = set_current_tenant(acme)
+        try:
+            self.assertNotIn("lemonldap", sso.get_identity_providers())
+        finally:
+            reset_current_tenant(token)
+
+
+class TestOidcProviderTenantScopedSkipsAutoRegister(TestCase):
+    """OidcProvider.__init__ must NOT call register_identity_provider when
+    tenant_server_name is set — the handler registers explicitly via
+    register_tenant_identity_provider."""
+
+    def test_tenant_scoped_oidc_provider_does_not_auto_register(self) -> None:
+        """Invoke OidcProvider.__init__ in tenant-scoped mode and assert
+        sso.register_identity_provider was NOT called.
+
+        __init__ does a lot of work; we patch out the heavy collaborators
+        (ClientAuth, JwtClientSecret, RetryOnExceptionCachedCall) and use
+        a real OidcProviderConfig-shaped MagicMock so we reach the
+        register guard at the tail of __init__.
+        """
+        import synapse.handlers.oidc as oidc_mod
+        from synapse.handlers.oidc import OidcProvider
+
+        hs = MagicMock()
+        hs.config.server.server_name = "main.localhost"
+        hs.config.server.public_baseurl = "https://main.localhost/"
+        hs.get_proxied_http_client.return_value = MagicMock()
+        sso = MagicMock()
+        hs.get_sso_handler.return_value = sso
+        hs.get_device_handler.return_value = MagicMock()
+
+        provider_cfg = MagicMock()
+        provider_cfg.idp_id = "lemonldap"
+        provider_cfg.idp_name = "LemonLDAP"
+        provider_cfg.idp_icon = None
+        provider_cfg.idp_brand = None
+        provider_cfg.redirect_uri = None
+        provider_cfg.client_secret = "secret"
+        provider_cfg.client_secret_jwt_key = None
+        provider_cfg.additional_authorization_parameters = ()
+        provider_cfg.passthrough_authorization_parameters = ()
+
+        # Make user_mapping_provider_class.__init__ have 2 params so the
+        # __init__ branch at line ~508 takes the short form.
+        class _FakeUMP:
+            def __init__(self, cfg):
+                pass
+        provider_cfg.user_mapping_provider_class = _FakeUMP
+        provider_cfg.user_mapping_provider_config = MagicMock()
+
+        with patch.object(oidc_mod, "ClientAuth") as _CA, \
+             patch.object(oidc_mod, "RetryOnExceptionCachedCall") as _RC:
+            _CA.return_value = MagicMock()
+            _RC.return_value = MagicMock()
+            OidcProvider(
+                hs,
+                MagicMock(),
+                provider_cfg,
+                tenant_server_name="acme.localhost",
+                tenant_public_baseurl="https://acme.localhost/",
+            )
+        sso.register_identity_provider.assert_not_called()

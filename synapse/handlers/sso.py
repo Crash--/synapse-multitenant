@@ -225,22 +225,82 @@ class SsoHandler:
         # a map from session id to session data
         self._username_mapping_sessions: dict[str, UsernameMappingSession] = {}
 
-        # map from idp_id to SsoIdentityProvider
+        # map from registration key → SsoIdentityProvider.
+        # Global IdPs are keyed by bare idp_id ("lemonldap").
+        # Tenant-scoped IdPs are keyed "<tenant_server_name>::<idp_id>" so
+        # multiple tenants can share an idp_id without colliding.
         self._identity_providers: dict[str, SsoIdentityProvider] = {}
 
         self._consent_at_registration = hs.config.consent.user_consent_at_registration
 
+    # -- registration -------------------------------------------------
+
     def register_identity_provider(self, p: SsoIdentityProvider) -> None:
+        """Register a GLOBAL identity provider (no tenant scoping)."""
         p_id = p.idp_id
-        assert p_id not in self._identity_providers
+        assert p_id not in self._identity_providers, (
+            f"duplicate global identity provider registration for {p_id}"
+        )
         self._identity_providers[p_id] = p
         init_counters_for_auth_provider(
             auth_provider_id=p_id, server_name=self.server_name
         )
 
+    def register_tenant_identity_provider(
+        self, p: SsoIdentityProvider, tenant_server_name: str
+    ) -> None:
+        """Register a TENANT-scoped identity provider.
+
+        The same ``idp_id`` may be registered for multiple tenants; the
+        storage key is namespaced (``<tenant>::<idp_id>``) so there is no
+        collision.
+        """
+        key = f"{tenant_server_name}::{p.idp_id}"
+        assert key not in self._identity_providers, (
+            f"duplicate tenant identity provider registration for {key}"
+        )
+        self._identity_providers[key] = p
+        init_counters_for_auth_provider(
+            auth_provider_id=p.idp_id, server_name=tenant_server_name
+        )
+
+    def deregister_tenant_identity_provider(
+        self, tenant_server_name: str, idp_id: str
+    ) -> None:
+        """Remove a tenant-scoped identity provider. Idempotent."""
+        key = f"{tenant_server_name}::{idp_id}"
+        self._identity_providers.pop(key, None)
+
+    # -- lookup -------------------------------------------------------
+
     def get_identity_providers(self) -> Mapping[str, SsoIdentityProvider]:
-        """Get the configured identity providers"""
-        return self._identity_providers
+        """Get the identity providers visible to the current request.
+
+        Tenant context (via ContextVar) narrows the view:
+
+          * If a tenant is current AND has tenant-scoped IdPs → return
+            those (with the namespace stripped from the keys).
+          * If a tenant is current but has no tenant-scoped IdPs → return
+            the global IdPs (so yaml-only deployments still work).
+          * If no tenant context → return the global IdPs.
+        """
+        from synapse.tenant_context import get_current_tenant
+
+        tenant = get_current_tenant()
+        if tenant is not None:
+            prefix = f"{tenant.server_name}::"
+            tenant_idps = {
+                key[len(prefix):]: p
+                for key, p in self._identity_providers.items()
+                if key.startswith(prefix)
+            }
+            if tenant_idps:
+                return tenant_idps
+        return {
+            key: p
+            for key, p in self._identity_providers.items()
+            if "::" not in key
+        }
 
     async def get_identity_providers_for_user(
         self, user_id: str
@@ -260,7 +320,14 @@ class SsoHandler:
 
         valid_idps = {}
         for idp_id, _ in external_ids:
+            # External IDs store the bare idp_id. Look up in both global
+            # and any tenant namespace for a match.
             idp = self._identity_providers.get(idp_id)
+            if idp is None:
+                for key, candidate in self._identity_providers.items():
+                    if key.endswith(f"::{idp_id}"):
+                        idp = candidate
+                        break
             if not idp:
                 logger.warning(
                     "User %r has an SSO mapping for IdP %r, but this is no longer "
@@ -268,8 +335,8 @@ class SsoHandler:
                     user_id,
                     idp_id,
                 )
-            else:
-                valid_idps[idp_id] = idp
+                continue
+            valid_idps[idp_id] = idp
 
         return valid_idps
 

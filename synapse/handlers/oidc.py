@@ -174,7 +174,7 @@ class OidcHandler:
                     tenant.server_name,
                 )
                 continue
-            self._tenant_providers[tenant.server_name] = {
+            built: dict[str, OidcProvider] = {
                 p.idp_id: OidcProvider(
                     hs,
                     self._macaroon_generator,
@@ -184,6 +184,11 @@ class OidcHandler:
                 )
                 for p in parsed
             }
+            for provider in built.values():
+                self._sso_handler.register_tenant_identity_provider(
+                    provider, tenant.server_name
+                )
+            self._tenant_providers[tenant.server_name] = built
 
     def _get_providers(self) -> dict[str, "OidcProvider"]:
         """Return OIDC providers for the current tenant context."""
@@ -540,7 +545,12 @@ class OidcProvider:
         self._sso_handler = hs.get_sso_handler()
         self._device_handler = hs.get_device_handler()
 
-        self._sso_handler.register_identity_provider(self)
+        # Tenant-scoped providers are registered explicitly by the
+        # OidcHandler via ``register_tenant_identity_provider`` so the
+        # storage key can be namespaced per tenant. Only auto-register
+        # global providers here.
+        if tenant_server_name is None:
+            self._sso_handler.register_identity_provider(self)
 
         self.passthrough_authorization_parameters = (
             provider.passthrough_authorization_parameters
