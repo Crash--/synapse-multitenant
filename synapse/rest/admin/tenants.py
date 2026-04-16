@@ -566,14 +566,13 @@ class ReloadTenantsRestServlet(RestServlet):
             self._hs.get_tenant_ratelimiter_registry().reload(registry)
 
             # OIDC handler reload: rebuild per-tenant provider set and
-            # (de)register tenant IdPs in the SsoHandler. Only runs if
-            # an OidcHandler was constructed (i.e. OIDC is configured
-            # globally or for at least one tenant at startup).
+            # (de)register tenant IdPs in the SsoHandler.
             try:
                 oidc_handler = self._hs.get_oidc_handler()
-            except AssertionError:
-                # OidcHandler.__init__ asserts global_confs; fires when
-                # no OIDC is configured anywhere. Nothing to reload.
+            except Exception:
+                # Handler is optional — tolerate any factory failure and
+                # skip the cascade rather than fail the whole reload.
+                logger.exception("OIDC reload skipped: handler unavailable")
                 oidc_handler = None
             if oidc_handler is not None:
                 oidc_handler.reload(registry)

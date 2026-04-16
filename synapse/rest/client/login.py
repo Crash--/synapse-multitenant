@@ -140,11 +140,10 @@ class LoginRestServlet(RestServlet):
             return True
         try:
             oidc = self.hs.get_oidc_handler()
-        except AssertionError:
-            # OidcHandler.__init__ asserts that at least one global provider
-            # is configured.  When OIDC is fully absent from the YAML and no
-            # tenant override is present the assertion fires; treat that as
-            # "no providers".
+        except Exception:
+            # The handler is optional in deployments without global OIDC
+            # and no multi_tenant; tolerate any factory failure rather
+            # than 500 on /login.
             return False
         return oidc.has_providers()
 
@@ -783,5 +782,11 @@ def _load_sso_handlers(hs: "HomeServer") -> None:
         hs.get_cas_handler()
     if hs.config.saml2.saml2_enabled:
         hs.get_saml_handler()
-    if hs.config.oidc.oidc_enabled:
+    # Construct OidcHandler whenever OIDC is globally enabled OR multi-tenant
+    # mode is on — in DB-driven deployments the tenants (and their OIDC
+    # providers) arrive via the admin reload cascade after startup, and the
+    # handler needs to exist for that cascade to target.
+    multi_tenant = getattr(hs.config, "multi_tenant", None)
+    multi_tenant_enabled = multi_tenant is not None and multi_tenant.enabled
+    if hs.config.oidc.oidc_enabled or multi_tenant_enabled:
         hs.get_oidc_handler()

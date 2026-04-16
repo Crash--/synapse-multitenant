@@ -131,14 +131,18 @@ class OidcHandler:
         self._sso_handler = hs.get_sso_handler()
         self._macaroon_generator = hs.get_macaroon_generator()
 
-        # Global providers (used by tenants without OIDC override)
+        # Global providers (used by tenants without OIDC override).
+        #
+        # In DB-driven multi-tenant mode, there may be NO global providers —
+        # every tenant brings its own config via `TenantOidcConfig`. The
+        # handler is still useful: it owns the per-tenant provider map
+        # built below and the admin-reload cascade
+        # (:meth:`reload`). Do not assert global_confs here.
         global_confs = hs.config.oidc.oidc_providers
-        # we should not have been instantiated if there is no configured provider.
-        assert global_confs
 
         self._global_providers: dict[str, "OidcProvider"] = {
             p.idp_id: OidcProvider(hs, self._macaroon_generator, p)
-            for p in global_confs
+            for p in global_confs or ()
         }
 
         # Per-tenant providers: dict[server_name, dict[idp_id, OidcProvider]]
