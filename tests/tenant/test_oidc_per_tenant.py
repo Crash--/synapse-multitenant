@@ -46,3 +46,66 @@ class TestTenantOidcConfigFromDbValue(TestCase):
         raw = {"enabled": True}
         cfg = TenantOidcConfig.from_db_value(raw)
         self.assertEqual(cfg.providers, ())
+
+
+from unittest.mock import MagicMock, patch
+from synapse.config.tenants import TenantConfig
+
+
+def _make_tenant_with_oidc(
+    server_name: str,
+    provider: dict,
+) -> TenantConfig:
+    return TenantConfig(
+        server_name=server_name,
+        database_schema=f"tenant_{server_name.replace('.', '_')}",
+        signing_key_path=f"/keys/{server_name}.key",
+        media_store_path=f"/media/{server_name}",
+        oidc=TenantOidcConfig(providers=(provider,)),
+    )
+
+
+class TestBuildTenantProvidersReadsRegistry(TestCase):
+    """_build_tenant_providers must iterate the live registry, not the YAML
+    dict (Pattern A — see critical-e2e-bugs.md)."""
+
+    _PROVIDER = {
+        "idp_id": "lemonldap",
+        "idp_name": "LemonLDAP SSO",
+        "issuer": "https://lemonldap.localhost/",
+        "client_id": "synapse-demo",
+        "client_secret": "demo-secret-change-in-prod",
+        "scopes": ["openid"],
+        "discover": False,
+        "authorization_endpoint": "https://lemonldap.localhost/oauth2/authorize",
+        "token_endpoint": "https://lemonldap.localhost/oauth2/token",
+        "userinfo_endpoint": "https://lemonldap.localhost/oauth2/userinfo",
+        "jwks_uri": "https://lemonldap.localhost/oauth2/jwks",
+    }
+
+    def test_iterates_registry_not_yaml_dict(self) -> None:
+        """DB-driven mode: YAML dict empty, registry populated. Tenant
+        providers must be built from the registry."""
+        from synapse.handlers.oidc import OidcHandler
+        import synapse.handlers.oidc as oidc_mod
+
+        acme = _make_tenant_with_oidc("acme.localhost", self._PROVIDER)
+        hs = MagicMock()
+        # YAML dict is empty (DB-driven mode).
+        hs.config.multi_tenant = MagicMock(enabled=True, tenants={})
+        # Registry populated.
+        registry = MagicMock()
+        registry.get_all_tenants.return_value = [acme]
+        hs.get_tenant_registry.return_value = registry
+        # Global providers must exist for OidcHandler construction, stub them.
+        hs.config.oidc.oidc_providers = [MagicMock(idp_id="global")]
+        hs.get_sso_handler.return_value = MagicMock()
+        hs.get_macaroon_generator.return_value = MagicMock()
+
+        with patch.object(oidc_mod, "OidcProvider") as OP, \
+             patch.object(oidc_mod, "_parse_oidc_provider_configs",
+                          return_value=[MagicMock(idp_id="lemonldap")]):
+            handler = OidcHandler(hs)
+            self.assertIn("acme.localhost", handler._tenant_providers)
+            self.assertIn("lemonldap", handler._tenant_providers["acme.localhost"])
+            OP.assert_called()

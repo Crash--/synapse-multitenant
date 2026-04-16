@@ -54,7 +54,11 @@ from twisted.web.http_headers import Headers
 
 from synapse.api.errors import SynapseError
 from synapse.config import ConfigError
-from synapse.config.oidc import OidcProviderClientSecretJwtKey, OidcProviderConfig
+from synapse.config.oidc import (
+    OidcProviderClientSecretJwtKey,
+    OidcProviderConfig,
+    _parse_oidc_provider_configs,
+)
 from synapse.handlers.sso import MappingException, UserAttributes
 from synapse.http.server import finish_request
 from synapse.http.servlet import parse_string
@@ -141,18 +145,35 @@ class OidcHandler:
         self._build_tenant_providers(hs)
 
     def _build_tenant_providers(self, hs: "HomeServer") -> None:
-        """Build OidcProvider sets for tenants with OIDC overrides."""
-        from synapse.config.oidc import _parse_oidc_provider_configs
+        """Build OidcProvider sets for tenants with OIDC overrides.
 
+        Consults the live ``hs.get_tenant_registry()`` rather than the
+        YAML dict so DB-sourced tenants (source=database) are seen, and
+        so control-plane reloads can cascade through
+        :meth:`reload` below.
+        """
         mt_config = getattr(hs.config, "multi_tenant", None)
         if not mt_config or not mt_config.enabled:
             return
 
-        for tenant in mt_config.tenants.values():
-            if tenant.oidc is None:
+        try:
+            registry = hs.get_tenant_registry()
+        except Exception:
+            logger.debug("No tenant registry available; skipping tenant OIDC build")
+            return
+
+        for tenant in registry.get_all_tenants():
+            if tenant.oidc is None or not tenant.oidc.providers:
                 continue
             synthetic = {"oidc_providers": list(tenant.oidc.providers)}
-            parsed = tuple(_parse_oidc_provider_configs(synthetic))
+            try:
+                parsed = tuple(_parse_oidc_provider_configs(synthetic))
+            except Exception:
+                logger.exception(
+                    "Failed to parse OIDC providers for tenant %s; skipping",
+                    tenant.server_name,
+                )
+                continue
             self._tenant_providers[tenant.server_name] = {
                 p.idp_id: OidcProvider(
                     hs,
