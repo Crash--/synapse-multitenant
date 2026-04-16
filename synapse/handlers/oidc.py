@@ -146,12 +146,12 @@ class OidcHandler:
         self._build_tenant_providers(hs)
 
     def _build_tenant_providers(self, hs: "HomeServer") -> None:
-        """Build OidcProvider sets for tenants with OIDC overrides.
+        """Build OidcProvider sets for tenants with OIDC overrides at
+        startup. See :meth:`_compute_tenant_providers` for details.
 
         Consults the live ``hs.get_tenant_registry()`` rather than the
-        YAML dict so DB-sourced tenants (source=database) are seen, and
-        so control-plane reloads can cascade through
-        :meth:`reload` below.
+        YAML dict so DB-sourced tenants (source=database) are seen.
+        Handler-level reload is :meth:`reload`.
         """
         mt_config = getattr(hs.config, "multi_tenant", None)
         if not mt_config or not mt_config.enabled:
@@ -163,6 +163,27 @@ class OidcHandler:
             logger.debug("No tenant registry available; skipping tenant OIDC build")
             return
 
+        built = self._compute_tenant_providers(registry)
+        # Register each tenant provider with the SsoHandler using the
+        # namespaced API so same-idp_id tenants don't collide.
+        for server_name, providers in built.items():
+            for provider in providers.values():
+                self._sso_handler.register_tenant_identity_provider(
+                    provider, server_name
+                )
+            self._tenant_providers[server_name] = providers
+
+    def _compute_tenant_providers(
+        self, registry: "TenantRegistry"
+    ) -> "dict[str, dict[str, OidcProvider]]":
+        """Compute the per-tenant ``{idp_id: OidcProvider}`` map from the
+        live registry.
+
+        Used by both ``_build_tenant_providers`` (at startup) and
+        ``reload`` (on control-plane push). Best-effort: one broken
+        tenant is logged and skipped.
+        """
+        built: dict[str, dict[str, OidcProvider]] = {}
         for tenant in registry.get_all_tenants():
             if tenant.oidc is None or not tenant.oidc.providers:
                 continue
@@ -175,9 +196,9 @@ class OidcHandler:
                     tenant.server_name,
                 )
                 continue
-            built: dict[str, OidcProvider] = {
+            built[tenant.server_name] = {
                 p.idp_id: OidcProvider(
-                    hs,
+                    self._hs,
                     self._macaroon_generator,
                     p,
                     tenant_server_name=tenant.server_name,
@@ -185,11 +206,7 @@ class OidcHandler:
                 )
                 for p in parsed
             }
-            for provider in built.values():
-                self._sso_handler.register_tenant_identity_provider(
-                    provider, tenant.server_name
-                )
-            self._tenant_providers[tenant.server_name] = built
+        return built
 
     def _get_providers(self) -> dict[str, "OidcProvider"]:
         """Return OIDC providers for the current tenant context."""
@@ -221,33 +238,10 @@ class OidcHandler:
         Best-effort: individual per-tenant parse / register failures are
         logged but don't abort the whole reload.
         """
-        old: dict[str, dict[str, OidcProvider]] = self._tenant_providers
-        new: dict[str, dict[str, OidcProvider]] = {}
+        old = self._tenant_providers
+        new = self._compute_tenant_providers(registry)
 
-        for tenant in registry.get_all_tenants():
-            if tenant.oidc is None or not tenant.oidc.providers:
-                continue
-            synthetic = {"oidc_providers": list(tenant.oidc.providers)}
-            try:
-                parsed = tuple(_parse_oidc_provider_configs(synthetic))
-            except Exception:
-                logger.exception(
-                    "Reload: failed to parse OIDC for tenant %s; skipping",
-                    tenant.server_name,
-                )
-                continue
-            new[tenant.server_name] = {
-                p.idp_id: OidcProvider(
-                    self._hs,
-                    self._macaroon_generator,
-                    p,
-                    tenant_server_name=tenant.server_name,
-                    tenant_public_baseurl=tenant.effective_public_baseurl,
-                )
-                for p in parsed
-            }
-
-        # De-register removed tenant IdPs (anything in old but not in new).
+        # De-register removed tenant IdPs (in old but not in new).
         for server_name, providers in old.items():
             new_for_tenant = new.get(server_name, {})
             for idp_id in providers:
@@ -262,7 +256,7 @@ class OidcHandler:
                             server_name, idp_id,
                         )
 
-        # Register new tenant IdPs (anything in new but not in old).
+        # Register new tenant IdPs (in new but not in old).
         for server_name, providers in new.items():
             old_for_tenant = old.get(server_name, {})
             for idp_id, provider in providers.items():
