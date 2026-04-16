@@ -52,15 +52,27 @@
 #     docker compose down
 
 services:
+  # --- DNS resolver --------------------------------------------------
+  dnsmasq:
+    image: strm/dnsmasq:latest
+    container_name: synapse-demo-dnsmasq
+    restart: unless-stopped
+    cap_add: [NET_ADMIN]
+    volumes:
+      - ./dnsmasq/dnsmasq.conf:/etc/dnsmasq.conf:ro
+    networks:
+      synapse-demo-net:
+        # Pinned outside the default IPAM allocation range to avoid
+        # races with unpinned services (postgres, pgbouncer, ...)
+        # that would otherwise grab .0.2 first.
+        ipv4_address: 172.28.0.254
+
   # --- Reverse proxy -------------------------------------------------
   traefik:
     image: traefik:v2.11
     container_name: synapse-demo-traefik
     restart: unless-stopped
     command:
-      - '--providers.docker=true'
-      - '--providers.docker.exposedbydefault=false'
-      - '--providers.docker.network=docker-demo_synapse-demo-net'
       - '--providers.file.directory=/etc/traefik/dynamic'
       - '--providers.file.watch=true'
       - '--entrypoints.web.address=:80'
@@ -70,9 +82,89 @@ services:
       - '80:80'
       - '443:443'
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
       - ./certs:/certs:ro
+    networks:
+      synapse-demo-net:
+        # Pinned outside the default IPAM allocation range — dnsmasq
+        # points *.localhost at this address so siblings loop through
+        # the proxy for cross-tenant federation.
+        ipv4_address: 172.28.0.253
+
+  # --- LDAP directory ------------------------------------------------
+  openldap:
+    image: osixia/openldap:1.5.0
+    container_name: synapse-demo-openldap
+    environment:
+      LDAP_ORGANISATION: "Demo Multi-Tenant Matrix"
+      LDAP_DOMAIN: "demo.local"
+      LDAP_BASE_DN: "dc=demo,dc=local"
+      LDAP_ADMIN_PASSWORD: "admin"
+      LDAP_CONFIG_PASSWORD: "admin"
+      LDAP_TLS: "false"
+      LDAP_READONLY_USER: "false"
+    volumes:
+      - ./openldap/bootstrap:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
+    command: --copy-service --loglevel info
+    healthcheck:
+      test: ["CMD", "ldapsearch", "-x", "-H", "ldap://localhost:389", "-b", "dc=demo,dc=local", "-D", "cn=admin,dc=demo,dc=local", "-w", "admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks:
+      synapse-demo-net:
+        ipv4_address: 172.28.0.252
+
+  # --- LemonLDAP-NG portal (OIDC provider) --------------------------
+  lemonldap:
+    # Use the "full" variant that's known to accept our config shape
+    # (matches the llng-with-custom-skin example the user has working).
+    # `full` includes portal + manager + handler; we only really need
+    # portal but the full build is the one that boots cleanly with the
+    # config file format we're writing.
+    image: yadd/lemonldap-ng-full:latest
+    container_name: synapse-demo-lemonldap
+    depends_on:
+      openldap:
+        condition: service_healthy
+    environment:
+      SSODOMAIN: "localhost"
+      PORTAL: "https://lemonldap.localhost/"
+      LOGLEVEL: "info"
+    volumes:
+      - ./lemonldap/lmConf-1.json:/var/lib/lemonldap-ng/conf/lmConf-1.json:ro
+    healthcheck:
+      # Accept any HTTP response (2xx, 3xx, 4xx, 5xx): we just want to
+      # know nginx is up. The baked config returns 302 on /.
+      test: ["CMD-SHELL", "curl -sk -o /dev/null -w '%{http_code}' http://localhost/ | grep -qE '^[0-9]+$'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - synapse-demo-net
+
+  # --- OIDC proxy (single shared client for all tenants) ------------
+  oidc-proxy:
+    # Public Linagora image — don't vendor the source locally.
+    # Upstream: https://github.com/linagora/twake-chat-oidc-proxy
+    image: linagora/twake-chat-oidc-proxy:1.0.9
+    container_name: synapse-demo-oidc-proxy
+    depends_on:
+      lemonldap:
+        condition: service_healthy
+    # Same dnsmasq pointer as synapse — needed to resolve *.localhost
+    # to the traefik IP for the OIDC discovery call to LemonLDAP.
+    dns:
+      - 172.28.0.254
+    environment:
+      PORT: "3002"
+      PROXY_URL: "https://oidc-proxy.localhost"
+      OIDC_ISSUER_URL: "https://lemonldap.localhost/"
+      OIDC_CLIENT_ID: "synapse-demo"
+      OIDC_CLIENT_SECRET: "demo-secret-change-in-prod"
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
     networks:
       - synapse-demo-net
 
@@ -113,45 +205,6 @@ services:
     networks:
       - synapse-demo-net
 
-  # --- One-shot bootstrap: keys + schemas ---------------------------
-  keygen:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: synapse:multi-tenant
-    container_name: synapse-demo-keygen
-    user: root
-    volumes:
-      - ./data/keys:/keys
-      - ./scripts:/scripts:ro
-    environment:
-      KEYS_DIR: "/keys"
-      TENANTS: "localhost,matrix.tenant-a.com,matrix.tenant-b.com,matrix.tenant-c.com,matrix.tenant-d.com"
-    entrypoint: ["python3", "/scripts/generate_keys.py"]
-    networks:
-      - synapse-demo-net
-
-  init-schemas:
-    image: synapse:multi-tenant
-    container_name: synapse-demo-init-schemas
-    depends_on:
-      postgres:
-        condition: service_healthy
-      keygen:
-        condition: service_completed_successfully
-    volumes:
-      - ./scripts:/scripts:ro
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_USER: synapse
-      POSTGRES_PASSWORD: synapse_password
-      POSTGRES_DB: synapse_demo
-      TENANTS: "matrix.tenant-a.com,matrix.tenant-b.com,matrix.tenant-c.com,matrix.tenant-d.com"
-    entrypoint: ["python3", "/scripts/init_schemas.py"]
-    networks:
-      - synapse-demo-net
-
   # --- Synapse -------------------------------------------------------
   synapse:
     image: synapse:multi-tenant
@@ -159,33 +212,23 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      keygen:
-        condition: service_completed_successfully
-      init-schemas:
-        condition: service_completed_successfully
       traefik:
         condition: service_started
+    dns:
+      - 172.28.0.254
     environment:
       SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
       # Skip tenant schema isolation check on first boot — copy-schemas
       # clones the tables after Synapse creates them in public.
       SYNAPSE_SKIP_TENANT_ISOLATION_CHECK: "1"
+      # Master key for decrypting per-tenant signing keys from the DB
+      # (phase 7). Must match control-plane's TENANT_KEY_MASTER.
+      # 32 zero bytes — demo only!
+      SYNAPSE_TENANT_KEY_MASTER: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     volumes:
       - ./config:/data:ro
       - ./data/keys:/keys:ro
       - ./data/media:/media
-    labels:
-      - 'traefik.enable=true'
-      # Both tenant hostnames route to the same Synapse container.
-      # Synapse itself resolves the tenant from the Host header that
-      # Traefik forwards.
-      - 'traefik.docker.network=docker-demo_synapse-demo-net'
-      - 'traefik.http.routers.synapse.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`) || Host(`matrix.tenant-c.com`) || Host(`matrix.tenant-d.com`)'
-      - 'traefik.http.routers.synapse.entrypoints=web'
-      - 'traefik.http.routers.synapse-tls.rule=Host(`matrix.tenant-a.com`) || Host(`matrix.tenant-b.com`) || Host(`matrix.tenant-c.com`) || Host(`matrix.tenant-d.com`)'
-      - 'traefik.http.routers.synapse-tls.entrypoints=websecure'
-      - 'traefik.http.routers.synapse-tls.tls=true'
-      - 'traefik.http.services.synapse.loadbalancer.server.port=8008'
     networks:
       - synapse-demo-net
     healthcheck:
@@ -212,8 +255,6 @@ services:
       MEDIA_BASE_DIR: "/media"
     volumes:
       - ./data/media:/media
-    ports:
-      - '3001:3001'
     networks:
       - synapse-demo-net
 
@@ -222,10 +263,10 @@ services:
     build: ./manager
     container_name: synapse-demo-manager
     depends_on:
-      bootstrap-admin:
-        condition: service_completed_successfully
       control-plane:
         condition: service_started
+      openldap:
+        condition: service_healthy
     environment:
       CONFIG_PATH: /synapse-config/homeserver.yaml
       KEYS_DIR: /keys
@@ -238,13 +279,20 @@ services:
       SYNAPSE_CONTAINER: synapse-demo-server
       CONTROL_PLANE_URL: "http://control-plane:3001"
       CONTROL_PLANE_TOKEN: "demo-control-plane-token"
+      LDAP_URL: "ldap://openldap:389"
+      LDAP_ADMIN_DN: "cn=admin,dc=demo,dc=local"
+      LDAP_ADMIN_PW: "admin"
+      # Pre-hashed SSHA of password "demo" — generated at setup time.
+      DEMO_USER_SSHA: "{SSHA}Dnd/fRooGjVUMuNihZnBBYFLOFRzgD1k"
+      OIDC_CLIENT_ID: "synapse-demo"
+      OIDC_CLIENT_SECRET: "demo-secret-change-in-prod"
+      OIDC_ISSUER: "https://lemonldap.localhost/"
+      OIDC_PROXY: "https://oidc-proxy.localhost"
     volumes:
       - ./config:/synapse-config            # rw — manager appends tenants
       - ./data/keys:/keys                   # rw — manager generates signing keys
       - ./data/media:/media                 # rw — manager creates media dirs
       - /var/run/docker.sock:/var/run/docker.sock  # for SIGHUP via Docker API
-    ports:
-      - '3000:3000'
     networks:
       - synapse-demo-net
 
@@ -286,25 +334,9 @@ services:
     networks:
       - synapse-demo-net
 
-  # --- Bootstrap admin user for the manager UI ----------------------
-  bootstrap-admin:
-    image: synapse:multi-tenant
-    container_name: synapse-demo-bootstrap-admin
-    depends_on:
-      copy-schemas:
-        condition: service_completed_successfully
-    volumes:
-      - ./scripts:/scripts:ro
-    environment:
-      SYNAPSE_HOST: "http://synapse:8008"
-      TENANT_HOST: "matrix.tenant-a.com"
-      ADMIN_USERNAME: "admin"
-      ADMIN_PASSWORD: "admin"
-      SHARED_SECRET: "demo_shared_secret_change_in_production"
-    entrypoint: ["python3", "/scripts/bootstrap_admin.py"]
-    networks:
-      - synapse-demo-net
-
 networks:
   synapse-demo-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

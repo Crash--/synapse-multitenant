@@ -1,23 +1,9 @@
-# Traefik dynamic configuration — TLS certificates.
-#
-# These paths point at files inside the certs/ folder of this demo,
-# which is bind-mounted into the Traefik container as /certs.
-#
-# To populate them with locally-trusted certificates run mkcert from
-# the docker-demo/ directory:
-#
-#     mkcert -install   # one-time per machine
-#     mkdir -p certs
-#     mkcert -cert-file certs/tenants.crt \
-#            -key-file  certs/tenants.key \
-#            matrix.tenant-a.com matrix.tenant-b.com matrix.tenant-c.com matrix.tenant-d.com
-#
-# When the cert files are missing Traefik logs a warning and falls
-# back to its built-in self-signed certificate. The HTTP entrypoint
-# (port 80) keeps working in either case, so the demo is still usable
-# without TLS — Element will just need the `http://` URL.
-
 tls:
   certificates:
-    - certFile: /certs/tenants.crt
-      keyFile: /certs/tenants.key
+    - certFile: /certs/wildcard.crt
+      keyFile:  /certs/wildcard.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/wildcard.crt
+        keyFile:  /certs/wildcard.key

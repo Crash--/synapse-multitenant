@@ -1,0 +1,58 @@
+http:
+  routers:
+    synapse-wildcard:
+      rule: "HostRegexp(`{subdomain:[a-z0-9-]+}.localhost`) && !Host(`manager.localhost`) && !Host(`control-plane.localhost`) && !Host(`traefik.localhost`)"
+      service: synapse
+      tls: {}
+      entryPoints: [websecure]
+      priority: 10
+
+    manager:
+      rule: "Host(`manager.localhost`)"
+      service: manager
+      tls: {}
+      entryPoints: [websecure]
+      priority: 100
+
+    control-plane:
+      rule: "Host(`control-plane.localhost`)"
+      service: control-plane
+      tls: {}
+      entryPoints: [websecure]
+      priority: 100
+
+    lemonldap:
+      rule: "Host(`lemonldap.localhost`)"
+      service: lemonldap
+      tls: {}
+      entryPoints: [websecure]
+      priority: 100
+
+    oidc-proxy:
+      rule: "Host(`oidc-proxy.localhost`)"
+      service: oidc-proxy
+      tls: {}
+      entryPoints: [websecure]
+      priority: 100
+
+  services:
+    synapse:
+      loadBalancer:
+        servers:
+          - url: "http://synapse:8008"
+    manager:
+      loadBalancer:
+        servers:
+          - url: "http://manager:3000"
+    control-plane:
+      loadBalancer:
+        servers:
+          - url: "http://control-plane:3001"
+    lemonldap:
+      loadBalancer:
+        servers:
+          - url: "http://lemonldap:80"
+    oidc-proxy:
+      loadBalancer:
+        servers:
+          - url: "http://oidc-proxy:3002"

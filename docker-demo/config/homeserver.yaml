@@ -3,64 +3,24 @@ pid_file: /data/homeserver.pid
 web_client: false
 soft_file_limit: 0
 public_baseurl: http://localhost/
+
+# Multi-tenant enabled; tenants loaded from public.tenants DB table
+# (populated by the control plane at runtime).
 multi_tenant:
   enabled: true
   default_schema: public
-tenants:
-  - server_name: matrix.tenant-a.com
-    database_schema: tenant_matrix_tenant_a_com
-    signing_key_path: /keys/matrix_tenant-a_com.signing.key
-    media_store_path: /media/tenant-a
-    public_baseurl: http://matrix.tenant-a.com/
-    registration_enabled: true
-    registration_shared_secret: tenant_a_shared_secret_demo
-    macaroon_secret_key: tenant_a_macaroon_demo
-    form_secret: tenant_a_form_demo
-    enable_federation: false
-    ratelimit:
-      rc_message:
-        per_second: 10
-        burst_count: 50
-      rc_login:
-        per_second: 10
-        burst_count: 30
-  - server_name: matrix.tenant-b.com
-    database_schema: tenant_matrix_tenant_b_com
-    signing_key_path: /keys/matrix_tenant-b_com.signing.key
-    media_store_path: /media/tenant-b
-    public_baseurl: http://matrix.tenant-b.com/
-    registration_enabled: true
-    registration_shared_secret: tenant_b_shared_secret_demo
-    macaroon_secret_key: tenant_b_macaroon_demo
-    form_secret: tenant_b_form_demo
-    enable_federation: false
-    ratelimit:
-      rc_message:
-        per_second: 10
-        burst_count: 50
-      rc_login:
-        per_second: 10
-        burst_count: 30
-  - server_name: matrix.tenant-c.com
-    database_schema: tenant_matrix_tenant_c_com
-    signing_key_path: /keys/matrix_tenant-c_com.signing.key
-    media_store_path: /media/matrix.tenant-c.com
-    public_baseurl: http://matrix.tenant-c.com/
-    registration_enabled: true
-    registration_shared_secret: tenant_c_shared_secret_demo
-    macaroon_secret_key: tenant_c_macaroon_demo
-    form_secret: tenant_c_form_demo
-    enable_federation: false
-  - server_name: matrix.tenant-d.com
-    database_schema: tenant_matrix_tenant_d_com
-    signing_key_path: /keys/matrix_tenant-d_com.signing.key
-    media_store_path: /media/matrix.tenant-d.com
-    public_baseurl: http://matrix.tenant-d.com/
-    registration_enabled: true
-    registration_shared_secret: tenant_d_shared_secret_demo
-    macaroon_secret_key: tenant_d_macaroon_demo
-    form_secret: tenant_d_form_demo
-    enable_federation: false
+  source: database
+  reload_secret: demo-reload-secret
+
+# Demo only: accept any TLS cert on outbound federation. Sibling tenants
+# present the mkcert wildcard cert, which the Synapse container does not
+# trust by default. DO NOT use this in production.
+federation_verify_certificates: false
+
+# Serve /.well-known/matrix/server (tenant-aware from the ServerWellKnownResource
+# change in this session). Remote servers discover the port via this.
+serve_server_wellknown: true
+
 listeners:
   - port: 8008
     type: http

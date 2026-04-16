@@ -1,0 +1,12 @@
+# Base DIT structure for the docker-demo multi-tenant LDAP.
+# Each tenant gets a branch under ou=organizations created dynamically
+# by the manager when a new tenant is provisioned.
+#
+# The cn=admin user is created by osixia/openldap from the
+# LDAP_ADMIN_PASSWORD env var — no need to declare it here.
+
+dn: ou=organizations,dc=demo,dc=local
+objectClass: top
+objectClass: organizationalUnit
+ou: organizations
+description: Per-tenant organization branches created by the manager on provision
