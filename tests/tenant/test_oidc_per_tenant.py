@@ -4,8 +4,9 @@
 """Red/green probes for phase OIDC — per-tenant SSO login bridge."""
 
 from unittest import TestCase
+from unittest.mock import ANY, MagicMock, patch
 
-from synapse.config.tenants import TenantOidcConfig
+from synapse.config.tenants import TenantConfig, TenantOidcConfig
 
 
 class TestTenantOidcConfigFromDbValue(TestCase):
@@ -47,9 +48,6 @@ class TestTenantOidcConfigFromDbValue(TestCase):
         cfg = TenantOidcConfig.from_db_value(raw)
         self.assertEqual(cfg.providers, ())
 
-
-from unittest.mock import MagicMock, patch
-from synapse.config.tenants import TenantConfig
 
 
 def _make_tenant_with_oidc(
@@ -108,4 +106,10 @@ class TestBuildTenantProvidersReadsRegistry(TestCase):
             handler = OidcHandler(hs)
             self.assertIn("acme.localhost", handler._tenant_providers)
             self.assertIn("lemonldap", handler._tenant_providers["acme.localhost"])
-            OP.assert_called()
+            OP.assert_any_call(
+                hs,
+                ANY,
+                ANY,
+                tenant_server_name="acme.localhost",
+                tenant_public_baseurl=ANY,
+            )
