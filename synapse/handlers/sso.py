@@ -238,9 +238,10 @@ class SsoHandler:
     def register_identity_provider(self, p: SsoIdentityProvider) -> None:
         """Register a GLOBAL identity provider (no tenant scoping)."""
         p_id = p.idp_id
-        assert p_id not in self._identity_providers, (
-            f"duplicate global identity provider registration for {p_id}"
-        )
+        if p_id in self._identity_providers:
+            raise RuntimeError(
+                f"duplicate global identity provider registration for {p_id}"
+            )
         self._identity_providers[p_id] = p
         init_counters_for_auth_provider(
             auth_provider_id=p_id, server_name=self.server_name
@@ -256,9 +257,10 @@ class SsoHandler:
         collision.
         """
         key = f"{tenant_server_name}::{p.idp_id}"
-        assert key not in self._identity_providers, (
-            f"duplicate tenant identity provider registration for {key}"
-        )
+        if key in self._identity_providers:
+            raise RuntimeError(
+                f"duplicate tenant identity provider registration for {key}"
+            )
         self._identity_providers[key] = p
         init_counters_for_auth_provider(
             auth_provider_id=p.idp_id, server_name=tenant_server_name
@@ -381,7 +383,8 @@ class SsoHandler:
         Returns:
              the URI to redirect to
         """
-        if not self._identity_providers:
+        idps = self.get_identity_providers()
+        if not idps:
             raise SynapseError(
                 400, "Homeserver not configured for SSO.", errcode=Codes.UNRECOGNIZED
             )
@@ -389,13 +392,13 @@ class SsoHandler:
         # if the client chose an IdP, use that
         idp: SsoIdentityProvider | None = None
         if idp_id:
-            idp = self._identity_providers.get(idp_id)
+            idp = idps.get(idp_id)
             if not idp:
                 raise NotFoundError("Unknown identity provider")
 
         # if we only have one auth provider, redirect to it directly
-        elif len(self._identity_providers) == 1:
-            idp = next(iter(self._identity_providers.values()))
+        elif len(idps) == 1:
+            idp = next(iter(idps.values()))
 
         if idp:
             return await idp.handle_redirect_request(request, client_redirect_url)
