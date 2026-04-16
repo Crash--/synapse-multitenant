@@ -765,7 +765,11 @@ def test_oidc_proxy_wellknown() -> None:
               f"keys={list(j.keys())}")
 
 
-def assert_login_advertises_sso(tenant: str, expected_idp_id: str = "lemonldap") -> None:
+def assert_login_advertises_sso(
+    tenant: str,
+    expected_idp_id: str = "oidc-lemonldap",
+    host: str = "localhost",
+) -> None:
     """Verify GET /_matrix/client/v3/login returns an m.login.sso flow
     with the expected IdP for a freshly-provisioned tenant.
 
@@ -773,9 +777,21 @@ def assert_login_advertises_sso(tenant: str, expected_idp_id: str = "lemonldap")
     created via the control plane and its oidc_config is PATCHed, a
     tenants/reload cascade triggers OidcHandler.reload and the SSO
     flow must appear in the login response for that tenant's Host.
+
+    Matches the rest of this script's pattern: connect to ``host`` and
+    route via the ``Host: <tenant>`` header. ``host`` defaults to the
+    Traefik front-door on the loopback — the wildcard router in
+    ``docker-demo/traefik/dynamic/routes.yml`` is ``websecure`` only, so
+    use HTTPS with ``verify=False`` for the self-signed cert.
     """
+    url = (
+        f"http://{host}/_matrix/client/v3/login"
+        if host.startswith("synapse")
+        else f"https://{host}/_matrix/client/v3/login"
+    )
     resp = requests.get(
-        f"https://{tenant}/_matrix/client/v3/login",
+        url,
+        headers=_headers(tenant),
         verify=False,
         timeout=10,
     )
