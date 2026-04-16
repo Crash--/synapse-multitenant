@@ -765,6 +765,47 @@ def test_oidc_proxy_wellknown() -> None:
               f"keys={list(j.keys())}")
 
 
+def assert_login_advertises_sso(tenant: str, expected_idp_id: str = "lemonldap") -> None:
+    """Verify GET /_matrix/client/v3/login returns an m.login.sso flow
+    with the expected IdP for a freshly-provisioned tenant.
+
+    Probes the tail end of the phase-OIDC bridge: after a tenant is
+    created via the control plane and its oidc_config is PATCHed, a
+    tenants/reload cascade triggers OidcHandler.reload and the SSO
+    flow must appear in the login response for that tenant's Host.
+    """
+    resp = requests.get(
+        f"https://{tenant}/_matrix/client/v3/login",
+        verify=False,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    flows = resp.json().get("flows", [])
+    sso = [f for f in flows if f.get("type") == "m.login.sso"]
+    assert sso, (
+        f"[{tenant}] m.login.sso flow missing; got {flows!r}"
+    )
+    idp_ids = [p.get("id") for p in sso[0].get("identity_providers", [])]
+    assert expected_idp_id in idp_ids, (
+        f"[{tenant}] expected IdP {expected_idp_id!r} in login response, "
+        f"got {idp_ids!r}"
+    )
+    print(f"[{tenant}] /login advertises {expected_idp_id} SSO flow ✓")
+
+
+def test_login_advertises_sso() -> None:
+    """Phase OIDC-f: /login must expose m.login.sso with lemonldap IdP per tenant."""
+    print("\n--- OIDC-f: /login SSO flow advertisement ---")
+    for tenant in (TENANT_A, TENANT_B):
+        try:
+            assert_login_advertises_sso(tenant)
+            check(f"{tenant} /login advertises lemonldap SSO", True)
+        except AssertionError as exc:
+            check(f"{tenant} /login advertises lemonldap SSO", False, str(exc))
+        except Exception as exc:
+            check(f"{tenant} /login advertises lemonldap SSO", False, f"error: {exc}")
+
+
 def test_sso_cross_tenant_rejected(_tenant_a: str, _tenant_b: str) -> None:
     """
     The proxy's token endpoint must reject with 4xx/5xx on unknown code.
@@ -847,6 +888,7 @@ def main() -> None:
     test_lemonldap_portal_reachable()
     test_oidc_proxy_wellknown()
     test_sso_cross_tenant_rejected(TENANT_A, TENANT_B)
+    test_login_advertises_sso()
 
     # Summary
     print("\n" + "=" * 60)
