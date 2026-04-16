@@ -83,7 +83,29 @@ class TenantOidcConfig:
 
     @classmethod
     def from_list(cls, providers: list) -> "TenantOidcConfig":
+        """Legacy bare-list parser (retained for YAML / tests)."""
         return cls(providers=tuple(providers))
+
+    @classmethod
+    def from_db_value(cls, raw: object) -> "TenantOidcConfig":
+        """Parse the DB JSONB ``oidc_config`` column.
+
+        Accepts either:
+          * a bare list of provider dicts (legacy), or
+          * the envelope ``{"enabled": bool, "providers": [...]}``
+            written by the control plane.
+
+        ``enabled: false`` yields an empty providers tuple — the tenant
+        has no OIDC providers even if the list is non-empty.
+        """
+        if isinstance(raw, dict):
+            if not raw.get("enabled", True):
+                return cls(providers=())
+            providers = raw.get("providers", []) or []
+            return cls(providers=tuple(providers))
+        if isinstance(raw, list):
+            return cls(providers=tuple(raw))
+        return cls(providers=())
 
 
 @attr.s(auto_attribs=True, slots=True, frozen=True)
@@ -485,7 +507,7 @@ class TenantConfig:
         email_cfg = TenantEmailConfig.from_dict(email_raw) if email_raw else None
 
         oidc_raw = row.get("oidc_config")
-        oidc_cfg = TenantOidcConfig.from_list(oidc_raw) if oidc_raw else None
+        oidc_cfg = TenantOidcConfig.from_db_value(oidc_raw) if oidc_raw else None
 
         cas_raw = row.get("cas_config")
         cas_cfg = TenantCasConfig.from_dict(cas_raw) if cas_raw else None
