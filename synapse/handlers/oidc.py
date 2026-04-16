@@ -157,8 +157,12 @@ class OidcHandler:
         YAML dict so DB-sourced tenants (source=database) are seen.
         Handler-level reload is :meth:`reload`.
         """
-        mt_config = getattr(hs.config, "multi_tenant", None)
-        if not mt_config or not mt_config.enabled:
+        tenants_config = getattr(hs.config, "tenants", None)
+        if (
+            tenants_config is None
+            or not getattr(tenants_config, "multi_tenant", None)
+            or not tenants_config.multi_tenant.enabled
+        ):
             return
 
         try:

@@ -760,10 +760,21 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
         and hs.config.registration.refreshable_access_token_lifetime is not None
     ):
         RefreshTokenServlet(hs).register(http_server)
+    # SsoRedirectServlet must also register when multi-tenant is enabled —
+    # DB-driven tenants bring OIDC providers that don't appear in the global
+    # oidc_enabled flag but still need /_matrix/client/v3/login/sso/redirect
+    # to dispatch to them.
+    _tenants = getattr(hs.config, "tenants", None)
+    _multi_tenant_enabled = (
+        _tenants is not None
+        and getattr(_tenants, "multi_tenant", None) is not None
+        and _tenants.multi_tenant.enabled
+    )
     if (
         hs.config.cas.cas_enabled
         or hs.config.saml2.saml2_enabled
         or hs.config.oidc.oidc_enabled
+        or _multi_tenant_enabled
     ):
         SsoRedirectServlet(hs).register(http_server)
     if hs.config.cas.cas_enabled:
@@ -786,7 +797,11 @@ def _load_sso_handlers(hs: "HomeServer") -> None:
     # mode is on — in DB-driven deployments the tenants (and their OIDC
     # providers) arrive via the admin reload cascade after startup, and the
     # handler needs to exist for that cascade to target.
-    multi_tenant = getattr(hs.config, "multi_tenant", None)
-    multi_tenant_enabled = multi_tenant is not None and multi_tenant.enabled
+    tenants = getattr(hs.config, "tenants", None)
+    multi_tenant_enabled = (
+        tenants is not None
+        and getattr(tenants, "multi_tenant", None) is not None
+        and tenants.multi_tenant.enabled
+    )
     if hs.config.oidc.oidc_enabled or multi_tenant_enabled:
         hs.get_oidc_handler()

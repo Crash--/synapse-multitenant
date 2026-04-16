@@ -91,7 +91,7 @@ class TestBuildTenantProvidersReadsRegistry(TestCase):
         acme = _make_tenant_with_oidc("acme.localhost", self._PROVIDER)
         hs = MagicMock()
         # YAML dict is empty (DB-driven mode).
-        hs.config.multi_tenant = MagicMock(enabled=True, tenants={})
+        hs.config.tenants.multi_tenant = MagicMock(enabled=True, tenants={})
         # Registry populated.
         registry = MagicMock()
         registry.get_all_tenants.return_value = [acme]
@@ -332,7 +332,7 @@ class TestOidcHandlerReload(TestCase):
         import synapse.handlers.oidc as oidc_mod
 
         hs = MagicMock()
-        hs.config.multi_tenant = MagicMock(enabled=True, tenants={})
+        hs.config.tenants.multi_tenant = MagicMock(enabled=True, tenants={})
         registry = MagicMock()
         registry.get_all_tenants.return_value = tenants_at_start
         hs.get_tenant_registry.return_value = registry
