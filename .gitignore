@@ -94,3 +94,14 @@ docker-demo/control-plane/dist/
 # PgBouncer credentials
 docker-demo/config/pgbouncer_userlist.txt
 
+# Local-only Claude Code skills (not shared with the fork)
+/.claude/skills/playwright-cli/
+
+# Root-level working notes / scratchpads (authoritative versions live under docs/superpowers/)
+/phase-*.md
+/critical-e2e-bugs.md
+
+# Orphan LemonLDAP signing keypair — the active key lives inline in lmConf-1.json
+docker-demo/lemonldap/oidc-signing.key
+docker-demo/lemonldap/oidc-signing.pub
+

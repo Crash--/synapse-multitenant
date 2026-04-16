@@ -34,11 +34,16 @@ except ImportError:
     import requests
 
 
-TENANT_A = "matrix.tenant-a.com"
-TENANT_B = "matrix.tenant-b.com"
+TENANT_A = "acme.localhost"
+TENANT_B = "corp.localhost"
+TENANT_C = "startup.localhost"
+TENANT_D = "tenant-d.localhost"
 SHARED_SECRET_A = "demo_shared_secret_change_in_production"
 SHARED_SECRET_B = "demo_shared_secret_change_in_production"
 ADMIN_SECRET = "demo_shared_secret_change_in_production"
+
+CONTROL_PLANE_BASE = os.environ.get("CONTROL_PLANE_BASE", "http://control-plane:3001")
+CONTROL_PLANE_TOKEN = os.environ.get("CONTROL_PLANE_TOKEN", "demo-control-plane-token")
 
 # Unique suffix per run so re-runs don't collide with existing users
 _RUN_ID = str(int(time.time()))[-6:]
@@ -209,8 +214,8 @@ def test_well_known(base: str) -> None:
     """Phase 1: .well-known returns correct server_name per tenant."""
     print("\n--- Phase 1: .well-known/matrix/client ---")
     for tenant, expected_base in [
-        (TENANT_A, "http://matrix.tenant-a.com/"),
-        (TENANT_B, "http://matrix.tenant-b.com/"),
+        (TENANT_A, f"https://{TENANT_A}/"),
+        (TENANT_B, f"https://{TENANT_B}/"),
     ]:
         r = requests.get(
             f"{base}/.well-known/matrix/client",
@@ -640,6 +645,144 @@ def test_cross_tenant_room(base: str, tokens: dict[str, str]) -> None:
 
 
 # ------------------------------------------------------------------
+# Zero-config provisioning + federation-test endpoint (control plane)
+# ------------------------------------------------------------------
+
+def test_zero_config_provisioning(control_plane_base: str, control_plane_token: str) -> None:
+    """Create a fresh tenant via SSE and assert the SSE stream completes."""
+    print("\n--- Zero-config provisioning (SSE) ---")
+
+    tenant_name = f"smoke-{int(time.time())}.localhost"
+    r = requests.post(
+        f"{control_plane_base}/api/v1/tenants",
+        headers={
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {control_plane_token}",
+            "Content-Type": "application/json",
+        },
+        json={"server_name": tenant_name},
+        stream=True,
+        timeout=30,
+    )
+    check("SSE request accepted", r.status_code == 200, f"status={r.status_code}")
+
+    events_seen: list[str] = []
+    for line in r.iter_lines(decode_unicode=True):
+        if line and line.startswith("event: "):
+            events_seen.append(line[7:])
+        if len(events_seen) > 30:
+            break
+    r.close()
+
+    check(
+        "SSE stream had step events",
+        any(e == "step" for e in events_seen),
+        f"events={events_seen[:10]}",
+    )
+    check(
+        "SSE stream ended with complete or error",
+        bool(events_seen) and events_seen[-1] in ("complete", "error"),
+        f"last={events_seen[-1] if events_seen else 'none'}",
+    )
+
+
+def test_federation_test_endpoint(
+    control_plane_base: str, control_plane_token: str
+) -> None:
+    """Exercise /federation-test between TENANT_A and TENANT_B."""
+    print("\n--- Federation test endpoint ---")
+
+    r = requests.post(
+        f"{control_plane_base}/api/v1/tenants/{TENANT_A}/federation-test",
+        headers={
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {control_plane_token}",
+            "Content-Type": "application/json",
+        },
+        json={"target": TENANT_B},
+        stream=True,
+        timeout=60,
+    )
+    check("fed-test HTTP 200", r.status_code == 200, f"status={r.status_code}")
+
+    final_event: str | None = None
+    for line in r.iter_lines(decode_unicode=True):
+        if line and line.startswith("event: "):
+            final_event = line[7:]
+    r.close()
+
+    check(
+        "fed-test completed without error",
+        final_event == "complete",
+        f"final_event={final_event}",
+    )
+
+
+# ------------------------------------------------------------------
+# LDAP + SSO
+# ------------------------------------------------------------------
+
+def test_ldap_branch_exists(tenant_server_name: str) -> None:
+    """After tenant creation, LDAP has the org branch + 3 users."""
+    import subprocess
+    org = tenant_server_name.split(".")[0]
+    r = subprocess.run(
+        [
+            "docker", "exec", "synapse-demo-openldap",
+            "ldapsearch", "-x", "-H", "ldap://localhost:389",
+            "-D", "cn=admin,dc=demo,dc=local", "-w", "admin",
+            "-b", f"o={org},ou=organizations,dc=demo,dc=local",
+            "(objectClass=inetOrgPerson)", "uid", "mail",
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    check(f"{tenant_server_name} LDAP branch query succeeds",
+          r.returncode == 0, f"rc={r.returncode} stderr={r.stderr[:200]}")
+    uids = [line.split(": ", 1)[1] for line in r.stdout.splitlines() if line.startswith("uid: ")]
+    check(f"{tenant_server_name} has 3 seeded users",
+          sorted(uids) == ["alice", "bob", "charlie"], f"got={sorted(uids)}")
+
+
+def test_lemonldap_portal_reachable() -> None:
+    """LemonLDAP portal responds."""
+    import requests
+    r = requests.get("https://lemonldap.localhost/", verify=False, timeout=5)
+    check("lemonldap portal HTTP 200", r.status_code == 200, f"status={r.status_code}")
+
+
+def test_oidc_proxy_wellknown() -> None:
+    """OIDC proxy serves its own discovery document."""
+    import requests
+    r = requests.get(
+        "https://oidc-proxy.localhost/.well-known/openid-configuration",
+        verify=False, timeout=5,
+    )
+    check("oidc-proxy well-known HTTP 200", r.status_code == 200, f"status={r.status_code}")
+    if r.status_code == 200:
+        j = r.json()
+        check("oidc-proxy advertises authorize endpoint",
+              "authorization_endpoint" in j,
+              f"keys={list(j.keys())}")
+
+
+def test_sso_cross_tenant_rejected(_tenant_a: str, _tenant_b: str) -> None:
+    """
+    The proxy's token endpoint must reject with 4xx/5xx on unknown code.
+    This is a shape test — the full SSO flow (browser auth at LemonLDAP)
+    isn't automated here; manual verification covers that.
+    """
+    import requests
+    r = requests.post(
+        "https://oidc-proxy.localhost/api/oidc/token",
+        data={"grant_type": "authorization_code", "code": "nonexistent"},
+        verify=False, timeout=5,
+    )
+    check("oidc-proxy rejects unknown code",
+          r.status_code in (400, 403, 500),
+          f"status={r.status_code}")
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -695,6 +838,15 @@ def main() -> None:
     test_federation_key_server(base)
     test_federation_version(base)
     test_cross_tenant_room(base, tokens)
+    test_zero_config_provisioning(CONTROL_PLANE_BASE, CONTROL_PLANE_TOKEN)
+    test_federation_test_endpoint(CONTROL_PLANE_BASE, CONTROL_PLANE_TOKEN)
+
+    # --- LDAP + SSO --------------------------------------------------
+    for t in [TENANT_A, TENANT_B]:
+        test_ldap_branch_exists(t)
+    test_lemonldap_portal_reachable()
+    test_oidc_proxy_wellknown()
+    test_sso_cross_tenant_rejected(TENANT_A, TENANT_B)
 
     # Summary
     print("\n" + "=" * 60)
