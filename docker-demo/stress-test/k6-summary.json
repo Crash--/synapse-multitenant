@@ -1,0 +1,208 @@
+{
+    "metrics": {
+        "whoami_duration": {
+            "p(90)": 5.3116653000000005,
+            "p(95)": 8.27495115,
+            "avg": 3.2844188483767316,
+            "min": 1.027021,
+            "med": 2.1327845,
+            "max": 549.136747
+        },
+        "data_received": {
+            "count": 87095005,
+            "rate": 279646.9086309483
+        },
+        "http_req_tls_handshaking": {
+            "max": 15.63303,
+            "p(90)": 0,
+            "p(95)": 0,
+            "avg": 0.009329213377377224,
+            "min": 0,
+            "med": 0
+        },
+        "http_req_receiving": {
+            "avg": 0.0885731027457425,
+            "min": 0.011352,
+            "med": 0.0635695,
+            "max": 491.556927,
+            "p(90)": 0.11883210000000001,
+            "p(95)": 0.14130454999999995
+        },
+        "http_reqs": {
+            "count": 52372,
+            "rate": 168.15738053887273
+        },
+        "versions_duration": {
+            "avg": 4.430169538649079,
+            "min": 0.9789,
+            "med": 2.4496455,
+            "max": 508.470295,
+            "p(90)": 5.572131300000011,
+            "p(95)": 9.94922515
+        },
+        "vus": {
+            "value": 5,
+            "min": 1,
+            "max": 200
+        },
+        "http_req_failed": {
+            "fails": 42796,
+            "passes": 9576,
+            "thresholds": {
+                "rate<0.15": true
+            },
+            "value": 0.18284579546322463
+        },
+        "http_req_waiting": {
+            "med": 2.5363035,
+            "max": 762.388751,
+            "p(90)": 7.3858238000000025,
+            "p(95)": 12.271411949999981,
+            "avg": 5.730947943958637,
+            "min": 0.866598
+        },
+        "login_duration": {
+            "p(90)": 298.0719334,
+            "p(95)": 314.96561384999995,
+            "avg": 237.5960229285713,
+            "min": 2.992686,
+            "med": 248.799838,
+            "max": 762.610909
+        },
+        "sync_duration": {
+            "max": 553.076554,
+            "p(90)": 10.2808396,
+            "p(95)": 15.679188049999995,
+            "avg": 5.837036038886849,
+            "min": 1.10068,
+            "med": 3.7885625000000003
+        },
+        "http_req_duration": {
+            "avg": 5.896357026521722,
+            "min": 0.9789,
+            "med": 2.6848725,
+            "max": 762.610909,
+            "p(90)": 7.556625600000003,
+            "p(95)": 12.469351749999994,
+            "thresholds": {
+                "p(95)<5000": false
+            }
+        },
+        "http_req_connecting": {
+            "p(90)": 0,
+            "p(95)": 0,
+            "avg": 0.0013123723554571145,
+            "min": 0,
+            "med": 0,
+            "max": 14.719152
+        },
+        "vus_max": {
+            "value": 200,
+            "min": 200,
+            "max": 200
+        },
+        "http_req_sending": {
+            "avg": 0.07683597981745921,
+            "min": 0.023204,
+            "med": 0.05304,
+            "max": 548.959915,
+            "p(90)": 0.1145659,
+            "p(95)": 0.14217654999999993
+        },
+        "data_sent": {
+            "count": 3034104,
+            "rate": 9741.980083298631
+        },
+        "checks": {
+            "passes": 54370,
+            "fails": 14820,
+            "thresholds": {
+                "rate>0.90": true
+            },
+            "value": 0.7858071975719034
+        },
+        "http_req_duration{expected_response:true}": {
+            "max": 762.610909,
+            "p(90)": 7.924683,
+            "p(95)": 13.10647675,
+            "avg": 5.917117807575486,
+            "min": 0.9789,
+            "med": 2.810519
+        },
+        "iterations": {
+            "count": 16940,
+            "rate": 54.39139284977667
+        },
+        "http_req_blocked": {
+            "min": 0.00014,
+            "med": 0.000261,
+            "max": 17.019757,
+            "p(90)": 0.000441,
+            "p(95)": 0.000532,
+            "avg": 0.01154115876804308
+        },
+        "iteration_duration": {
+            "avg": 2017.6456970149336,
+            "min": 1003.990281,
+            "med": 2012.6495965,
+            "max": 3471.761761,
+            "p(90)": 2822.0445820000004,
+            "p(95)": 2925.92748935
+        },
+        "isolation_check_passed": {
+            "passes": 432,
+            "fails": 1164,
+            "value": 0.2706766917293233
+        }
+    },
+    "root_group": {
+        "name": "",
+        "path": "",
+        "id": "d41d8cd98f00b204e9800998ecf8427e",
+        "groups": {},
+        "checks": {
+                "login 200": {
+                    "path": "::login 200",
+                    "id": "48b06dc5cde7f6ebb606ad7da726a2a5",
+                    "passes": 200,
+                    "fails": 122,
+                    "name": "login 200"
+                },
+                "versions 200": {
+                    "name": "versions 200",
+                    "path": "::versions 200",
+                    "id": "70276e6450ecb876987094a7139409a8",
+                    "passes": 16818,
+                    "fails": 0
+                },
+                "whoami 200": {
+                    "id": "15b2e9068a75672e0012ff5fb5874755",
+                    "passes": 12306,
+                    "fails": 4512,
+                    "name": "whoami 200",
+                    "path": "::whoami 200"
+                },
+                "whoami user matches tenant": {
+                    "path": "::whoami user matches tenant",
+                    "id": "4df86f5ce1798875421be725012614a6",
+                    "passes": 12306,
+                    "fails": 4512,
+                    "name": "whoami user matches tenant"
+                },
+                "sync 200": {
+                    "path": "::sync 200",
+                    "id": "f150d6a78507344cdeaae914b37630ef",
+                    "passes": 12308,
+                    "fails": 4510,
+                    "name": "sync 200"
+                },
+                "cross-tenant token rejected": {
+                    "fails": 1164,
+                    "name": "cross-tenant token rejected",
+                    "path": "::cross-tenant token rejected",
+                    "id": "b5a00363b72591617ac2d27ce595bc07",
+                    "passes": 432
+                }
+            }
+    }
+}

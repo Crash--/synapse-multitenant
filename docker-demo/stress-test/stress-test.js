@@ -17,6 +17,7 @@ const rateLimited = new Counter("rate_limited_responses");
 // (cp_max=10 in homeserver.yaml — challenges.md predicts starvation
 // at moderate concurrency).
 export const options = {
+  insecureSkipTLSVerify: true,
   stages: [
     { duration: "20s", target: 20 },   // warm-up
     { duration: "30s", target: 50 },   // moderate — within pool budget
@@ -33,7 +34,7 @@ export const options = {
   },
 };
 
-const BASE_URL = __ENV.BASE_URL || "http://localhost";
+const BASE_URL = __ENV.BASE_URL || "https://localhost";
 
 // ── Per-VU state ───────────────────────────────────────────────
 let cachedToken = null;

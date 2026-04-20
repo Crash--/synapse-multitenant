@@ -5,10 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 HOST="${1:-localhost}"
-PORT="${2:-80}"
-BASE_URL="http://${HOST}"
-if [ "$PORT" != "80" ]; then
-  BASE_URL="http://${HOST}:${PORT}"
+PORT="${2:-443}"
+SCHEME="${SCHEME:-https}"
+DEFAULT_PORT=443
+[ "$SCHEME" = "http" ] && DEFAULT_PORT=80
+BASE_URL="${SCHEME}://${HOST}"
+if [ "$PORT" != "$DEFAULT_PORT" ]; then
+  BASE_URL="${SCHEME}://${HOST}:${PORT}"
 fi
 
 echo "============================================"
@@ -19,7 +22,7 @@ echo "============================================"
 # ── Pre-flight: check Synapse is running ──────────────────────
 echo ""
 echo "Checking Synapse health..."
-if ! curl -sf "${BASE_URL}/health" -H "Host: matrix.tenant-a.com" > /dev/null 2>&1; then
+if ! curl -skf "${BASE_URL}/health" -H "Host: stress-a.localhost" > /dev/null 2>&1; then
   echo "ERROR: Synapse is not responding at ${BASE_URL}"
   echo "Make sure the docker-compose stack is running:"
   echo "  cd docker-demo && docker compose up -d"
@@ -49,7 +52,7 @@ echo ""
 
 # ── Phase 1: Bootstrap users and rooms ────────────────────────
 echo "=== Phase 1: Bootstrap ==="
-python3 setup.py --host "$HOST" --port "$PORT"
+python3 setup.py --host "$HOST" --port "$PORT" --scheme "$SCHEME"
 
 # ── Phase 2: Run k6 with InfluxDB output ─────────────────────
 echo ""
@@ -59,20 +62,23 @@ echo ""
 
 INFLUX_OUT="influxdb=http://localhost:8086/k6"
 
+K6_SUMMARY="${SCRIPT_DIR}/k6-summary.json"
 if command -v k6 > /dev/null 2>&1; then
   k6 run \
     --out "$INFLUX_OUT" \
     --env BASE_URL="${BASE_URL}" \
+    --summary-export="$K6_SUMMARY" \
     stress-test.js
 else
   echo "k6 not found locally, using Docker..."
   docker run --rm \
     --network docker-demo_synapse-demo-net \
-    -v "${SCRIPT_DIR}:/scripts:ro" \
+    -v "${SCRIPT_DIR}:/scripts" \
     -w /scripts \
     grafana/k6 run \
     --out "influxdb=http://stress-influxdb:8086/k6" \
-    --env BASE_URL="http://traefik" \
+    --env BASE_URL="https://synapse-demo-traefik" \
+    --summary-export=/scripts/k6-summary.json \
     stress-test.js
 fi
 
