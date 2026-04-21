@@ -473,3 +473,38 @@ def create_tenant_registry(hs: "HomeServer") -> TenantRegistry:
         return TenantRegistry(MultiTenantConfig(enabled=False))
 
     return TenantRegistry(tenants_config.multi_tenant)
+
+
+async def hydrate_registry_at_startup(
+    registry: TenantRegistry,
+    db_pool,
+    master_key: bytes | None,
+) -> None:
+    """Populate the registry from ``public.tenants`` once at boot.
+
+    Idempotent no-op when multi-tenant is disabled or when tenants were
+    already parsed from YAML (source != "database"). Failures are logged
+    at ERROR and swallowed — the process continues to boot with an empty
+    registry (same as before this hook existed), and an admin can recover
+    via ``POST /_synapse/admin/v1/tenants/reload``.
+    """
+    if not registry.enabled:
+        return
+    if registry._config.source != "database":
+        return
+
+    try:
+        result = await registry.load_from_database(
+            db_pool, master_key, registry._config.default_schema
+        )
+        logger.info(
+            "Startup hydration from database: added=%s removed=%s unchanged=%s",
+            result.get("added"),
+            result.get("removed"),
+            result.get("unchanged"),
+        )
+    except Exception:
+        logger.exception(
+            "Startup hydration from database failed; registry remains empty. "
+            "Admins can recover via POST /_synapse/admin/v1/tenants/reload"
+        )

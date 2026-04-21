@@ -362,3 +362,73 @@ class TestLoadFromDatabase(SynchronousTestCase):
         # reload() return value propagates back
         self.assertIn("added", result)
         self.assertEqual(sorted(result["added"]), ["acme.com", "corp.io"])
+
+
+class TestStartupHydration(SynchronousTestCase):
+    """The helper that hydrates the registry at startup."""
+
+    def test_hydration_helper_invokes_load_from_database_when_db_source(self):
+        """When source='database', the helper calls registry.load_from_database()."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="database", tenants={}
+        )
+        registry = TenantRegistry(config)
+
+        registry.load_from_database = AsyncMock(
+            return_value={"added": [], "removed": [], "unchanged": []}
+        )
+        fake_db_pool = MagicMock()
+
+        self.successResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        registry.load_from_database.assert_awaited_once_with(
+            fake_db_pool, None, "public"
+        )
+
+    def test_hydration_helper_noop_when_yaml_source(self):
+        """When source='yaml', the helper does NOT call load_from_database."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="yaml", tenants={}
+        )
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock()
+        fake_db_pool = MagicMock()
+
+        self.successResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        registry.load_from_database.assert_not_awaited()
+
+    def test_hydration_helper_noop_when_disabled(self):
+        """When multi-tenant disabled, the helper does NOT call load_from_database."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(enabled=False)
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock()
+        fake_db_pool = MagicMock()
+
+        self.successResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        registry.load_from_database.assert_not_awaited()
