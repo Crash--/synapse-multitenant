@@ -48,7 +48,7 @@ from synapse.storage.types import Cursor
 from synapse.storage.util.id_generators import IdGenerator
 from synapse.storage.util.sequence import build_sequence_generator
 from synapse.types import JsonDict, StrCollection, UserID, UserInfo
-from synapse.util.caches.descriptors import cached
+from synapse.util.caches.descriptors import cached, tenant_cached
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter
 
@@ -464,7 +464,7 @@ class RegistrationWorkerStore(StatsStore, CacheInvalidationWorkerStore):
         is_trial = (now - info.creation_ts * 1000) < trial_duration_ms
         return is_trial
 
-    @cached()
+    @tenant_cached()
     async def get_user_by_access_token(self, token: str) -> TokenLookupResult | None:
         """Get a user from the given access token.
 
@@ -1023,7 +1023,7 @@ class RegistrationWorkerStore(StatsStore, CacheInvalidationWorkerStore):
         except self.database_engine.module.IntegrityError:
             raise ExternalIDReuseException()
 
-    @cached()
+    @tenant_cached()
     async def get_user_by_external_id(
         self, auth_provider: str, external_id: str
     ) -> str | None:
@@ -1969,7 +1969,7 @@ class RegistrationWorkerStore(StatsStore, CacheInvalidationWorkerStore):
 
         return True
 
-    @cached()
+    @tenant_cached()
     async def mark_access_token_as_used(self, token_id: int) -> None:
         """
         Mark the access token as used, which invalidates the refresh token used

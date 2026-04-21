@@ -450,6 +450,25 @@ async def start(
             False otherwise the homeserver cannot be garbage collected after `shutdown`.
     """
 
+    # Hydrate the tenant registry from public.tenants for source="database"
+    # deployments, so the isolation check below and all HTTP traffic see a
+    # populated registry. No-op for YAML-source or single-tenant.
+    if hs.config.tenants.multi_tenant.enabled:
+        from synapse.tenant_registry import hydrate_registry_at_startup
+
+        mt_config = hs.config.tenants.multi_tenant
+        master_key = None
+        if mt_config.source == "database":
+            from synapse.crypto.tenant_key_encryption import (
+                get_master_key_from_env,
+            )
+
+            master_key = get_master_key_from_env()
+        main_db_pool = hs.get_datastores().main.db_pool
+        await hydrate_registry_at_startup(
+            hs.get_tenant_registry(), main_db_pool, master_key
+        )
+
     # Security-first: verify every tenant schema actually holds the
     # tables the bootstrap thinks it cloned. If the operator forgot to
     # run scripts/create_tenant_schema.py, or if the bootstrap raced

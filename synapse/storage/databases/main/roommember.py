@@ -62,7 +62,13 @@ from synapse.types import (
     StreamToken,
     get_domain_from_id,
 )
-from synapse.util.caches.descriptors import _CacheContext, cached, cachedList
+from synapse.util.caches.descriptors import (
+    _CacheContext,
+    cached,
+    cachedList,
+    tenant_cached,
+    tenant_cached_list,
+)
 from synapse.util.duration import Duration
 from synapse.util.iterutils import batch_iter
 from synapse.util.metrics import Measure
@@ -1057,7 +1063,7 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
             return users_in_room
 
-    @cached(
+    @tenant_cached(
         max_entries=10000,
         # This name matches the old function that has been replaced - the cache name
         # is kept here to maintain backwards compatibility.
@@ -1068,7 +1074,7 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
     ) -> tuple[str, ProfileInfo] | None:
         raise NotImplementedError()
 
-    @cachedList(
+    @tenant_cached_list(
         cached_method_name="_get_user_id_from_membership_event_id",
         list_name="event_ids",
     )
@@ -1404,13 +1410,13 @@ class RoomMemberWorkerStore(EventsWorkerStore, CacheInvalidationWorkerStore):
 
         return set(event_ids)
 
-    @cached(max_entries=5000)
+    @tenant_cached(max_entries=5000)
     async def _get_membership_from_event_id(
         self, member_event_id: str
     ) -> EventIdMembership | None:
         raise NotImplementedError()
 
-    @cachedList(
+    @tenant_cached_list(
         cached_method_name="_get_membership_from_event_id", list_name="member_event_ids"
     )
     async def get_membership_from_event_ids(

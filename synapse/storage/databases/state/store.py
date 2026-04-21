@@ -20,6 +20,7 @@
 #
 
 import logging
+import os
 from typing import (
     TYPE_CHECKING,
     Iterable,
@@ -46,6 +47,7 @@ from synapse.storage.databases.state.bg_updates import StateBackgroundUpdateStor
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.types import Cursor
 from synapse.storage.util.sequence import build_sequence_generator
+from synapse.tenant_context import get_current_tenant
 from synapse.types import MutableStateMap, StateKey, StateMap
 from synapse.types.state import StateFilter
 from synapse.util.caches.descriptors import cached
@@ -60,6 +62,89 @@ logger = logging.getLogger(__name__)
 
 
 MAX_STATE_DELTA_HOPS = 100
+
+
+# F#2 diagnostic guard (permanent, not scaffolding).
+#
+# Every write path into `state_groups`, `state_group_edges`, and
+# `state_groups_persisting` calls `_mt_state_groups_guard(txn, op)` immediately
+# before the INSERT. The helper emits one DEBUG log line carrying
+#   (tenant, search_path, pg-resolved-schema-for-state_groups, op)
+# which lets the Task 7 repro log reader pick between the three hypotheses
+# documented in `docs/superpowers/specs/2026-04-21-stress-test-findings-
+# fix-design.md`:
+#
+#   (A) startup-time writes land in `public.state_groups` (tenant=None,
+#       search_path='public')
+#   (B) search_path drops `public` so unqualified writes resolve to an
+#       unexpected schema (tenant set, target_schema disagrees)
+#   (C) a global `state_groups_persisting` tracker isn't tenant-partitioned
+#       (tenant set, target_schema disagrees only for `state_groups_persisting`
+#       writes)
+#
+# When `SYNAPSE_MT_STRICT_STATE_GROUPS=1` is set in the environment (off by
+# default; intended for repro runs and CI once F#2 is fixed), a write with no
+# active tenant context raises `AssertionError` instead of merely logging.
+# The explicit `raise AssertionError(...)` is deliberate: Python's `assert`
+# statement compiles out under `-O`, which would silently disable the guard in
+# production.
+def _mt_state_groups_guard(txn: "Cursor", op: str) -> None:
+    """Diagnostic guard for every state-groups write.
+
+    Args:
+        txn: The current transaction / cursor. Used to query
+            ``current_setting('search_path')`` and the ``pg_class`` resolution
+            for ``state_groups``.
+        op: A short descriptor of the call site, e.g.
+            ``"nextval state_group_id_seq (batch)"`` or
+            ``"insert state_groups_persisting"``. Included in the DEBUG log
+            line so an operator reading the logs can tell which specific site
+            fired.
+    """
+    tenant = get_current_tenant()
+
+    search_path: str | None = None
+    try:
+        txn.execute("SELECT current_setting('search_path')")
+        row = txn.fetchone()
+        if row is not None:
+            search_path = row[0]
+    except Exception:
+        # SQLite (in tests) or an already-aborted txn — don't let the guard
+        # itself break persistence. The strict-mode assertion below will still
+        # fire on `tenant is None` regardless of search_path availability.
+        pass
+
+    target_schema: str | None = None
+    try:
+        txn.execute(
+            "SELECT n.nspname FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname = 'state_groups' "
+            "AND n.nspname = ANY(current_schemas(false)) "
+            "LIMIT 1"
+        )
+        row = txn.fetchone()
+        if row is not None:
+            target_schema = row[0]
+    except Exception:
+        pass
+
+    logger.debug(
+        "mt_state_groups_guard: tenant=%s search_path=%s target_schema=%s op=%s",
+        tenant.server_name if tenant is not None else None,
+        search_path,
+        target_schema,
+        op,
+    )
+
+    if os.environ.get("SYNAPSE_MT_STRICT_STATE_GROUPS"):
+        if tenant is None:
+            raise AssertionError(
+                "SYNAPSE_MT_STRICT_STATE_GROUPS: state-groups write with no "
+                f"tenant context. search_path={search_path} "
+                f"target_schema={target_schema} op={op}"
+            )
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -152,6 +237,53 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             "state_group_id_seq",
             table="state_groups",
             id_column="id",
+        )
+
+        # F#2 diagnostic (permanent, one-shot at boot). Startup happens with
+        # no tenant context active, so the schema that `state_groups` resolves
+        # to here is the direct answer to hypothesis A (startup-time writes
+        # land in `public.state_groups`): if this logs `schema=public` and
+        # the max id is nonzero, some tenant data has been leaking into the
+        # shared schema. Written at INFO because one line per boot is cheap
+        # and operators reading boot logs should see it without enabling
+        # DEBUG. See `docs/superpowers/plans/2026-04-21-stress-test-findings-
+        # fix.md` (Task 6) for the full diagnostic protocol.
+        startup_tenant = get_current_tenant()
+        startup_max_state_group_id: int | None = None
+        startup_resolved_schema: str | None = None
+        try:
+            with db_conn.cursor(
+                txn_name="state_groups_startup_instrumentation"
+            ) as introspect_txn:
+                introspect_txn.execute(
+                    "SELECT COALESCE(max(id), 0) FROM state_groups"
+                )
+                row = introspect_txn.fetchone()
+                if row is not None:
+                    startup_max_state_group_id = row[0]
+                if isinstance(self.database_engine, PostgresEngine):
+                    introspect_txn.execute(
+                        "SELECT n.nspname FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE c.relname = 'state_groups' "
+                        "AND n.nspname = ANY(current_schemas(false)) "
+                        "LIMIT 1"
+                    )
+                    schema_row = introspect_txn.fetchone()
+                    if schema_row is not None:
+                        startup_resolved_schema = schema_row[0]
+        except Exception:
+            # Instrumentation must never break startup. On SQLite (used by
+            # unit tests) the pg_class query would fail; silently swallow it.
+            pass
+        logger.info(
+            "state_group_id_seq generator initialized at startup "
+            "(no tenant context active); "
+            "startup_tenant=%s startup_max_state_group_id=%s "
+            "resolved_schema_for_state_groups=%s",
+            startup_tenant.server_name if startup_tenant is not None else None,
+            startup_max_state_group_id,
+            startup_resolved_schema,
         )
 
     @cached(max_entries=10000, iterable=True)
@@ -503,6 +635,9 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 1 for event, _ in events_and_context if event.is_state()
             )
 
+            _mt_state_groups_guard(
+                txn, "nextval state_group_id_seq (batch)"
+            )
             state_groups = self._state_group_seq_gen.get_next_mult_txn(
                 txn, num_state_groups
             )
@@ -523,6 +658,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 }
                 sg_before = sg_after
 
+            _mt_state_groups_guard(txn, "insert_many state_groups (batch)")
             self.db_pool.simple_insert_many_txn(
                 txn,
                 table="state_groups",
@@ -534,6 +670,7 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
                 ],
             )
 
+            _mt_state_groups_guard(txn, "insert_many state_group_edges (batch)")
             self.db_pool.simple_insert_many_txn(
                 txn,
                 table="state_group_edges",
@@ -641,14 +778,19 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             if potential_hops >= MAX_STATE_DELTA_HOPS:
                 return None
 
+            _mt_state_groups_guard(
+                txn, "nextval state_group_id_seq (delta)"
+            )
             state_group = self._state_group_seq_gen.get_next_id_txn(txn)
 
+            _mt_state_groups_guard(txn, "insert state_groups (delta)")
             self.db_pool.simple_insert_txn(
                 txn,
                 table="state_groups",
                 values={"id": state_group, "room_id": room_id, "event_id": event_id},
             )
 
+            _mt_state_groups_guard(txn, "insert state_group_edges (delta)")
             self.db_pool.simple_insert_txn(
                 txn,
                 table="state_group_edges",
@@ -678,8 +820,12 @@ class StateGroupDataStore(StateBackgroundUpdateStore, SQLBaseStore):
             txn: LoggingTransaction, current_state_ids: StateMap[str]
         ) -> int:
             """Persist the full state, returning the new state group."""
+            _mt_state_groups_guard(
+                txn, "nextval state_group_id_seq (full)"
+            )
             state_group = self._state_group_seq_gen.get_next_id_txn(txn)
 
+            _mt_state_groups_guard(txn, "insert state_groups (full)")
             self.db_pool.simple_insert_txn(
                 txn,
                 table="state_groups",

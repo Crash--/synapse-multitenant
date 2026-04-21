@@ -367,6 +367,34 @@ class TenantRegistry:
         tenant = self.get_tenant_or_raise(server_name)
         return tenant.database_schema
 
+    async def load_from_database(
+        self,
+        db_pool,
+        master_key: bytes | None,
+        default_schema: str,
+    ) -> dict[str, list[str]]:
+        """Load tenants from ``public.tenants`` and apply them in-place.
+
+        Thin wrapper around the module-level ``load_tenants_from_database``
+        that also runs the DB I/O through ``db_pool`` and calls ``reload()``.
+
+        Args:
+            db_pool: A ``DatabasePool`` exposing ``runWithConnection``.
+            master_key: AES-256-GCM master key for decrypting signing keys.
+            default_schema: Schema name used by ``MultiTenantConfig``.
+
+        Returns:
+            The diff dict returned by ``reload()``.
+        """
+
+        def _load(conn):
+            return load_tenants_from_database(
+                conn.conn, master_key, default_schema
+            )
+
+        new_config = await db_pool.runWithConnection(_load)
+        return self.reload(new_config)
+
 
 def load_tenants_from_database(
     db_conn,
@@ -445,3 +473,46 @@ def create_tenant_registry(hs: "HomeServer") -> TenantRegistry:
         return TenantRegistry(MultiTenantConfig(enabled=False))
 
     return TenantRegistry(tenants_config.multi_tenant)
+
+
+async def hydrate_registry_at_startup(
+    registry: TenantRegistry,
+    db_pool,
+    master_key: bytes | None,
+) -> None:
+    """Populate the registry from ``public.tenants`` once at boot.
+
+    Idempotent no-op when multi-tenant is disabled or when tenants were
+    already parsed from YAML (source != "database"). Transient DB
+    connection errors (``psycopg2.OperationalError``) are logged and
+    swallowed so startup can proceed; admins can recover via
+    ``POST /_synapse/admin/v1/tenants/reload`` once the DB is back. All
+    other failures (schema mismatch, decryption failure, programmer
+    errors) propagate and crash startup so operators catch them —
+    otherwise the registry would stay empty and the isolation check in
+    ``homeserver.start()`` would trivially pass, re-opening the F#3
+    fall-through where every Host header serves ``server_name=localhost``.
+    """
+    if not registry.enabled:
+        return
+    if registry._config.source != "database":
+        return
+
+    import psycopg2
+
+    try:
+        result = await registry.load_from_database(
+            db_pool, master_key, registry._config.default_schema
+        )
+        logger.info(
+            "Startup hydration from database: added=%s removed=%s unchanged=%s",
+            result.get("added"),
+            result.get("removed"),
+            result.get("unchanged"),
+        )
+    except psycopg2.OperationalError:
+        logger.exception(
+            "Startup hydration from database failed due to a transient DB "
+            "error; registry remains empty. Admins can recover via "
+            "POST /_synapse/admin/v1/tenants/reload"
+        )

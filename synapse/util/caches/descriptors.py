@@ -619,6 +619,326 @@ def cachedList(
     )
 
 
+def tenant_cached(
+    *,
+    max_entries: int = 1000,
+    num_args: int | None = None,
+    uncached_args: Collection[str] | None = None,
+    tree: bool = False,
+    cache_context: bool = False,
+    iterable: bool = False,
+    prune_unread_entries: bool = True,
+    name: str | None = None,
+) -> Callable[[F], Callable[..., "defer.Deferred[Any]"]]:
+    """Tenant-aware variant of ``@cached``.
+
+    Behaves identically to ``@cached`` except that the cache key is prepended
+    with the current tenant's ``server_name`` (or ``None`` when no tenant
+    context is set). This prevents a value computed under tenant A from
+    being returned to a lookup under tenant B when both use the same
+    remaining arguments (e.g. the same access token or event_id).
+
+    See ``docs/multi_tenant/cache_audit.md`` for which methods need this
+    variant and why.
+
+    Implementation note: the ``num_args`` the caller passes refers to the
+    number of positional arguments of their *original* method (excluding
+    the implicit tenant key we prepend). The underlying descriptor is
+    given ``num_args + 1`` so the tenant key is counted as a cache-key
+    argument. ``cache_context=True`` is supported: the implicit
+    ``cache_context`` kwarg is threaded through as usual.
+    """
+    from synapse.tenant_context import get_current_tenant
+
+    # The underlying descriptor uses num_args to decide how many positional
+    # args become the cache key. We prepend the tenant key, so the underlying
+    # num_args must be original+1. None (default) means "use all args" — stays
+    # None (the descriptor counts *args of the inner function, which will now
+    # include the synthetic tenant_key).
+    inner_num_args = num_args + 1 if num_args is not None else None
+
+    def _wrap(orig: F) -> Callable[..., "defer.Deferred[Any]"]:
+        # Introspect the caller's function to build an inner function with
+        # an extra leading positional arg (`__tc_tenant_key__`). We can't use
+        # a simple `*args` signature because `_CacheDescriptorBase` relies on
+        # `inspect.getfullargspec(orig)` for arg names and default values.
+        arg_spec = inspect.getfullargspec(orig)
+        orig_args = arg_spec.args  # includes 'self'
+        if not orig_args:
+            raise ValueError(
+                "@tenant_cached can only be applied to bound methods "
+                "(function must accept at least `self`)."
+            )
+        self_name = orig_args[0]
+        other_args = orig_args[1:]
+        defaults = arg_spec.defaults or ()
+
+        # Build the inner function source with an injected `__tc_tenant_key__`
+        # arg placed right after `self`. We reproduce the caller's signature
+        # (including defaults) for the remaining positional args so that
+        # `inspect.getfullargspec` on the inner function matches what the
+        # descriptor expects.
+        #
+        # Internal closure-slot names are double-underscore (``__tc_*__``) so
+        # they cannot collide with a caller's method argument name. If we used
+        # plain names like ``_orig`` and the caller had a parameter named
+        # ``_orig``, the generated source would silently shadow the closure
+        # slot (``TypeError: 'str' object is not callable`` at call time).
+        params: list[str] = [self_name, "__tc_tenant_key__"]
+        num_without_default = len(other_args) - len(defaults)
+        for i, name_ in enumerate(other_args):
+            if i < num_without_default:
+                params.append(name_)
+            else:
+                # Reference the default through a closure slot so we don't
+                # have to re-emit it textually.
+                params.append(f"{name_}=__tc_defaults__[{i - num_without_default}]")
+
+        non_ctx_args = [n for n in other_args if n != "cache_context"]
+        forward_kwargs = ", ".join(non_ctx_args)
+        if cache_context and "cache_context" in other_args:
+            if forward_kwargs:
+                forward_kwargs = forward_kwargs + ", cache_context=cache_context"
+            else:
+                forward_kwargs = "cache_context=cache_context"
+
+        # Note: `__tc_tenant_key__` is not forwarded to `orig` — it exists
+        # only to serve as the prepended cache key.
+        src = (
+            f"async def __tc_inner__({', '.join(params)}):\n"
+            f"    return await __tc_orig__({self_name}, {forward_kwargs})\n"
+        )
+        ns: dict = {"__tc_orig__": orig, "__tc_defaults__": defaults}
+        exec(src, ns)
+        inner_fn = ns["__tc_inner__"]
+        inner_fn.__name__ = orig.__name__
+        inner_fn.__qualname__ = getattr(orig, "__qualname__", orig.__name__)
+        inner_fn.__doc__ = orig.__doc__
+
+        inner_descriptor = _CachedFunctionDescriptor(
+            max_entries=max_entries,
+            num_args=inner_num_args,
+            uncached_args=uncached_args,
+            tree=tree,
+            cache_context=cache_context,
+            iterable=iterable,
+            prune_unread_entries=prune_unread_entries,
+            # Preserve the caller's method name for cache metrics / lookup
+            # (e.g. so `@cachedList(cached_method_name=...)` can still find it).
+            name=name or orig.__name__,
+        )
+        inner_cached = inner_descriptor(inner_fn)
+
+        # Build a bound-method-style wrapper that prepends the tenant key.
+        # We return a `DeferredCacheDescriptor`-like object so that the
+        # standard descriptor protocol (`obj.method` → bound callable) works
+        # and so that `@tenant_cached_list`'s `getattr(obj, cached_method_name)`
+        # still returns an object exposing `.cache` and `.num_args`.
+        return _TenantCachedDescriptor(
+            inner_descriptor=inner_cached,
+            orig_name=orig.__name__,
+            get_current_tenant=get_current_tenant,
+        )
+
+    return _wrap
+
+
+class _TenantCachedDescriptor:
+    """Descriptor that binds a ``@tenant_cached`` inner descriptor to an instance.
+
+    On `obj.method` access it delegates to the inner ``DeferredCacheDescriptor``
+    to get the bound cached callable, then wraps it so the current tenant's
+    ``server_name`` is prepended to every call.
+    """
+
+    def __init__(
+        self,
+        *,
+        inner_descriptor: Any,
+        orig_name: str,
+        get_current_tenant: Callable[[], Any],
+    ):
+        # The inner is a `DeferredCacheDescriptor` instance (returned by
+        # `_CachedFunctionDescriptor.__call__`), not yet bound to `obj`.
+        self._inner = inner_descriptor
+        self._orig_name = orig_name
+        self._get_current_tenant = get_current_tenant
+        self.__name__ = orig_name
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._attr_name = name
+
+    def __get__(
+        self, obj: Any, owner: type | None = None
+    ) -> Callable[..., "defer.Deferred[Any]"]:
+        if obj is None:
+            return self  # type: ignore[return-value]
+
+        # Delegate to the inner descriptor to build the bound wrapped
+        # callable. This stores a `_wrapped` under `obj.__dict__[name]`
+        # (inside the inner's __get__), which we will overwrite below.
+        bound_cached = self._inner.__get__(obj, owner)
+        get_current_tenant = self._get_current_tenant
+
+        @functools.wraps(bound_cached)
+        def tenant_aware(*args: Any, **kwargs: Any) -> "defer.Deferred[Any]":
+            tenant = get_current_tenant()
+            tenant_key = tenant.server_name if tenant is not None else None
+            return bound_cached(tenant_key, *args, **kwargs)
+
+        # Expose the underlying cache / invalidation APIs so call sites
+        # using `self.method.invalidate(...)` or `self.method.cache` keep
+        # working. Invalidation keys must include the tenant prefix.
+        tenant_aware.cache = bound_cached.cache  # type: ignore[attr-defined]
+        tenant_aware.num_args = bound_cached.num_args  # type: ignore[attr-defined]
+        tenant_aware.invalidate_all = bound_cached.invalidate_all  # type: ignore[attr-defined]
+
+        def _tenant_invalidate(key: tuple) -> None:
+            tenant = get_current_tenant()
+            tenant_key = tenant.server_name if tenant is not None else None
+            if bound_cached.num_args == 1:
+                # Inner stores bare key (not a 1-tuple) when num_args==1.
+                # With the tenant prefix, num_args is >=2, so we build a tuple.
+                bound_cached.invalidate((tenant_key, key))
+            else:
+                bound_cached.invalidate((tenant_key,) + tuple(key))
+
+        def _tenant_prefill(key: tuple, value: Any) -> None:
+            tenant = get_current_tenant()
+            tenant_key = tenant.server_name if tenant is not None else None
+            if bound_cached.num_args == 1:
+                bound_cached.prefill((tenant_key, key), value)
+            else:
+                bound_cached.prefill((tenant_key,) + tuple(key), value)
+
+        tenant_aware.invalidate = _tenant_invalidate  # type: ignore[attr-defined]
+        tenant_aware.prefill = _tenant_prefill  # type: ignore[attr-defined]
+
+        # Overwrite the inner descriptor's cached attribute on the instance
+        # so subsequent attribute accesses return the tenant-aware wrapper
+        # directly (matching the descriptor protocol used by @cached).
+        obj.__dict__[self._attr_name if hasattr(self, "_attr_name") else self._orig_name] = (
+            tenant_aware
+        )
+        return tenant_aware
+
+
+def tenant_cached_list(
+    *,
+    cached_method_name: str,
+    list_name: str,
+    num_args: int | None = None,
+    name: str | None = None,
+) -> Callable[[F], Callable[..., "defer.Deferred[dict]"]]:
+    """Tenant-aware variant of ``@cachedList``.
+
+    Used in tandem with ``@tenant_cached`` on the paired
+    ``cached_method_name``. The list-batch lookup consults the paired
+    method's tenant-scoped ``DeferredCache`` directly (via
+    ``cache.get_bulk``), so this wrapper prepends the current tenant's
+    ``server_name`` to every cache key it constructs.
+
+    ``num_args`` refers to the caller's method signature (including
+    ``list_name`` but excluding the implicit tenant key). We bump the
+    underlying ``DeferredCacheListDescriptor`` by one and inject a synthetic
+    first positional arg (``__tc_tenant_key__``) into the orig so the cache
+    keys align with the paired ``@tenant_cached``.
+    """
+    from synapse.tenant_context import get_current_tenant
+
+    inner_num_args = num_args + 1 if num_args is not None else None
+
+    def _wrap(orig: F) -> Callable[..., "defer.Deferred[dict]"]:
+        arg_spec = inspect.getfullargspec(orig)
+        orig_args = arg_spec.args
+        if not orig_args:
+            raise ValueError(
+                "@tenant_cached_list can only be applied to bound methods."
+            )
+        self_name = orig_args[0]
+        other_args = orig_args[1:]
+        defaults = arg_spec.defaults or ()
+
+        # See `tenant_cached` for why the internal closure-slot names are
+        # double-underscore form: they cannot clash with caller argument
+        # names.
+        params: list[str] = [self_name, "__tc_tenant_key__"]
+        num_without_default = len(other_args) - len(defaults)
+        for i, name_ in enumerate(other_args):
+            if i < num_without_default:
+                params.append(name_)
+            else:
+                params.append(f"{name_}=__tc_defaults__[{i - num_without_default}]")
+
+        forward_kwargs = ", ".join(f"{n}={n}" for n in other_args)
+        src = (
+            f"async def __tc_inner__({', '.join(params)}):\n"
+            f"    return await __tc_orig__({self_name}, {forward_kwargs})\n"
+        )
+        ns: dict = {"__tc_orig__": orig, "__tc_defaults__": defaults}
+        exec(src, ns)
+        inner_fn = ns["__tc_inner__"]
+        inner_fn.__name__ = orig.__name__
+        inner_fn.__qualname__ = getattr(orig, "__qualname__", orig.__name__)
+        inner_fn.__doc__ = orig.__doc__
+
+        inner_descriptor = _CachedListFunctionDescriptor(
+            cached_method_name=cached_method_name,
+            list_name=list_name,
+            num_args=inner_num_args,
+            name=name or orig.__name__,
+        )
+        inner_cached = inner_descriptor(inner_fn)
+
+        return _TenantCachedListDescriptor(
+            inner_descriptor=inner_cached,
+            orig_name=orig.__name__,
+            get_current_tenant=get_current_tenant,
+        )
+
+    return _wrap
+
+
+class _TenantCachedListDescriptor:
+    """Descriptor companion to ``_TenantCachedDescriptor`` for list-batch
+    tenant_cached_list methods."""
+
+    def __init__(
+        self,
+        *,
+        inner_descriptor: Any,
+        orig_name: str,
+        get_current_tenant: Callable[[], Any],
+    ):
+        self._inner = inner_descriptor
+        self._orig_name = orig_name
+        self._get_current_tenant = get_current_tenant
+        self.__name__ = orig_name
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._attr_name = name
+
+    def __get__(
+        self, obj: Any, owner: type | None = None
+    ) -> Callable[..., "defer.Deferred[dict]"]:
+        if obj is None:
+            return self  # type: ignore[return-value]
+
+        bound_cached = self._inner.__get__(obj, owner)
+        get_current_tenant = self._get_current_tenant
+
+        @functools.wraps(bound_cached)
+        def tenant_aware(*args: Any, **kwargs: Any) -> "defer.Deferred[dict]":
+            tenant = get_current_tenant()
+            tenant_key = tenant.server_name if tenant is not None else None
+            return bound_cached(tenant_key, *args, **kwargs)
+
+        obj.__dict__[self._attr_name if hasattr(self, "_attr_name") else self._orig_name] = (
+            tenant_aware
+        )
+        return tenant_aware
+
+
 def _get_cache_key_builder(
     param_names: Sequence[str],
     include_params: Sequence[bool],

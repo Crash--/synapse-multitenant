@@ -29,6 +29,7 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
+from synapse.storage.databases.state.store import _mt_state_groups_guard
 from synapse.storage.engines import PostgresEngine
 from synapse.util.stringutils import shortstr
 
@@ -277,6 +278,7 @@ class StateDeletionDataStore:
                 f"state groups have been deleted: {shortstr(missing_state_groups)}"
             )
 
+        _mt_state_groups_guard(txn, "insert_many state_groups_persisting")
         self.db_pool.simple_insert_many_txn(
             txn,
             table="state_groups_persisting",

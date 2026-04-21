@@ -39,7 +39,6 @@ from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
 from synapse.http.site import SynapseRequest
 from synapse.rest.admin._base import admin_patterns, assert_requester_is_admin
-from synapse.tenant_registry import load_tenants_from_database
 from synapse.types import JsonDict
 
 if TYPE_CHECKING:
@@ -534,28 +533,20 @@ class ReloadTenantsRestServlet(RestServlet):
 
         try:
             if mt_config.source == "database":
-                # Load tenants from the database
                 from synapse.crypto.tenant_key_encryption import (
                     get_master_key_from_env,
                 )
 
                 master_key = get_master_key_from_env()
-
-                # Get a raw DB connection for the query.
-                # runWithConnection passes a LoggingDatabaseConnection;
-                # unwrap to the raw DB-API connection for our query.
                 db_pool = self._hs.get_datastores().main.db_pool
-                new_config = await db_pool.runWithConnection(
-                    lambda conn: load_tenants_from_database(
-                        conn.conn, master_key, mt_config.default_schema
-                    )
+                result = await registry.load_from_database(
+                    db_pool, master_key, mt_config.default_schema
                 )
             else:
                 # YAML source: re-read the config file
                 self._hs.config.reload_config_section("tenants")
                 new_config = self._hs.config.tenants.multi_tenant
-
-            result = registry.reload(new_config)
+                result = registry.reload(new_config)
 
             # Cascade to dependent registries
             keyring = self._hs.get_multi_tenant_keyring()

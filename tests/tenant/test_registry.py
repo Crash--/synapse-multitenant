@@ -23,6 +23,9 @@ These tests verify that:
 """
 
 from unittest import TestCase
+from unittest.mock import AsyncMock, MagicMock
+
+from twisted.trial.unittest import SynchronousTestCase
 
 from synapse.config.tenants import MultiTenantConfig, TenantConfig
 from synapse.tenant_registry import TenantNotFoundError, TenantRegistry
@@ -293,3 +296,192 @@ class TestTenantRegistryIsolation(TestCase):
         self.assertNotEqual(
             tenant_a.media_store_path, tenant_b.media_store_path
         )
+
+
+class TestLoadFromDatabase(SynchronousTestCase):
+    """Tests TenantRegistry.load_from_database()."""
+
+    def test_load_from_database_populates_registry(self):
+        """Registry populates itself via the method, without an external call to reload()."""
+        from twisted.internet.defer import ensureDeferred
+
+        # Start with an empty DB-source registry (the post-startup state today)
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="database", tenants={}
+        )
+        registry = TenantRegistry(config)
+        self.assertEqual(len(registry.get_all_tenants()), 0)
+
+        # Fake db_pool whose runWithConnection calls the callback with a fake conn
+        # whose cursor returns two tenant rows.
+        fake_row_acme = {
+            "server_name": "acme.com",
+            "database_schema": "tenant_acme_com",
+            "signing_key_data": b"ed25519 0 abc",
+            "media_store_path": "/media/acme",
+            "status": "active",
+            "signing_key_encrypted": None,
+        }
+        fake_row_corp = {
+            "server_name": "corp.io",
+            "database_schema": "tenant_corp_io",
+            "signing_key_data": b"ed25519 0 def",
+            "media_store_path": "/media/corp",
+            "status": "active",
+            "signing_key_encrypted": None,
+        }
+        rows = [tuple(fake_row_acme.values()), tuple(fake_row_corp.values())]
+        columns = list(fake_row_acme.keys())
+
+        fake_cursor = MagicMock()
+        fake_cursor.description = [(c,) for c in columns]
+        fake_cursor.fetchall.return_value = rows
+
+        fake_conn = MagicMock()
+        fake_conn.conn.cursor.return_value = fake_cursor
+
+        fake_db_pool = MagicMock()
+        fake_db_pool.runWithConnection = AsyncMock(
+            side_effect=lambda fn: fn(fake_conn)
+        )
+
+        # Run the new method through the Twisted reactor
+        result = self.successResultOf(
+            ensureDeferred(
+                registry.load_from_database(
+                    fake_db_pool, master_key=None, default_schema="public"
+                )
+            )
+        )
+
+        # Both tenants now present
+        self.assertEqual(
+            sorted(t.server_name for t in registry.get_all_tenants()),
+            ["acme.com", "corp.io"],
+        )
+        # reload() return value propagates back
+        self.assertIn("added", result)
+        self.assertEqual(sorted(result["added"]), ["acme.com", "corp.io"])
+
+
+class TestStartupHydration(SynchronousTestCase):
+    """The helper that hydrates the registry at startup."""
+
+    def test_hydration_helper_invokes_load_from_database_when_db_source(self):
+        """When source='database', the helper calls registry.load_from_database()."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="database", tenants={}
+        )
+        registry = TenantRegistry(config)
+
+        registry.load_from_database = AsyncMock(
+            return_value={"added": [], "removed": [], "unchanged": []}
+        )
+        fake_db_pool = MagicMock()
+
+        self.successResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        registry.load_from_database.assert_awaited_once_with(
+            fake_db_pool, None, "public"
+        )
+
+    def test_hydration_helper_noop_when_yaml_source(self):
+        """When source='yaml', the helper does NOT call load_from_database."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="yaml", tenants={}
+        )
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock()
+        fake_db_pool = MagicMock()
+
+        self.successResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        registry.load_from_database.assert_not_awaited()
+
+    def test_hydration_helper_noop_when_disabled(self):
+        """When multi-tenant disabled, the helper does NOT call load_from_database."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(enabled=False)
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock()
+        fake_db_pool = MagicMock()
+
+        self.successResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        registry.load_from_database.assert_not_awaited()
+
+    def test_hydration_helper_swallows_transient_db_error(self):
+        """psycopg2.OperationalError is logged and swallowed; startup continues."""
+        import psycopg2
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="database", tenants={}
+        )
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock(
+            side_effect=psycopg2.OperationalError("connection refused")
+        )
+        fake_db_pool = MagicMock()
+
+        with self.assertLogs("synapse.tenant_registry", level="ERROR") as cm:
+            self.successResultOf(
+                ensureDeferred(
+                    hydrate_registry_at_startup(
+                        registry, fake_db_pool, master_key=None
+                    )
+                )
+            )
+        self.assertTrue(
+            any(
+                "Startup hydration from database failed" in msg
+                for msg in cm.output
+            )
+        )
+
+    def test_hydration_helper_propagates_non_transient_errors(self):
+        """Configuration/schema errors bubble up and crash startup."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="database", tenants={}
+        )
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock(
+            side_effect=RuntimeError("bad master key")
+        )
+        fake_db_pool = MagicMock()
+
+        failure = self.failureResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        self.assertIsInstance(failure.value, RuntimeError)
