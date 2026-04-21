@@ -22,15 +22,32 @@
 
 ## Pre-flight
 
-Every `trial` / `pytest` invocation below assumes the engineer is **in the worktree root** and uses the already-provisioned venv in the main checkout:
+Every `trial` / `pytest` invocation below assumes the engineer is **in the worktree root** and uses the already-provisioned venv in the main checkout. **`PYTHONPATH` MUST point at the worktree** — the venv's `matrix_synapse.pth` points at the *main* checkout, so without `PYTHONPATH` the import resolves to the main checkout's code and runs stale tests silently:
 
 ```bash
 cd /home/monta/Documents/workspace/synapse-multitenant/.worktrees/fix-stress-test-findings
 export SYNAPSE_SKIP_RUST_CHECK=1
+export PYTHONPATH="$(pwd)"
 TRIAL=/home/monta/Documents/workspace/synapse-multitenant/.venv/bin/trial
 ```
 
-Baseline note: `tests.tenant.test_context` is pre-existing RED (10/13) because `reset_current_tenant()` gained a required `token` argument but the test helpers weren't updated. That failure is OUT OF SCOPE for this plan — **do not** fix it here. Every NEW test we write goes through `tests.tenant.test_registry`-style pattern (plain `unittest.TestCase`) or `HomeserverTestCase` in `tests/unittest.py`.
+If Rust imports fail (`ModuleNotFoundError: synapse.synapse_rust`), symlink the compiled extension from the main checkout into the worktree (one-time setup, file is gitignored):
+
+```bash
+ln -s /home/monta/Documents/workspace/synapse-multitenant/synapse/synapse_rust.abi3.so \
+      synapse/synapse_rust.abi3.so
+```
+
+**Sanity-check before relying on test counts:** grep the output for the test class name you just added, e.g.:
+
+```bash
+$TRIAL tests.tenant.test_registry 2>&1 | tee /tmp/trial.out
+grep -q "TestLoadFromDatabase" /tmp/trial.out || echo "WARNING: new test class not discovered — PYTHONPATH is pointing at the main checkout"
+```
+
+If the grep fails, your `PYTHONPATH` is wrong and trial ran stale code.
+
+Baseline note: `tests.tenant.test_context` is pre-existing RED (10/13) because `reset_current_tenant()` gained a required `token` argument but the test helpers weren't updated. That failure is OUT OF SCOPE for this plan — **do not** fix it here. Every NEW test we write goes through `tests.tenant.test_registry`-style pattern (plain `unittest.TestCase` or `twisted.trial.unittest.SynchronousTestCase` if `self.successResultOf` is needed) or `HomeserverTestCase` in `tests/unittest.py`.
 
 ## File inventory
 
