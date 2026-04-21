@@ -98,7 +98,7 @@ Single PR on a worktree branched off `feature/multi-tenant`. Commits land in thi
 
 **Touchpoints.**
 
-- `synapse/util/caches/descriptors.py` — new `@tenant_cached(...)` decorator (and `@tenant_cached_list`). Under the hood, the cache key is `(tenant_id, *original_args)`, where `tenant_id = tenant_context.get_current_tenant().server_name if tenant_context.get_current_tenant() else None`. Single-tenant deployments always get `tenant_id=None` — indistinguishable from today's behavior. All other behavior (TTL, invalidation, eviction) is preserved.
+- `synapse/util/caches/descriptors.py` — new `@tenant_cached(...)` decorator (and `@tenant_cached_list`). Under the hood, the cache key is `(tenant_id, *original_args)`, where `tenant_id = tenant_context.get_current_tenant().server_name if tenant_context.get_current_tenant() else None`. Single-tenant deployments always get `tenant_id=None` — indistinguishable from today's behavior. All other cache semantics (LRU sizing, invalidation, eviction) are preserved.
 - `synapse/storage/databases/main/registration.py:467-478` — swap `@cached()` → `@tenant_cached()` on `get_user_by_access_token`.
 - Any other storage method the audit turns up.
 
