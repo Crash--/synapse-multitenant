@@ -692,6 +692,17 @@ class DatabasePool:
                 schema,
                 conn_id,
             )
+            # F#2 diagnostic (permanent): every _set_tenant_schema call emits
+            # one line with (txn/conn-id, tenant, search_path). This lets the
+            # repro run in Task 7 reconstruct which connection got which
+            # search_path and when, even on the cache-hit path. Noisy at DEBUG
+            # level, negligible overhead when the logger is silent.
+            logger.debug(
+                "txn=%s tenant=%s search_path=%s",
+                conn_id,
+                tenant.server_name,
+                schema,
+            )
             return
 
         cursor = conn.cursor()
@@ -704,6 +715,16 @@ class DatabasePool:
                 schema,
                 tenant.server_name,
                 conn_id,
+            )
+            # F#2 diagnostic (permanent): mirrors the cache-hit path above so
+            # every call emits the tuple we need to diagnose schema routing
+            # bugs. See `docs/superpowers/plans/2026-04-21-stress-test-
+            # findings-fix.md` (Task 6) for how these logs are consumed.
+            logger.debug(
+                "txn=%s tenant=%s search_path=%s",
+                conn_id,
+                tenant.server_name,
+                schema,
             )
         finally:
             cursor.close()
