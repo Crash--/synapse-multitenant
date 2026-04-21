@@ -367,6 +367,34 @@ class TenantRegistry:
         tenant = self.get_tenant_or_raise(server_name)
         return tenant.database_schema
 
+    async def load_from_database(
+        self,
+        db_pool,
+        master_key: bytes | None,
+        default_schema: str,
+    ) -> dict[str, list[str]]:
+        """Load tenants from ``public.tenants`` and apply them in-place.
+
+        Thin wrapper around the module-level ``load_tenants_from_database``
+        that also runs the DB I/O through ``db_pool`` and calls ``reload()``.
+
+        Args:
+            db_pool: A ``DatabasePool`` exposing ``runWithConnection``.
+            master_key: AES-256-GCM master key for decrypting signing keys.
+            default_schema: Schema name used by ``MultiTenantConfig``.
+
+        Returns:
+            The diff dict returned by ``reload()``.
+        """
+
+        def _load(conn):
+            return load_tenants_from_database(
+                conn.conn, master_key, default_schema
+            )
+
+        new_config = await db_pool.runWithConnection(_load)
+        return self.reload(new_config)
+
 
 def load_tenants_from_database(
     db_conn,
