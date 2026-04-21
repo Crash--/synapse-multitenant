@@ -29,8 +29,6 @@ from synapse.storage.databases.main.events_worker import (
     EventsWorkerStore,
 )
 from synapse.util.caches.descriptors import (
-    cached,
-    cachedList,
     tenant_cached,
     tenant_cached_list,
 )
