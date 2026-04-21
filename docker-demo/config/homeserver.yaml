@@ -33,6 +33,10 @@ listeners:
           - client
           - federation
         compress: false
+  - port: 9000
+    type: metrics
+    bind_addresses:
+      - 0.0.0.0
 database:
   name: psycopg2
   allow_unsafe_locale: true
@@ -42,8 +46,10 @@ database:
     database: synapse_demo
     host: postgres
     port: 5432
+    # Raised from 10 to support the density test (many tenants sharing
+    # one pool). Pgbouncer default_pool_size=50 matches this ceiling.
     cp_min: 5
-    cp_max: 10
+    cp_max: 50
 log_config: /data/log.config
 media_store_path: /media
 max_upload_size: 50M
@@ -71,6 +77,6 @@ rc_login:
   failed_attempts:
     per_second: 5
     burst_count: 20
-enable_metrics: false
+enable_metrics: true
 report_stats: false
 allow_guest_access: false

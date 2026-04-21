@@ -102,8 +102,13 @@ export default function () {
 
   // 4) Cross-tenant isolation probe every 10th iteration:
   //    present our token to a sibling tenant's Host header — must be rejected.
+  //    Pick a RANDOM other tenant (not the deterministic next one) so the
+  //    probe covers the N² isolation surface as the tenant count scales.
   if (__ITER % 10 === 9) {
-    const other = tenantNames[(tenantNames.indexOf(tenant) + 1) % tenantNames.length];
+    const selfIdx = tenantNames.indexOf(tenant);
+    let otherIdx = Math.floor(Math.random() * tenantNames.length);
+    if (otherIdx === selfIdx) otherIdx = (otherIdx + 1) % tenantNames.length;
+    const other = tenantNames[otherIdx];
     const iso = http.get(`${BASE_URL}/_matrix/client/v3/account/whoami`, {
       headers: hdrs(other, token),
       tags: { name: "isolation_check", tenant },

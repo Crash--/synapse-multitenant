@@ -156,8 +156,12 @@ export default function () {
   // ── Isolation check (every 10th iteration) ─────────────────
   // Uses current user's token with a different tenant's Host header
   // to test actual schema-level token isolation.
+  // Pick a RANDOM other tenant (not the deterministic next one) so the
+  // probe covers the N² isolation surface as the tenant count scales.
   if (__ITER % 10 === 9) {
-    const otherIndex = (tenantNames.indexOf(tenantName) + 1) % tenantNames.length;
+    const selfIdx = tenantNames.indexOf(tenantName);
+    let otherIndex = Math.floor(Math.random() * tenantNames.length);
+    if (otherIndex === selfIdx) otherIndex = (otherIndex + 1) % tenantNames.length;
     const otherTenantName = tenantNames[otherIndex];
     const otherRoomId = testData.tenants[otherTenantName].room_id;
 
