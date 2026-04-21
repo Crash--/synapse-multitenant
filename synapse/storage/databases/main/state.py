@@ -55,7 +55,12 @@ from synapse.storage.databases.main.roommember import RoomMemberWorkerStore
 from synapse.types import JsonDict, JsonMapping, StateKey, StateMap, StrCollection
 from synapse.types.state import StateFilter
 from synapse.util.caches import intern_string
-from synapse.util.caches.descriptors import cached, cachedList
+from synapse.util.caches.descriptors import (
+    cached,
+    cachedList,
+    tenant_cached,
+    tenant_cached_list,
+)
 from synapse.util.cancellation import cancellable
 from synapse.util.iterutils import batch_iter
 
@@ -601,7 +606,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             "get_filtered_current_state_ids", _get_filtered_current_state_ids_txn
         )
 
-    @cached(max_entries=50000)
+    @tenant_cached(max_entries=50000)
     async def _get_state_group_for_event(self, event_id: str) -> int | None:
         return await self.db_pool.simple_select_one_onecol(
             table="event_to_state_groups",
@@ -611,7 +616,7 @@ class StateGroupWorkerStore(EventsWorkerStore, SQLBaseStore):
             desc="_get_state_group_for_event",
         )
 
-    @cachedList(
+    @tenant_cached_list(
         cached_method_name="_get_state_group_for_event",
         list_name="event_ids",
         num_args=1,

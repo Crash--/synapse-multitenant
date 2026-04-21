@@ -88,7 +88,12 @@ from synapse.types.state import StateFilter
 from synapse.types.storage import _BackgroundUpdates
 from synapse.util import unwrapFirstError
 from synapse.util.async_helpers import ObservableDeferred, delay_cancellation
-from synapse.util.caches.descriptors import cached, cachedList
+from synapse.util.caches.descriptors import (
+    cached,
+    cachedList,
+    tenant_cached,
+    tenant_cached_list,
+)
 from synapse.util.caches.lrucache import AsyncLruCache
 from synapse.util.caches.stream_change_cache import StreamChangeCache
 from synapse.util.cancellation import cancellable
@@ -2501,7 +2506,7 @@ class EventsWorkerStore(SQLBaseStore):
             get_event_id_for_timestamp_txn,
         )
 
-    @cachedList(cached_method_name="is_partial_state_event", list_name="event_ids")
+    @tenant_cached_list(cached_method_name="is_partial_state_event", list_name="event_ids")
     async def get_partial_state_events(
         self, event_ids: Collection[str]
     ) -> Mapping[str, bool]:
@@ -2528,7 +2533,7 @@ class EventsWorkerStore(SQLBaseStore):
         partial = {r[0] for r in result}
         return {e_id: e_id in partial for e_id in event_ids}
 
-    @cached()
+    @tenant_cached()
     async def is_partial_state_event(self, event_id: str) -> bool:
         """Checks if the given event has partial state"""
         result = await self.db_pool.simple_select_one_onecol(

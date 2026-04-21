@@ -28,17 +28,22 @@ from synapse.storage.databases.main.events_worker import (
     EventRedactBehaviour,
     EventsWorkerStore,
 )
-from synapse.util.caches.descriptors import cached, cachedList
+from synapse.util.caches.descriptors import (
+    cached,
+    cachedList,
+    tenant_cached,
+    tenant_cached_list,
+)
 
 
 class SignatureWorkerStore(EventsWorkerStore):
-    @cached()
+    @tenant_cached()
     def get_event_reference_hash(self, event_id: str) -> Mapping[str, bytes]:
         # This is a dummy function to allow get_event_reference_hashes
         # to use its cache
         raise NotImplementedError()
 
-    @cachedList(
+    @tenant_cached_list(
         cached_method_name="get_event_reference_hash", list_name="event_ids", num_args=1
     )
     async def get_event_reference_hashes(
