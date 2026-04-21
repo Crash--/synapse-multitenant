@@ -105,3 +105,6 @@ docker-demo/config/pgbouncer_userlist.txt
 docker-demo/lemonldap/oidc-signing.key
 docker-demo/lemonldap/oidc-signing.pub
 
+
+# Superpowers-managed worktrees for feature-branch work
+.worktrees/
