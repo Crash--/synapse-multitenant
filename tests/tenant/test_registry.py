@@ -432,3 +432,56 @@ class TestStartupHydration(SynchronousTestCase):
             )
         )
         registry.load_from_database.assert_not_awaited()
+
+    def test_hydration_helper_swallows_transient_db_error(self):
+        """psycopg2.OperationalError is logged and swallowed; startup continues."""
+        import psycopg2
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="database", tenants={}
+        )
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock(
+            side_effect=psycopg2.OperationalError("connection refused")
+        )
+        fake_db_pool = MagicMock()
+
+        with self.assertLogs("synapse.tenant_registry", level="ERROR") as cm:
+            self.successResultOf(
+                ensureDeferred(
+                    hydrate_registry_at_startup(
+                        registry, fake_db_pool, master_key=None
+                    )
+                )
+            )
+        self.assertTrue(
+            any(
+                "Startup hydration from database failed" in msg
+                for msg in cm.output
+            )
+        )
+
+    def test_hydration_helper_propagates_non_transient_errors(self):
+        """Configuration/schema errors bubble up and crash startup."""
+        from synapse.tenant_registry import hydrate_registry_at_startup
+        from twisted.internet.defer import ensureDeferred
+
+        config = MultiTenantConfig(
+            enabled=True, default_schema="public", source="database", tenants={}
+        )
+        registry = TenantRegistry(config)
+        registry.load_from_database = AsyncMock(
+            side_effect=RuntimeError("bad master key")
+        )
+        fake_db_pool = MagicMock()
+
+        failure = self.failureResultOf(
+            ensureDeferred(
+                hydrate_registry_at_startup(
+                    registry, fake_db_pool, master_key=None
+                )
+            )
+        )
+        self.assertIsInstance(failure.value, RuntimeError)

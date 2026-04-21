@@ -31,6 +31,8 @@ import os
 from io import StringIO
 from typing import TYPE_CHECKING
 
+import psycopg2
+
 from signedjson.key import read_signing_keys
 
 from synapse.config.tenants import MultiTenantConfig, TenantConfig
@@ -483,10 +485,15 @@ async def hydrate_registry_at_startup(
     """Populate the registry from ``public.tenants`` once at boot.
 
     Idempotent no-op when multi-tenant is disabled or when tenants were
-    already parsed from YAML (source != "database"). Failures are logged
-    at ERROR and swallowed — the process continues to boot with an empty
-    registry (same as before this hook existed), and an admin can recover
-    via ``POST /_synapse/admin/v1/tenants/reload``.
+    already parsed from YAML (source != "database"). Transient DB
+    connection errors (``psycopg2.OperationalError``) are logged and
+    swallowed so startup can proceed; admins can recover via
+    ``POST /_synapse/admin/v1/tenants/reload`` once the DB is back. All
+    other failures (schema mismatch, decryption failure, programmer
+    errors) propagate and crash startup so operators catch them —
+    otherwise the registry would stay empty and the isolation check in
+    ``homeserver.start()`` would trivially pass, re-opening the F#3
+    fall-through where every Host header serves ``server_name=localhost``.
     """
     if not registry.enabled:
         return
@@ -503,8 +510,9 @@ async def hydrate_registry_at_startup(
             result.get("removed"),
             result.get("unchanged"),
         )
-    except Exception:
+    except psycopg2.OperationalError:
         logger.exception(
-            "Startup hydration from database failed; registry remains empty. "
-            "Admins can recover via POST /_synapse/admin/v1/tenants/reload"
+            "Startup hydration from database failed due to a transient DB "
+            "error; registry remains empty. Admins can recover via "
+            "POST /_synapse/admin/v1/tenants/reload"
         )
