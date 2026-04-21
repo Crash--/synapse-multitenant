@@ -659,8 +659,8 @@ def tenant_cached(
 
     def _wrap(orig: F) -> Callable[..., "defer.Deferred[Any]"]:
         # Introspect the caller's function to build an inner function with
-        # an extra leading positional arg (`_tenant_key`). We can't use a
-        # simple `*args` signature because `_CacheDescriptorBase` relies on
+        # an extra leading positional arg (`__tc_tenant_key__`). We can't use
+        # a simple `*args` signature because `_CacheDescriptorBase` relies on
         # `inspect.getfullargspec(orig)` for arg names and default values.
         arg_spec = inspect.getfullargspec(orig)
         orig_args = arg_spec.args  # includes 'self'
@@ -673,8 +673,8 @@ def tenant_cached(
         other_args = orig_args[1:]
         defaults = arg_spec.defaults or ()
 
-        # Build the inner function source with an injected `_tenant_key` arg
-        # placed right after `self`. We reproduce the caller's signature
+        # Build the inner function source with an injected `__tc_tenant_key__`
+        # arg placed right after `self`. We reproduce the caller's signature
         # (including defaults) for the remaining positional args so that
         # `inspect.getfullargspec` on the inner function matches what the
         # descriptor expects.
@@ -841,8 +841,8 @@ def tenant_cached_list(
     ``num_args`` refers to the caller's method signature (including
     ``list_name`` but excluding the implicit tenant key). We bump the
     underlying ``DeferredCacheListDescriptor`` by one and inject a synthetic
-    first positional arg ``_tenant_key`` into the orig so the cache keys
-    align with the paired ``@tenant_cached``.
+    first positional arg (``__tc_tenant_key__``) into the orig so the cache
+    keys align with the paired ``@tenant_cached``.
     """
     from synapse.tenant_context import get_current_tenant
 
