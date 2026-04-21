@@ -60,7 +60,11 @@ from synapse.metrics import SERVER_NAME_LABEL, register_threadpool
 from synapse.storage.background_updates import BackgroundUpdater
 from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine, Sqlite3Engine
 from synapse.storage.types import Connection, Cursor, SQLQueryParameters
-from synapse.tenant_context import get_current_tenant
+from synapse.tenant_context import (
+    get_current_tenant,
+    reset_current_tenant,
+    set_current_tenant,
+)
 from synapse.types import StrCollection
 from synapse.util.async_helpers import delay_cancellation
 from synapse.util.duration import Duration
@@ -684,42 +688,28 @@ class DatabasePool:
         if not schema.replace("_", "").isalnum():
             raise ValueError(f"Invalid schema name: {schema}")
 
-        # Cache check: skip SET if this connection already has the right schema
+        # F#2 fix (2026-04-21): the per-connection cache that used to live
+        # here assumed session-level `SET search_path` persisted between
+        # pool borrows, and skipped the SET on cache hit. In practice the
+        # assumption was unsafe — the `rooms` INSERT during `createRoom`
+        # landed in `public` despite the cache reporting "already set" —
+        # so we drop the cache and unconditionally re-issue the SET on
+        # every DB borrow. See docker-demo/stress-test/finding-2-repro-
+        # 2026-04-21.md for the reproduce evidence.
         conn_id = id(conn)
-        if self._connection_schemas.get(conn_id) == schema:
-            logger.debug(
-                "search_path cache hit for '%s' on conn %d",
-                schema,
-                conn_id,
-            )
-            # F#2 diagnostic (permanent): every _set_tenant_schema call emits
-            # one line with (txn/conn-id, tenant, search_path). This lets the
-            # repro run in Task 7 reconstruct which connection got which
-            # search_path and when, even on the cache-hit path. Noisy at DEBUG
-            # level, negligible overhead when the logger is silent.
-            logger.debug(
-                "txn=%s tenant=%s search_path=%s",
-                conn_id,
-                tenant.server_name,
-                schema,
-            )
-            return
-
         cursor = conn.cursor()
         try:
             # Security-first policy: do NOT include `, public` as a fallback.
             cursor.execute(f"SET search_path TO {schema}")
-            self._connection_schemas[conn_id] = schema
             logger.debug(
                 "Set search_path to '%s' for tenant %s (conn %d)",
                 schema,
                 tenant.server_name,
                 conn_id,
             )
-            # F#2 diagnostic (permanent): mirrors the cache-hit path above so
-            # every call emits the tuple we need to diagnose schema routing
-            # bugs. See `docs/superpowers/plans/2026-04-21-stress-test-
-            # findings-fix.md` (Task 6) for how these logs are consumed.
+            # F#2 diagnostic (permanent): every _set_tenant_schema call emits
+            # one line with (conn-id, tenant, search_path) so schema-routing
+            # bugs remain diagnosable from logs.
             logger.debug(
                 "txn=%s tenant=%s search_path=%s",
                 conn_id,
@@ -1256,18 +1246,35 @@ class DatabasePool:
                             )
 
                         # Set tenant schema if multi-tenant mode is active.
-                        # Session-level SET persists across transactions on this
-                        # connection — no restore needed on exit.
                         if captured_tenant is not None and isinstance(self.engine, PostgresEngine):
                             self._set_tenant_schema(conn, captured_tenant)
 
-                        db_conn = LoggingDatabaseConnection(
-                            conn=conn,
-                            engine=self.engine,
-                            default_txn_name="runWithConnection",
-                            server_name=self.server_name,
+                        # F#2 fix (2026-04-21): re-establish the tenant
+                        # contextvar inside the thread-pool thread.
+                        # Python `contextvars.ContextVar` do NOT propagate
+                        # across the reactor→threadpool boundary, so
+                        # `get_current_tenant()` returns None here unless
+                        # we re-set it. Any tenant-aware logic reached
+                        # from inside `func()` — invalidation call sites,
+                        # txn.call_after callbacks, @tenant_cached keys
+                        # built inside a DB txn — relies on this.
+                        ctx_token = (
+                            set_current_tenant(captured_tenant)
+                            if captured_tenant is not None
+                            else None
                         )
-                        return func(db_conn, *args, **kwargs)
+
+                        try:
+                            db_conn = LoggingDatabaseConnection(
+                                conn=conn,
+                                engine=self.engine,
+                                default_txn_name="runWithConnection",
+                                server_name=self.server_name,
+                            )
+                            return func(db_conn, *args, **kwargs)
+                        finally:
+                            if ctx_token is not None:
+                                reset_current_tenant(ctx_token)
                     finally:
                         if db_autocommit:
                             self.engine.attempt_to_set_autocommit(conn, False)
