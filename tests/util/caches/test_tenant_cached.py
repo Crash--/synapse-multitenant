@@ -30,7 +30,6 @@ from synapse.tenant_context import (
     set_current_tenant,
 )
 from synapse.util.caches.descriptors import tenant_cached, tenant_cached_list
-from synapse.util.clock import Clock
 
 from tests.server import get_clock
 
@@ -265,3 +264,73 @@ class TenantCachedListTestCase(SynchronousTestCase):
         # Exactly one batch call, and it only had to fetch {e2}.
         self.assertEqual(store.batch_calls, 1)
         self.assertEqual(store.last_batch_input, {"e2"})
+
+
+# -------------------------------------------------------------------------- #
+# Regression tests for review-flagged bugs in the `exec()`-generated source. #
+# -------------------------------------------------------------------------- #
+
+
+class _CollisionStore:
+    """A method argument whose name collides with a former internal closure
+    slot (``_orig``). Pre-fix this shadowed the closure slot and blew up
+    at call time with ``TypeError: 'str' object is not callable``.
+    """
+
+    def __init__(self) -> None:
+        self.server_name = "test_server"
+        _, self.clock = get_clock()
+
+    @tenant_cached()
+    async def lookup(self, _orig: str) -> str:
+        return f"got:{_orig}"
+
+
+class TenantCachedInternalNameCollisionTestCase(SynchronousTestCase):
+    def test_method_arg_named_like_internal_slot_does_not_shadow(self) -> None:
+        store = _CollisionStore()
+        result = self.successResultOf(ensureDeferred(store.lookup("X")))
+        self.assertEqual(result, "got:X")
+
+
+class _OnlyCtxStore:
+    """A method whose only positional arg is ``cache_context``. Pre-fix the
+    ``forward_kwargs`` string started with a leading comma, producing a
+    ``SyntaxError`` when the generated ``async def`` was ``exec()``'d.
+    """
+
+    def __init__(self) -> None:
+        self.server_name = "test_server"
+        _, self.clock = get_clock()
+
+    @tenant_cached(cache_context=True)
+    async def lookup(self, cache_context=None) -> str:
+        return "v"
+
+
+class TenantCachedCacheContextOnlyArgTestCase(SynchronousTestCase):
+    def test_cache_context_only_arg_does_not_emit_leading_comma(self) -> None:
+        store = _OnlyCtxStore()
+        result = self.successResultOf(ensureDeferred(store.lookup()))
+        self.assertEqual(result, "v")
+
+
+class _CtxStore:
+    """Happy-path: ``@tenant_cached(cache_context=True)`` applied to a method
+    that takes one real positional arg plus ``cache_context``.
+    """
+
+    def __init__(self) -> None:
+        self.server_name = "test_server"
+        _, self.clock = get_clock()
+
+    @tenant_cached(cache_context=True)
+    async def lookup(self, key: str, cache_context=None) -> str:
+        return f"v:{key}"
+
+
+class TenantCachedCacheContextTestCase(SynchronousTestCase):
+    def test_cache_context_decorator_applies_cleanly(self) -> None:
+        store = _CtxStore()
+        result = self.successResultOf(ensureDeferred(store.lookup("K")))
+        self.assertEqual(result, "v:K")

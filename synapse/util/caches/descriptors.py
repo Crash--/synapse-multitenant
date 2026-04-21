@@ -678,7 +678,13 @@ def tenant_cached(
         # (including defaults) for the remaining positional args so that
         # `inspect.getfullargspec` on the inner function matches what the
         # descriptor expects.
-        params: list[str] = [self_name, "_tenant_key"]
+        #
+        # Internal closure-slot names are double-underscore (``__tc_*__``) so
+        # they cannot collide with a caller's method argument name. If we used
+        # plain names like ``_orig`` and the caller had a parameter named
+        # ``_orig``, the generated source would silently shadow the closure
+        # slot (``TypeError: 'str' object is not callable`` at call time).
+        params: list[str] = [self_name, "__tc_tenant_key__"]
         num_without_default = len(other_args) - len(defaults)
         for i, name_ in enumerate(other_args):
             if i < num_without_default:
@@ -686,27 +692,25 @@ def tenant_cached(
             else:
                 # Reference the default through a closure slot so we don't
                 # have to re-emit it textually.
-                params.append(f"{name_}=_td[{i - num_without_default}]")
+                params.append(f"{name_}=__tc_defaults__[{i - num_without_default}]")
 
-        if cache_context:
-            # cache_context is a kwarg-by-name contract: the inner function
-            # must forward the `cache_context` keyword to the original.
-            forward_kwargs = (
-                ", ".join(n for n in other_args if n != "cache_context")
-                + (", cache_context=cache_context" if "cache_context" in other_args else "")
-            )
-        else:
-            forward_kwargs = ", ".join(other_args)
+        non_ctx_args = [n for n in other_args if n != "cache_context"]
+        forward_kwargs = ", ".join(non_ctx_args)
+        if cache_context and "cache_context" in other_args:
+            if forward_kwargs:
+                forward_kwargs = forward_kwargs + ", cache_context=cache_context"
+            else:
+                forward_kwargs = "cache_context=cache_context"
 
-        # Note: `_tenant_key` is not forwarded to `orig` — it exists only
-        # to serve as the prepended cache key.
+        # Note: `__tc_tenant_key__` is not forwarded to `orig` — it exists
+        # only to serve as the prepended cache key.
         src = (
-            f"async def _inner({', '.join(params)}):\n"
-            f"    return await _orig({self_name}, {forward_kwargs})\n"
+            f"async def __tc_inner__({', '.join(params)}):\n"
+            f"    return await __tc_orig__({self_name}, {forward_kwargs})\n"
         )
-        ns: dict = {"_orig": orig, "_td": defaults}
+        ns: dict = {"__tc_orig__": orig, "__tc_defaults__": defaults}
         exec(src, ns)
-        inner_fn = ns["_inner"]
+        inner_fn = ns["__tc_inner__"]
         inner_fn.__name__ = orig.__name__
         inner_fn.__qualname__ = getattr(orig, "__qualname__", orig.__name__)
         inner_fn.__doc__ = orig.__doc__
@@ -855,22 +859,25 @@ def tenant_cached_list(
         other_args = orig_args[1:]
         defaults = arg_spec.defaults or ()
 
-        params: list[str] = [self_name, "_tenant_key"]
+        # See `tenant_cached` for why the internal closure-slot names are
+        # double-underscore form: they cannot clash with caller argument
+        # names.
+        params: list[str] = [self_name, "__tc_tenant_key__"]
         num_without_default = len(other_args) - len(defaults)
         for i, name_ in enumerate(other_args):
             if i < num_without_default:
                 params.append(name_)
             else:
-                params.append(f"{name_}=_td[{i - num_without_default}]")
+                params.append(f"{name_}=__tc_defaults__[{i - num_without_default}]")
 
         forward_kwargs = ", ".join(f"{n}={n}" for n in other_args)
         src = (
-            f"async def _inner({', '.join(params)}):\n"
-            f"    return await _orig({self_name}, {forward_kwargs})\n"
+            f"async def __tc_inner__({', '.join(params)}):\n"
+            f"    return await __tc_orig__({self_name}, {forward_kwargs})\n"
         )
-        ns: dict = {"_orig": orig, "_td": defaults}
+        ns: dict = {"__tc_orig__": orig, "__tc_defaults__": defaults}
         exec(src, ns)
-        inner_fn = ns["_inner"]
+        inner_fn = ns["__tc_inner__"]
         inner_fn.__name__ = orig.__name__
         inner_fn.__qualname__ = getattr(orig, "__qualname__", orig.__name__)
         inner_fn.__doc__ = orig.__doc__
