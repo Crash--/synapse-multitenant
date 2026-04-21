@@ -31,8 +31,6 @@ import os
 from io import StringIO
 from typing import TYPE_CHECKING
 
-import psycopg2
-
 from signedjson.key import read_signing_keys
 
 from synapse.config.tenants import MultiTenantConfig, TenantConfig
@@ -499,6 +497,8 @@ async def hydrate_registry_at_startup(
         return
     if registry._config.source != "database":
         return
+
+    import psycopg2
 
     try:
         result = await registry.load_from_database(
