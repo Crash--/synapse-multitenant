@@ -869,3 +869,46 @@ CREATE TABLE public.tenants (
 ];
 
 export const TOTAL_DURATION_MS = STAGES[STAGES.length - 1].endMs;
+
+// ---------------------------------------------------------------------------
+// Scene E — fan-out density bottleneck
+//
+// Static data for the Scene-E explainer: the callsites that depend on
+// `run_as_background_process_per_tenant`, and the measured density numbers
+// from `docker-demo/stress-test/density-2026-04-21.md` + the 100-tenant
+// fan-out-off PoC from `docker-demo/stress-test/finding-density-versions-
+// p95.md`.
+// ---------------------------------------------------------------------------
+
+export const FANOUT_CALLSITES = [
+  { module: "handlers/presence.py",         proc: "handle_presence_timeouts",        interval: "every 5 s",   severity: "hot"  },
+  { module: "handlers/presence.py",         proc: "persist_presence_changes",        interval: "every ~60 s", severity: "warm" },
+  { module: "handlers/stats.py",            proc: "stats.notify_new_event",          interval: "event-driven",severity: "warm" },
+  { module: "handlers/user_directory.py",   proc: "user_directory.notify_new_event", interval: "event-driven",severity: "warm" },
+  { module: "handlers/device.py",           proc: "_handle_new_device_update_async", interval: "event-driven",severity: "hot"  },
+  { module: "handlers/device.py",           proc: "delete_stale_devices",            interval: "every 1 h",   severity: "cold" },
+  { module: "handlers/auth.py",             proc: "expire_old_sessions",             interval: "every 5 min", severity: "cold" },
+  { module: "handlers/message.py",          proc: "send_dummy_events_to_fill_ext.",  interval: "every ~5 min",severity: "cold" },
+  { module: "handlers/pagination.py",       proc: "paginate_purge_history",          interval: "event-driven",severity: "cold" },
+  { module: "handlers/account_validity.py", proc: "account_validity_expiry_sweep",   interval: "every 1 h",   severity: "cold" },
+  { module: "handlers/deactivate_account.py", proc: "deactivate_account_worker",     interval: "event-driven",severity: "cold" },
+  { module: "handlers/room_forgetter.py",   proc: "room_forgetter.notify_new_event", interval: "event-driven",severity: "warm" },
+  { module: "handlers/delayed_events.py",   proc: "delayed_events.notify_new_event", interval: "event-driven",severity: "warm" },
+  { module: "typing.py (internal)",         proc: "typing._handle_timeouts",         interval: "every 5 s",   severity: "hot"  },
+];
+
+// Measured impact on GET /versions p95 — tenant count × fan-out mode.
+// Source: docker-demo/stress-test/result-2026-04-21.md, density-2026-04-21.md,
+// and the 2026-04-21 PoC at 100 tenants with fan-out disabled.
+export const FANOUT_MEASUREMENTS = [
+  { n:   4, fanout: "on",  p95: 3.07, note: "baseline (fork pre-density)" },
+  { n:  10, fanout: "on",  p95: 3.72, note: "density smoke test" },
+  { n:  50, fanout: "on",  p95: 18.81, note: "density ceiling — 5.1× p95 at 5× tenants" },
+  { n: 100, fanout: "off", p95: 3.14, note: "fan-out bypass PoC — p95 reverts to 4-tenant baseline" },
+];
+
+export const FANOUT_SUMMARY = {
+  helper: "synapse/tenant_background.py :: run_as_background_process_per_tenant",
+  mechanic: "On every looping-call tick, the helper iterates the tenant registry and synchronously spawns one background process per tenant on the reactor thread. Each spawn allocates a LoggingContext, enters a tenant ContextVar scope, and registers a Prometheus counter — before any real work begins.",
+  consequence: "At N tenants, every fan-out ticks pays O(N) reactor-thread bookkeeping cost. With 8+ distinct callsites each firing on their own timer, dozens of fan-out bursts per minute compound into a density ceiling that lifts p95 of even static, unauthenticated endpoints like /_matrix/client/versions.",
+};

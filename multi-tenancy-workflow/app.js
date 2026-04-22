@@ -1,4 +1,11 @@
-import { STAGES, TENANTS, TOTAL_DURATION_MS } from "./data.js";
+import {
+  STAGES,
+  TENANTS,
+  TOTAL_DURATION_MS,
+  FANOUT_CALLSITES,
+  FANOUT_MEASUREMENTS,
+  FANOUT_SUMMARY,
+} from "./data.js";
 
 // ---------------------------------------------------------------------------
 // Timeline: drives currentTimeMs, fires stageChange events.
@@ -647,6 +654,325 @@ function mountTransport(timeline) {
 // Scene registry
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Scene E — fan-out & density bottleneck
+//
+// Self-contained visual explainer for the 2026-04-21 density finding.
+// Runs its own animation loop (independent of the main timeline) because
+// the cadence of the fan-out tick has nothing to do with request lifecycle
+// stages; it's an always-on architectural property.
+//
+// Layout (top → bottom):
+//   1. Dependency graph: 14 callsites → 1 helper → reactor
+//   2. Tick mechanic: every 3 s (visual), helper fires N bursts onto
+//      the reactor lane; a /versions request that arrives during a
+//      burst has to wait for it to drain.
+//   3. Measured impact: 4 / 10 / 50 (fan-out on) vs 100 (fan-out off).
+//   4. Conclusion strip: one sentence that names the bottleneck.
+// ---------------------------------------------------------------------------
+
+class SceneE {
+  constructor(timeline) {
+    this.timeline = timeline;
+    this._tickTimer = null;
+    this._requestTimer = null;
+    this._requestIdSeq = 0;
+    this._state = { n: 50, fanoutOn: true };
+  }
+
+  mount(root) {
+    root.innerHTML = "";
+    root.classList.add("scene-e");
+    root.classList.remove("scene-a", "scene-b", "scene-c", "scene-d");
+
+    root.innerHTML = `
+      <div class="e-controls">
+        <label class="e-ctrl">
+          <span>Tenants (N)</span>
+          <select id="e-n">
+            <option value="4">4</option>
+            <option value="10">10</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
+        <label class="e-ctrl e-fanout-toggle">
+          <input type="checkbox" id="e-fanout" checked>
+          <span>Fan-out enabled</span>
+        </label>
+        <button class="e-pulse-btn" id="e-pulse">Fire a tick now</button>
+        <div class="e-state-badge" id="e-state-badge"></div>
+      </div>
+
+      <section class="e-deps">
+        <h3>Dependencies · <span class="e-deps-count">${FANOUT_CALLSITES.length}</span> callsites feed one helper</h3>
+        <div class="e-deps-grid">
+          <div class="e-deps-left">
+            ${FANOUT_CALLSITES.map(
+              (c) => `
+                <div class="e-dep e-dep-${c.severity}" title="${c.interval}">
+                  <div class="e-dep-mod">${c.module}</div>
+                  <div class="e-dep-proc">${c.proc}</div>
+                  <div class="e-dep-int">${c.interval}</div>
+                </div>
+              `,
+            ).join("")}
+          </div>
+          <svg class="e-deps-arrows" viewBox="0 0 120 100" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M 0 10  C 60 10 60 50 120 50" class="e-arrow-line" />
+            <path d="M 0 30  C 60 30 60 50 120 50" class="e-arrow-line" />
+            <path d="M 0 50  C 60 50 60 50 120 50" class="e-arrow-line" />
+            <path d="M 0 70  C 60 70 60 50 120 50" class="e-arrow-line" />
+            <path d="M 0 90  C 60 90 60 50 120 50" class="e-arrow-line" />
+          </svg>
+          <div class="e-deps-right">
+            <div class="e-helper-box">
+              <div class="e-helper-title">run_as_background_process_per_tenant</div>
+              <div class="e-helper-file">synapse/tenant_background.py</div>
+              <div class="e-helper-note">iterates <code>registry.get_all_tenants()</code><br>spawns one bg-process per tenant<br>synchronously on the reactor</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="e-mechanic">
+        <h3>Tick mechanic · reactor thread is the contested resource</h3>
+        <div class="e-mechanic-body">
+          <div class="e-clock" id="e-clock" title="every 5 s (visualised every 3 s)">
+            <div class="e-clock-face"></div>
+            <div class="e-clock-hand"></div>
+            <div class="e-clock-label">tick</div>
+          </div>
+          <div class="e-fanout-stage">
+            <svg id="e-burst-svg" viewBox="0 0 800 220" preserveAspectRatio="xMidYMid meet">
+              <!-- helper anchor -->
+              <rect x="8" y="96" width="132" height="28" rx="6" class="e-helper-pill" />
+              <text x="74" y="114" text-anchor="middle" class="e-helper-pill-text">helper</text>
+              <!-- reactor lane (a single-thread highway) -->
+              <rect x="560" y="60" width="230" height="100" rx="8" class="e-reactor-bg" />
+              <text x="675" y="52" text-anchor="middle" class="e-reactor-label">REACTOR THREAD</text>
+              <rect id="e-reactor-fill" x="562" y="62" width="0" height="96" rx="6" class="e-reactor-fill" />
+              <text x="675" y="178" text-anchor="middle" class="e-reactor-sub">LogContext × N · ContextVar × N · Prom counters × N</text>
+              <!-- burst dots injected dynamically -->
+              <g id="e-burst-dots"></g>
+            </svg>
+          </div>
+        </div>
+      </section>
+
+      <section class="e-impact">
+        <h3>Request impact · GET /_matrix/client/versions (static, unauth)</h3>
+        <svg id="e-req-svg" viewBox="0 0 800 90" preserveAspectRatio="xMidYMid meet">
+          <line x1="20" y1="45" x2="780" y2="45" class="e-req-track" />
+          <text x="20"  y="20" class="e-req-caption-left">arrive →</text>
+          <text x="780" y="20" text-anchor="end" class="e-req-caption-right">→ response</text>
+          <!-- reactor-busy marker -->
+          <rect id="e-req-busy" x="0" y="30" width="0" height="30" class="e-req-busy" rx="3" />
+          <g id="e-req-dots"></g>
+        </svg>
+      </section>
+
+      <section class="e-measured">
+        <h3>Measured impact · /_matrix/client/versions p95 by run</h3>
+        <table class="e-measure-table">
+          <thead><tr>
+            <th>Tenants</th><th>Fan-out</th><th>p95</th><th>Note</th>
+          </tr></thead>
+          <tbody>
+            ${FANOUT_MEASUREMENTS.map(
+              (m) => `
+                <tr class="e-measure-row${m.fanout === "off" ? " e-measure-row-off" : ""}">
+                  <td>${m.n}</td>
+                  <td><span class="e-pill e-pill-${m.fanout}">${m.fanout.toUpperCase()}</span></td>
+                  <td class="e-measure-p95">${m.p95} ms</td>
+                  <td class="e-measure-note">${m.note}</td>
+                </tr>
+              `,
+            ).join("")}
+          </tbody>
+        </table>
+        <p class="e-conclusion">
+          <strong>What this picture shows:</strong> ${FANOUT_SUMMARY.mechanic}
+          <br><br>
+          <strong>Why it matters at density:</strong> ${FANOUT_SUMMARY.consequence}
+        </p>
+      </section>
+    `;
+
+    this.el = root;
+    this.nSelect = root.querySelector("#e-n");
+    this.fanoutCheck = root.querySelector("#e-fanout");
+    this.pulseBtn = root.querySelector("#e-pulse");
+    this.burstDotsG = root.querySelector("#e-burst-dots");
+    this.reactorFill = root.querySelector("#e-reactor-fill");
+    this.reqBusy = root.querySelector("#e-req-busy");
+    this.reqDotsG = root.querySelector("#e-req-dots");
+    this.clockEl = root.querySelector("#e-clock");
+    this.badgeEl = root.querySelector("#e-state-badge");
+
+    this.nSelect.addEventListener("change", () => {
+      this._state.n = parseInt(this.nSelect.value, 10);
+      this._updateBadge();
+    });
+    this.fanoutCheck.addEventListener("change", () => {
+      this._state.fanoutOn = this.fanoutCheck.checked;
+      this._updateBadge();
+      this._syncMeasuredHighlight();
+    });
+    this.pulseBtn.addEventListener("click", () => this._fireTick());
+
+    this._updateBadge();
+    this._syncMeasuredHighlight();
+
+    // Start two independent animation loops:
+    //   - a tick every ~3 s (visualising the fan-out burst)
+    //   - a new /versions request every ~350 ms (so ~8 per tick)
+    this._tickTimer = setInterval(() => {
+      if (this._state.fanoutOn) this._fireTick();
+    }, 3000);
+    this._requestTimer = setInterval(() => this._spawnRequest(), 350);
+  }
+
+  _updateBadge() {
+    const match = FANOUT_MEASUREMENTS.find(
+      (m) =>
+        m.n === this._state.n &&
+        m.fanout === (this._state.fanoutOn ? "on" : "off"),
+    );
+    const text = match
+      ? `N=${this._state.n} · fan-out ${this._state.fanoutOn ? "on" : "off"} · measured p95 ≈ ${match.p95} ms`
+      : `N=${this._state.n} · fan-out ${this._state.fanoutOn ? "on" : "off"} · (combination not measured)`;
+    this.badgeEl.textContent = text;
+    this.badgeEl.classList.toggle("e-badge-hot", this._state.fanoutOn && this._state.n >= 50);
+    this.badgeEl.classList.toggle("e-badge-cool", !this._state.fanoutOn || this._state.n <= 10);
+  }
+
+  _syncMeasuredHighlight() {
+    this.el.querySelectorAll(".e-measure-row").forEach((row) => row.classList.remove("e-measure-row-active"));
+    const match = FANOUT_MEASUREMENTS.findIndex(
+      (m) =>
+        m.n === this._state.n &&
+        m.fanout === (this._state.fanoutOn ? "on" : "off"),
+    );
+    if (match >= 0) {
+      this.el.querySelectorAll(".e-measure-row")[match].classList.add("e-measure-row-active");
+    }
+  }
+
+  _fireTick() {
+    // pulse the clock
+    this.clockEl.classList.remove("e-clock-pulse");
+    // force reflow to restart the animation
+    void this.clockEl.offsetWidth;
+    this.clockEl.classList.add("e-clock-pulse");
+
+    const n = this._state.n;
+    const svg = this.burstDotsG.ownerSVGElement;
+    const w = 800, h = 220;
+    const helperX = 140, helperY = 110;
+    const reactorX = 562, reactorY = 110;
+
+    // Spawn N dots flying from helper to reactor. Staggered by a tiny
+    // amount so the human eye reads them as a burst, not a swarm.
+    for (let i = 0; i < n; i++) {
+      const dot = document.createElementNS(SVG_NS, "circle");
+      dot.setAttribute("r", n > 40 ? 3 : 5);
+      dot.setAttribute("class", "e-burst-dot");
+      dot.setAttribute("cx", helperX);
+      dot.setAttribute("cy", helperY + (Math.random() - 0.5) * 10);
+      this.burstDotsG.appendChild(dot);
+
+      const delay = i * Math.max(4, 400 / n); // whole burst inside ~400 ms
+      // Animate with Web Animations API for precise timing + easy cleanup.
+      const anim = dot.animate(
+        [
+          { cx: helperX, cy: dot.getAttribute("cy"), opacity: 1 },
+          {
+            cx: reactorX + Math.random() * 220,
+            cy: reactorY + (Math.random() - 0.5) * 80,
+            opacity: 0.3,
+          },
+        ],
+        { duration: 700, delay, fill: "forwards", easing: "cubic-bezier(.4,.1,.2,1)" },
+      );
+      anim.onfinish = () => dot.remove();
+    }
+
+    // Reactor fill: grows proportional to N over the burst duration,
+    // then drains. This is the "reactor busy" indicator.
+    const busyMs = 200 + n * 8; // empirically: ~8ms reactor time per tenant bookkeeping
+    const capped = Math.min(1, busyMs / 1200);
+    this.reactorFill.animate(
+      [
+        { width: 0, opacity: 0 },
+        { width: `${capped * 226}px`, opacity: 0.9, offset: 0.2 },
+        { width: `${capped * 226}px`, opacity: 0.9, offset: 0.7 },
+        { width: 0, opacity: 0 },
+      ],
+      { duration: 1400, fill: "forwards", easing: "linear" },
+    );
+
+    // Request track: mark the reactor as "busy" for the same window.
+    // Requests spawned during this window are visibly queued.
+    this._reactorBusyUntil = performance.now() + busyMs;
+    const busyDuration = Math.min(1200, busyMs);
+    this.reqBusy.animate(
+      [
+        { width: 0, opacity: 0 },
+        { width: `${760 * (busyDuration / 1200)}px`, opacity: 0.7, offset: 0.2 },
+        { width: `${760 * (busyDuration / 1200)}px`, opacity: 0.7, offset: 0.7 },
+        { width: 0, opacity: 0 },
+      ],
+      { duration: 1400, fill: "forwards", easing: "linear" },
+    );
+  }
+
+  _spawnRequest() {
+    const now = performance.now();
+    const reactorBusy = this._reactorBusyUntil && now < this._reactorBusyUntil;
+    const dot = document.createElementNS(SVG_NS, "circle");
+    dot.setAttribute("r", 6);
+    dot.setAttribute("class", reactorBusy ? "e-req-dot e-req-dot-stall" : "e-req-dot");
+    dot.setAttribute("cx", 20);
+    dot.setAttribute("cy", 45);
+    this.reqDotsG.appendChild(dot);
+
+    // Fast path: zip across in ~900 ms. Stalled path: hold for 500 ms
+    // at some intermediate x while reactor busy, then dash.
+    if (reactorBusy) {
+      const stallMs = Math.max(0, this._reactorBusyUntil - now);
+      const anim = dot.animate(
+        [
+          { cx: 20,  offset: 0 },
+          { cx: 220, offset: 0.1 },
+          { cx: 220, offset: 0.1 + Math.min(0.6, stallMs / 2000) },
+          { cx: 780, offset: 1 },
+        ],
+        { duration: 900 + stallMs, fill: "forwards", easing: "linear" },
+      );
+      anim.onfinish = () => dot.remove();
+    } else {
+      const anim = dot.animate(
+        [
+          { cx: 20 },
+          { cx: 780 },
+        ],
+        { duration: 900, fill: "forwards", easing: "linear" },
+      );
+      anim.onfinish = () => dot.remove();
+    }
+  }
+
+  unmount() {
+    if (this._tickTimer) clearInterval(this._tickTimer);
+    if (this._requestTimer) clearInterval(this._requestTimer);
+    this._tickTimer = null;
+    this._requestTimer = null;
+    if (this.burstDotsG) this.burstDotsG.innerHTML = "";
+    if (this.reqDotsG) this.reqDotsG.innerHTML = "";
+  }
+}
+
 class SceneRegistry {
   constructor(timeline, mountEl) {
     this.timeline = timeline;
@@ -701,6 +1027,7 @@ function mountKeyboard(timeline, registry) {
       case "2": registry.activate("B"); break;
       case "3": registry.activate("C"); break;
       case "4": registry.activate("D"); break;
+      case "5": registry.activate("E"); break;
     }
   });
 }
@@ -723,6 +1050,7 @@ registry.register("A", SceneA);
 registry.register("B", SceneB);
 registry.register("C", SceneC);
 registry.register("D", SceneD);
+registry.register("E", SceneE);
 registry.activate("A");
 
 // Fork-additions toggle

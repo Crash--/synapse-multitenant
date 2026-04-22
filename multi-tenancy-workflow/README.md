@@ -18,7 +18,13 @@ flowing through the request lifecycle:
 
 Three synchronized scenes (switchable via tabs) show this same lifecycle
 from different angles: a flow diagram, a layered stack, and a
-diagram-plus-log split screen.
+diagram-plus-log split screen. A fourth scene compares against the
+upstream (single-tenant) code paths. A fifth scene (E) is a
+self-contained explainer for the fan-out density bottleneck
+identified in `docker-demo/stress-test/finding-density-versions-p95.md`
+— 14 call sites → 1 helper → a burst that saturates the reactor every
+tick, with N VU latency impact visualised side by side with the
+measured numbers from the 2026-04-21 density runs.
 
 ## Running
 
@@ -39,5 +45,5 @@ the server avoids that.
 
 - Space — play / pause
 - ← / → — previous / next stage
-- 1 / 2 / 3 — switch scene
+- 1 / 2 / 3 / 4 / 5 — switch scene
 - R — restart
